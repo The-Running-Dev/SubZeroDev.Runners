@@ -16,16 +16,17 @@ function Get-RunnerToken([string] $Url, [string] $Kind) {
     if ($LASTEXITCODE -or -not $token) { throw "No $Kind token for $Url (gh must be signed in as an admin)." }
     $token
 }
+# Newer runners also keep a copy of .runner as .runner_migrated, and config refuses to run while either exists.
+$RegistrationFiles = '.runner', '.runner_migrated', '.credentials', '.credentials_migrated', '.credentials_rsaparams'
 function Remove-Registration([string] $Directory, [scriptblock] $Configure) {
-    $file = Join-Path $Directory '.runner'
-    if (-not (Test-Path -LiteralPath $file)) { return }
+    $file = @('.runner', '.runner_migrated') | ForEach-Object { Join-Path $Directory $_ } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $file) { return }
     $old = Get-Content -Raw -LiteralPath $file | ConvertFrom-Json
     & $Configure remove --token (Get-RunnerToken $old.gitHubUrl 'remove')
-    if ($LASTEXITCODE) {
-        # Already gone from GitHub, or config could not reach it: drop the server side directly, then the local files.
-        gh api -X DELETE "$(Get-ApiScope $old.gitHubUrl)/actions/runners/$($old.agentId)" 2>$null | Out-Null
-        Remove-Item -LiteralPath $file, (Join-Path $Directory '.credentials'), (Join-Path $Directory '.credentials_rsaparams') -Force -ErrorAction SilentlyContinue
-    }
+    # Already gone from GitHub, or config could not reach it: drop the server side directly.
+    if ($LASTEXITCODE) { gh api -X DELETE "$(Get-ApiScope $old.gitHubUrl)/actions/runners/$($old.agentId)" 2>$null | Out-Null }
+    # Then whatever config left of the local files.
+    Remove-Item -LiteralPath ($RegistrationFiles | ForEach-Object { Join-Path $Directory $_ }) -Force -ErrorAction SilentlyContinue
 }
 
 & (Join-Path $PSScriptRoot 'Stop-Runners.ps1') -Drain
