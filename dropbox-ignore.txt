@@ -1,0 +1,30 @@
+# Paths that stay on this PC only. Scripts\Set-DropboxIgnored.ps1 marks each match with
+# Dropbox's com.dropbox.ignored stream; Start-Runners.ps1 and the daily log task reapply it,
+# so folders created later (runner updates, new caches) are picked up.
+# One path per line, relative to this folder; * and ? wildcards are allowed.
+
+# Windows runner: binaries (re-extracted or self-updated), toolchain, caches, workspace, logs
+windows/bin
+windows/bin.*
+windows/externals
+windows/externals.*
+windows/_work
+windows/_tool
+windows/_nuget
+windows/_dotnet-home
+windows/_diag
+windows/runner-console.log
+windows/supervisor.pid
+
+# Linux runner, mounted at /runner in the container
+linux/runner/bin
+linux/runner/bin.*
+linux/runner/externals
+linux/runner/externals.*
+linux/runner/_work
+linux/runner/_diag
+linux/*.log
+
+# Installers, downloadable again from GitHub and Microsoft
+downloads/*.tar.gz
+downloads/*.zip

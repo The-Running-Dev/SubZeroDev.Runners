@@ -1,0 +1,39 @@
+{
+  "runnerVersion": "2.338.0",
+  "github": {
+    "labels": ["subzerodev"]
+  },
+  "windows": {
+    "directory": "windows",
+    "name": "subzerodev.runner.windows",
+    "labels": ["subzerodev-windows"],
+    "startup": "Logon"
+  },
+  "linux": {
+    "directory": "linux/runner",
+    "name": "subzerodev.runner.linux",
+    "labels": ["subzerodev-linux"],
+    "container": "subzerodev-runner-linux",
+    "baseImage": "ghcr.io/the-running-dev/build-agent@sha256:663d11479f0e38408d8849e34d3dcc5270cf823abf8d730b0b739eca7d2524d7",
+    "image": "subzerodev-runner-linux:local",
+    "cacheVolume": "subzerodev-runner-linux-cache",
+    "workFolder": "/tmp/runner-work",
+    "cpus": 4,
+    "memory": "8g",
+    "docker": {
+      "mode": "sidecar",
+      "image": "docker:29.9.2-dind@sha256:9e79b879b177fbd72c34376a3dd3d91747da5db49e1f560f76aea59561471977",
+      "container": "subzerodev-runner-linux-docker",
+      "network": "subzerodev-runner-linux",
+      "dataVolume": "subzerodev-runner-linux-docker",
+      "certsVolume": "subzerodev-runner-linux-docker-certs",
+      "workVolume": "subzerodev-runner-linux-work",
+      "cpus": 4,
+      "memory": "4g"
+    }
+  },
+  "logs": {
+    "retentionDays": 14,
+    "trimAt": "04:00"
+  }
+}

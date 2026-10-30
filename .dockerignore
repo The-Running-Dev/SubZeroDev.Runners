@@ -1,0 +1,8 @@
+*
+!downloads/
+downloads/*
+!downloads/actions-runner-linux-x64-2.338.0.tar.gz
+!linux/
+linux/*
+!linux/Dockerfile
+!linux/entrypoint.sh

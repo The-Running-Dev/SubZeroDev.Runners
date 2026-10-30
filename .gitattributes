@@ -1,0 +1,2 @@
+# LF everywhere: the shell scripts and Dockerfile are used inside Linux containers straight from this folder.
+* text=auto eol=lf

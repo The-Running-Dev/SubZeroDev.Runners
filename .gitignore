@@ -1,0 +1,8 @@
+# The runners themselves stay on this PC: registrations and their credentials, binaries,
+# toolchains, caches, workspaces and logs, and runners.local.json (this machine's settings, such as github.url).
+# Only the shared settings, scripts and image sources are tracked.
+/windows/
+/linux/runner/
+/downloads/
+*.log
+/runners.local.json
