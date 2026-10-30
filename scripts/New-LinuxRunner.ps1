@@ -1,6 +1,7 @@
 # (Re)creates the Linux runner container from runners.json. -Build rebuilds the image first, on linux.baseImage.
 # The registration in linux\runner survives; only the container's own disposable filesystem is replaced.
-# With linux.docker.mode 'sidecar' it also (re)creates the docker:dind container that jobs use as their Docker daemon.
+# With linux.docker.mode 'sidecar' it also (re)creates the docker:dind container that jobs use as their Docker daemon;
+# with 'dind' it removes that container and runs the runner privileged, with its own daemon.
 param([switch] $Build)
 . "$PSScriptRoot\Common.ps1"
 $linux = $Config.linux
@@ -60,6 +61,15 @@ if ($DockerSidecar) {
         '-e', 'TESTCONTAINERS_HOST_OVERRIDE=docker'
         '--mount', "type=volume,source=$($sidecar.certsVolume),target=/certs,readonly"
         '--mount', "type=volume,source=$($sidecar.workVolume),target=$($linux.workFolder)"
+    )
+}
+elseif ($sidecar -and $sidecar.mode -eq 'dind') {
+    # The runner itself is privileged and runs dockerd; images and build cache stay in dindVolume across jobs.
+    # Its daemon listens on the default socket, so DOCKER_HOST stays unset and published ports are on localhost.
+    # The stop timeout leaves the entrypoint time to stop the daemon cleanly after the runner exits.
+    $dockerArgs = @(
+        '--privileged', '-e', 'BUILD_AGENT_DOCKERD=1', '--stop-timeout', '60'
+        '--mount', "type=volume,source=$($sidecar.dindVolume),target=/var/lib/docker"
     )
 }
 & $Docker run -d --name $linux.container --restart unless-stopped --cpus $linux.cpus --memory $linux.memory `

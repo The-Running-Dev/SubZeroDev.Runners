@@ -6,8 +6,9 @@ case "$work" in
   /tmp/?*) ;;
   *) echo "RUNNER_WORK_FOLDER must be a folder under /tmp, not '$work'." >&2; exit 1 ;;
 esac
-# With a Docker daemon, the job's leftover containers, networks and anonymous volumes go too; images and build cache stay.
-if [ -n "${DOCKER_HOST:-}" ]; then
+# With a Docker daemon (the sidecar, or the runner's own in dind mode), the job's leftover containers, networks and
+# anonymous volumes go too; images and build cache stay.
+if docker info >/dev/null 2>&1; then
   containers=$(docker ps -aq)
   if [ -n "$containers" ]; then
     docker rm -f $containers >/dev/null || echo 'Could not remove the job containers.' >&2

@@ -2,18 +2,21 @@
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path $PSScriptRoot -Parent
 $Config = Get-Content -Raw (Join-Path $Root 'runners.json') | ConvertFrom-Json
-# runners.local.json (git-ignored) holds this machine's settings, such as github.url, over runners.json's, section by section.
-$LocalConfig = Join-Path $Root 'runners.local.json'
-if (Test-Path -LiteralPath $LocalConfig) {
-    foreach ($section in (Get-Content -Raw $LocalConfig | ConvertFrom-Json).PSObject.Properties) {
-        foreach ($setting in $section.Value.PSObject.Properties) {
-            $Config.($section.Name) | Add-Member -Force -NotePropertyName $setting.Name -NotePropertyValue $setting.Value
-        }
+# runners.local.json (git-ignored) holds this machine's settings, such as github.url, over runners.json's. Objects merge
+# setting by setting at every level, so { "linux": { "docker": { "mode": "dind" } } } changes only that mode.
+function Merge-Settings($Target, $Source) {
+    foreach ($setting in $Source.PSObject.Properties) {
+        $current = $Target.($setting.Name)
+        if ($current -is [pscustomobject] -and $setting.Value -is [pscustomobject]) { Merge-Settings $current $setting.Value }
+        else { $Target | Add-Member -Force -NotePropertyName $setting.Name -NotePropertyValue $setting.Value }
     }
 }
+$LocalConfig = Join-Path $Root 'runners.local.json'
+if (Test-Path -LiteralPath $LocalConfig) { Merge-Settings $Config (Get-Content -Raw $LocalConfig | ConvertFrom-Json) }
 $WindowsRunner = Join-Path $Root $Config.windows.directory
 $LinuxRunner = Join-Path $Root $Config.linux.directory
 # linux.docker.mode 'sidecar': the Linux runner's Docker daemon is a separate docker:dind container.
+# 'dind': the runner container runs its own daemon (build-agent's opt-in dockerd) and there is no sidecar.
 $DockerSidecar = if ($Config.linux.docker -and $Config.linux.docker.mode -eq 'sidecar') { $Config.linux.docker.container }
 # Linux containers in start order; stop them in reverse.
 $LinuxContainers = @(@($DockerSidecar, $Config.linux.container) | Where-Object { $_ })
