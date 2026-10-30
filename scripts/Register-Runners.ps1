@@ -31,7 +31,8 @@ function Remove-Registration([string] $Directory, [scriptblock] $Configure) {
 
 & (Join-Path $PSScriptRoot 'Stop-Runners.ps1') -Drain
 $runners = @(
-    @{ Name = $Config.windows.name; Labels = $Config.windows.labels; Directory = $WindowsRunner; Work = '_work'; Configure = { & (Join-Path $WindowsRunner 'config.cmd') @args } }
+    # windows.workFolder: relative to the runner, or absolute; environment variables such as %TEMP% are expanded here.
+    @{ Name = $Config.windows.name; Labels = $Config.windows.labels; Directory = $WindowsRunner; Work = [Environment]::ExpandEnvironmentVariables($Config.windows.workFolder); Configure = { & (Join-Path $WindowsRunner 'config.cmd') @args } }
     # The Linux runner is configured from a throwaway container of the same image, on the same /runner mount.
     @{ Name = $Config.linux.name; Labels = $Config.linux.labels; Directory = $LinuxRunner; Work = $Config.linux.workFolder; Configure = { & $Docker run --rm --mount "type=bind,source=$LinuxRunner,target=/runner" $Config.linux.image configure @args } }
 )
