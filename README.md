@@ -25,9 +25,9 @@ Neither needs inbound ports.
 
 | Path | Contents |
 | --- | --- |
-| `runners.json`, `runners.local.json` | Settings every script reads (the second is git-ignored and wins): GitHub labels and URL, runner names and folders, container, base image, image, cache volume, Linux work folder, Docker sidecar (`linux.docker`), CPU/RAM limits, startup mode, log retention |
+| `runners.json`, `runners.local.json` | Settings every script reads (the second is git-ignored and wins): GitHub labels and URL, runner names and folders, container, base image, image, cache volume, work folders (`windows.workFolder` may be absolute and use `%TEMP%`-style variables), Docker sidecar (`linux.docker`), CPU/RAM limits, startup mode, log retention |
 | `scripts\` | Host scripts and the job-completed hooks (mounted read-only at `/runner-hooks` in the container) |
-| `windows\` | Windows runner: registration, binaries, private .NET SDK (`_tool\dotnet`), NuGet cache, `_work`, `_diag` logs (runner, console and `Startup_*` logs), `supervisor.pid` |
+| `windows\` | Windows runner: registration, binaries, private .NET SDK (`_tool\dotnet`), NuGet cache, `_work` (unless `windows.workFolder` points elsewhere), `_diag` logs (runner, console and `Startup_*` logs), `supervisor.pid` |
 | `linux\Dockerfile`, `linux\entrypoint.sh` | Linux image: `linux.baseImage` (Docker-BuildAgent pinned by digest; bump it in `runners.json`, then `New-LinuxRunner.ps1 -Build`) plus the Actions runner. Jobs run as root, like the base |
 | `linux\runner\` | Linux runner, mounted at `/runner`: registration, binaries, `_diag` logs. Checkouts use `/tmp/runner-work` inside the container |
 | Docker container `subzerodev-runner-linux-docker` | The Linux jobs' Docker daemon (`linux.docker.image`: `docker:dind` pinned by digest), privileged, on network `subzerodev-runner-linux` as host `docker`. The runner reaches it over TLS (`DOCKER_HOST=tcp://docker:2376`); ports that jobs publish are on `docker`, not `localhost` (`TESTCONTAINERS_HOST_OVERRIDE` is set) |
