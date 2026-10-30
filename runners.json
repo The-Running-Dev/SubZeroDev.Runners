@@ -15,7 +15,7 @@
     "name": "subzerodev.runner.linux",
     "labels": ["subzerodev-linux"],
     "container": "subzerodev-runner-linux",
-    "baseImage": "ghcr.io/the-running-dev/build-agent@sha256:663d11479f0e38408d8849e34d3dcc5270cf823abf8d730b0b739eca7d2524d7",
+    "baseImage": "ghcr.io/the-running-dev/build-agent@sha256:cc13d62b66fab58e264eb583de5c47eb5f49a3ee8a2cdd48f0de0b1d0ba16556",
     "image": "subzerodev-runner-linux:local",
     "cacheVolume": "subzerodev-runner-linux-cache",
     "workFolder": "/tmp/runner-work",
@@ -29,6 +29,7 @@
       "dataVolume": "subzerodev-runner-linux-docker",
       "certsVolume": "subzerodev-runner-linux-docker-certs",
       "workVolume": "subzerodev-runner-linux-work",
+      "dindVolume": "subzerodev-runner-linux-dind",
       "cpus": 4,
       "memory": "4g"
     }

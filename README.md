@@ -6,7 +6,7 @@ still owns triggers, logs, checks, secrets and artifacts; the jobs execute here.
 | Runner | Where it runs | `runs-on` |
 | --- | --- | --- |
 | `subzerodev.runner.windows` | Native process under the signed-in user, kept alive by `scripts\Run-WindowsRunner.ps1` | `subzerodev-windows` or `[self-hosted, subzerodev, Windows]` |
-| `subzerodev.runner.linux` | Docker container `subzerodev-runner-linux` on [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent) (Debian 12, .NET 8/9/10, Node 22, PowerShell, Docker CLI, GitVersion, NUKE) plus wasm-tools, CMake and Ninja | `subzerodev-linux` or `[self-hosted, subzerodev, Linux]` |
+| `subzerodev.runner.linux` | Docker container `subzerodev-runner-linux` on [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent) (Debian 12, .NET 8/9/10, Node 22, PowerShell, Docker CLI and Engine, GitVersion, NUKE) plus wasm-tools, CMake and Ninja | `subzerodev-linux` or `[self-hosted, subzerodev, Linux]` |
 
 Names and labels come from `runners.json` (`windows.name`, `linux.name`, `github.labels`); the
 GitHub URL they are registered to comes from `runners.local.json`, which git ignores:
@@ -25,14 +25,15 @@ Neither needs inbound ports.
 
 | Path | Contents |
 | --- | --- |
-| `runners.json`, `runners.local.json` | Settings every script reads (the second is git-ignored and wins): GitHub labels and URL, runner names and folders, container, base image, image, cache volume, work folders (`windows.workFolder` may be absolute and use `%TEMP%`-style variables), Docker sidecar (`linux.docker`), CPU/RAM limits, startup mode, log retention |
+| `runners.json`, `runners.local.json` | Settings every script reads (the second is git-ignored and wins): GitHub labels and URL, runner names and folders, container, base image, image, cache volume, work folders (`windows.workFolder` may be absolute and use `%TEMP%`-style variables), Docker daemon for Linux jobs (`linux.docker`, see below), CPU/RAM limits, startup mode, log retention |
 | `scripts\` | Host scripts and the job-completed hooks (mounted read-only at `/runner-hooks` in the container) |
 | `windows\` | Windows runner: registration, binaries, private .NET SDK (`_tool\dotnet`), NuGet cache, `_work` (unless `windows.workFolder` points elsewhere), `_diag` logs (runner, console and `Startup_*` logs), `supervisor.pid` |
 | `linux\Dockerfile`, `linux\entrypoint.sh` | Linux image: `linux.baseImage` (Docker-BuildAgent pinned by digest; bump it in `runners.json`, then `New-LinuxRunner.ps1 -Build`) plus the Actions runner. Jobs run as root, like the base |
 | `linux\runner\` | Linux runner, mounted at `/runner`: registration, binaries, `_diag` logs. Checkouts use `/tmp/runner-work` inside the container |
-| Docker container `subzerodev-runner-linux-docker` | The Linux jobs' Docker daemon (`linux.docker.image`: `docker:dind` pinned by digest), privileged, on network `subzerodev-runner-linux` as host `docker`. The runner reaches it over TLS (`DOCKER_HOST=tcp://docker:2376`); ports that jobs publish are on `docker`, not `localhost` (`TESTCONTAINERS_HOST_OVERRIDE` is set) |
+| Docker container `subzerodev-runner-linux-docker` | Sidecar mode only: the Linux jobs' Docker daemon (`linux.docker.image`: `docker:dind` pinned by digest), privileged, on network `subzerodev-runner-linux` as host `docker`. The runner reaches it over TLS (`DOCKER_HOST=tcp://docker:2376`); ports that jobs publish are on `docker`, not `localhost` (`TESTCONTAINERS_HOST_OVERRIDE` is set) |
 | Docker volume `subzerodev-runner-linux-cache` | Mounted at `/cache`: the container's home folder and NuGet packages, kept across container and image rebuilds (`docker volume rm` it to start clean) |
-| Docker volumes `subzerodev-runner-linux-docker`, `-docker-certs`, `-work` | The daemon's images and build cache; its TLS certificates (read-only in the runner); `/tmp/runner-work`, shared by both containers at the same path so bind mounts of a job's checkout work |
+| Docker volumes `subzerodev-runner-linux-docker`, `-docker-certs`, `-work` | Sidecar mode: the daemon's images and build cache; its TLS certificates (read-only in the runner); `/tmp/runner-work`, shared by both containers at the same path so bind mounts of a job's checkout work |
+| Docker volume `subzerodev-runner-linux-dind` | Dind mode: the runner's own daemon's images and build cache, at `/var/lib/docker` (`linux.docker.dindVolume`) |
 | `downloads\` | Actions runner packages for Windows and Linux |
 | `dropbox-ignore.txt` | Paths kept local-only |
 
@@ -40,11 +41,11 @@ Neither needs inbound ports.
 
 | Script | Does |
 | --- | --- |
-| `Start-Runners.ps1` | Reapplies ignore rules, trims logs, starts the Windows supervisor if `supervisor.pid` names none, starts Docker Desktop if needed, then the Docker sidecar and the Linux container. Logs to `windows\_diag\Startup_*-utc.log`; on failure shows a toast that opens that log |
-| `Stop-Runners.ps1 [-Drain] [-TimeoutMinutes 120]` | Kills the Windows supervisor (from `supervisor.pid`) and its runner, stops the Linux container, then the sidecar. `-Drain` first waits for running jobs to finish and stops nothing if one is still running at the timeout. Registrations stay |
+| `Start-Runners.ps1` | Reapplies ignore rules, trims logs, starts the Windows supervisor if `supervisor.pid` names none, starts Docker Desktop if needed, then the Docker sidecar (in sidecar mode) and the Linux container. Logs to `windows\_diag\Startup_*-utc.log`; on failure shows a toast that opens that log |
+| `Stop-Runners.ps1 [-Drain] [-TimeoutMinutes 120]` | Kills the Windows supervisor (from `supervisor.pid`) and its runner, stops the Linux container, then the sidecar (in sidecar mode). `-Drain` first waits for running jobs to finish and stops nothing if one is still running at the timeout. Registrations stay |
 | `Register-Runners.ps1` | Drains and stops both runners, removes their current registrations, registers them under `github.url` with the names and labels from `runners.json`, starts them. Needs `gh` signed in as an admin |
 | `Set-WindowsStartup.ps1 [-Mode Disabled\|Logon]` | Applies `windows.startup` (or `-Mode`). `Logon` writes the `SubZeroDev.Runners` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
-| `New-LinuxRunner.ps1 [-Build]` | Recreates the Docker sidecar (when `linux.docker.mode` is `sidecar`) and the container from `runners.json` (`-Build` rebuilds the image first, on `linux.baseImage`) and keeps the registration's work folder in step |
+| `New-LinuxRunner.ps1 [-Build]` | Recreates the Docker sidecar (when `linux.docker.mode` is `sidecar`; removes it otherwise) and the container from `runners.json` (`-Build` rebuilds the image first, on `linux.baseImage`) and keeps the registration's work folder in step |
 | `Set-DropboxIgnored.ps1` | Marks everything matched by `dropbox-ignore.txt` with `com.dropbox.ignored`. Idempotent |
 | `Trim-RunnerLogs.ps1` | Deletes `_diag` files older than `logs.retentionDays` in both runners, keeping the newest Runner/Worker/Console log of each runner |
 | `Register-LogTrimTask.ps1` | Schedules the trim daily at `logs.trimAt` as `\SubZeroDev.Runners\Trim logs`. `trimAt: null` removes it |
@@ -77,9 +78,21 @@ with:
 ```
 
 Keep fork pull requests off these machines and give jobs `permissions: {}` unless they need more.
-Linux jobs can use `docker`, `docker buildx` and `docker compose` against the sidecar.
+Linux jobs can use `docker`, `docker buildx` and `docker compose`; see below for where the daemon runs.
 The-Running-Dev is a user account, so a runner can only be registered to one repository at a
 time. Sharing them across repositories needs an organization; see Later.
+
+## Docker in Linux jobs
+
+`linux.docker.mode` picks where the Linux jobs' Docker daemon runs. Switch it in `runners.local.json`
+(`{ "linux": { "docker": { "mode": "dind" } } }`), then run `New-LinuxRunner.ps1`.
+
+| Mode | Daemon | Jobs see |
+| --- | --- | --- |
+| `sidecar` | A separate privileged `docker:dind` container with its own CPU/RAM limits (`linux.docker.cpus`, `.memory`) | `DOCKER_HOST=tcp://docker:2376` over TLS; published ports on host `docker` |
+| `dind` | Docker-BuildAgent's opt-in `dockerd` inside the runner container, which then runs privileged (`BUILD_AGENT_DOCKERD=1`). Starts before the runner and stops after it; its log is `/var/log/dockerd.log` | The default socket, `DOCKER_HOST` unset; published ports on `localhost`. The daemon shares the runner's CPU/RAM limits |
+
+Images and build cache stay in each mode's own volume, so switching back and forth keeps both.
 
 ## Isolation
 
@@ -87,9 +100,9 @@ Jobs run code from the repositories that use these runners, with that repository
 
 - **Now.** Linux jobs run in the container: root inside it, with no host mounts beyond its own
   `/runner` folder, the hooks (read-only) and the cache volume, and the CPU and memory limits from
-  `runners.json`. Their Docker daemon is a privileged sidecar, so a job can start a privileged
-  container and from there take over the Docker Desktop VM, including the Windows drives that
-  Docker Desktop shares into it. Treat Linux jobs as trusted, like Windows jobs. Windows jobs run as the signed-in host user and can reach
+  `runners.json`. Their Docker daemon is privileged (the sidecar, or in `dind` mode the runner
+  container itself), so a job can start a privileged container and from there take over the
+  Docker Desktop VM, including the Windows drives that Docker Desktop shares into it. Treat Linux jobs as trusted, like Windows jobs. Windows jobs run as the signed-in host user and can reach
   everything that user can.
 - **Next.** The Windows runner moves into a dedicated VM (see Later), which takes host files and
   the user's sign-ins out of reach.
@@ -120,9 +133,6 @@ Jobs run code from the repositories that use these runners, with that repository
   built for it; startup then becomes a boot-time task or service in the VM rather than the
   host user's logon.
 - **Linux stays a container.** Only the host it runs on may change.
-- **Docker inside the build agent.** [handoffs/build-agent-dind.md](handoffs/build-agent-dind.md)
-  asks Docker-BuildAgent for an opt-in `dockerd`. Once released, a `linux.docker.mode` of `dind`
-  can run the daemon inside the runner container instead of the sidecar, to compare the two.
 - **Startup modes.** `Logon` is the only automatic mode today. Candidates: a boot-time
   scheduled task (runs without signing in) or the runner's own Windows service.
 - **Dev Drive.** Still supported in Windows 11 (only the Dev Home app was retired). A ReFS

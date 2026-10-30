@@ -1,4 +1,4 @@
-# The Linux runner: Docker-BuildAgent (Node, .NET 8/9/10, PowerShell, Git, Docker CLI, GitVersion, NUKE)
+# The Linux runner: Docker-BuildAgent (Node, .NET 8/9/10, PowerShell, Git, Docker CLI and opt-in Engine, GitVersion, NUKE)
 # plus the Actions runner, the wasm-tools workload and the few native packages the builds also need.
 # New-LinuxRunner.ps1 -Build passes linux.baseImage from runners.json, a pinned digest.
 ARG BASE_IMAGE
@@ -15,4 +15,5 @@ ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIE
 RUN dotnet workload install wasm-tools --skip-manifest-update
 WORKDIR /runner
 COPY linux/entrypoint.sh /opt/entrypoint.sh
-ENTRYPOINT ["/bin/bash", "/opt/entrypoint.sh"]
+# The base's entrypoint starts dockerd first when BUILD_AGENT_DOCKERD=1 (linux.docker.mode 'dind') and stops it after the runner exits.
+ENTRYPOINT ["build-agent-entrypoint", "/bin/bash", "/opt/entrypoint.sh"]
