@@ -44,7 +44,7 @@ Neither needs inbound ports.
 | `Start-Runners.ps1` | Reapplies ignore rules, trims logs, starts the Windows supervisor if `supervisor.pid` names none, starts Docker Desktop if needed, then the Docker sidecar (in sidecar mode) and the Linux container. Logs to `windows\_diag\Startup_*-utc.log`; on failure shows a toast that opens that log |
 | `Stop-Runners.ps1 [-Drain] [-TimeoutMinutes 120]` | Kills the Windows supervisor (from `supervisor.pid`) and its runner, stops the Linux container, then the sidecar (in sidecar mode). `-Drain` first waits for running jobs to finish and stops nothing if one is still running at the timeout. Registrations stay |
 | `Register-Runners.ps1` | Drains and stops both runners, removes their current registrations, registers them under `github.url` with the names and labels from `runners.json`, starts them. Needs `gh` signed in as an admin |
-| `Set-WindowsStartup.ps1 [-Mode Disabled\|Logon]` | Applies `windows.startup` (or `-Mode`). `Logon` writes the `SubZeroDev.Runners` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
+| `Set-WindowsStartup.ps1 [-Mode Disabled\|Logon]` | Applies `windows.startup` (or `-Mode`). `Logon` registers `\SubZeroDev.Runners\Start runners`, run 30 s after this user signs in and retried up to three times if `Start-Runners.ps1` fails; `Disabled` removes it. Both remove the older `SubZeroDev.Runners` Run entry (Windows could skip it at sign-in) |
 | `New-LinuxRunner.ps1 [-Build]` | Recreates the Docker sidecar (when `linux.docker.mode` is `sidecar`; removes it otherwise) and the container from `runners.json` (`-Build` rebuilds the image first, on `linux.baseImage`) and keeps the registration's work folder in step |
 | `Set-DropboxIgnored.ps1` | Marks everything matched by `dropbox-ignore.txt` with `com.dropbox.ignored`. Idempotent |
 | `Trim-RunnerLogs.ps1` | Deletes `_diag` files older than `logs.retentionDays` in both runners, keeping the newest Runner/Worker/Console log of each runner |
@@ -133,8 +133,9 @@ Jobs run code from the repositories that use these runners, with that repository
   built for it; startup then becomes a boot-time task or service in the VM rather than the
   host user's logon.
 - **Linux stays a container.** Only the host it runs on may change.
-- **Startup modes.** `Logon` is the only automatic mode today. Candidates: a boot-time
-  scheduled task (runs without signing in) or the runner's own Windows service.
+- **Startup modes.** `Logon` (a sign-in scheduled task) is the only automatic mode today.
+  Candidates: a boot-time scheduled task (runs without signing in) or the runner's own
+  Windows service.
 - **Dev Drive.** Still supported in Windows 11 (only the Dev Home app was retired). A ReFS
   volume with Defender performance mode, at least 50 GB, created from Settings or as a VHDX.
   Fits `windows\_work`, `windows\_nuget` and other caches; Microsoft advises keeping SDKs
