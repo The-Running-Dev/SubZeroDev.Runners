@@ -1,5 +1,5 @@
 . "$PSScriptRoot\Common.ps1"
-$mutex = [Threading.Mutex]::new($false, 'Local\SubZeroDev.Runners.Windows')
+$mutex = [Threading.Mutex]::new($false, $WindowsMutexName)
 if (-not $mutex.WaitOne(0)) { exit }
 try {
     $env:DOTNET_INSTALL_DIR = Join-Path $WindowsRunner '_tool\dotnet'
