@@ -1,6 +1,6 @@
 # Schedules Trim-RunnerLogs.ps1 daily at logs.trimAt from runners.json (HH:mm). Set trimAt to null to remove the task.
 . "$PSScriptRoot\Common.ps1"
-$name = 'Trim logs'
+$name = $LogTrimTaskName
 if (-not $Config.logs.trimAt) {
     Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
     Write-Output 'Log trimming task removed.'
