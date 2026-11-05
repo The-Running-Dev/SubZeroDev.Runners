@@ -98,7 +98,8 @@ function Get-RunnerSetupEvidence {
     if (-not $supervisorProcess) { throw "Supervisor is not running for $InstanceId." }
     $dotnet = Join-Path $WindowsRunner '_tool\dotnet\dotnet.exe'
     if (-not (Test-Path -LiteralPath $dotnet)) { throw "Private .NET SDK is missing for $InstanceId." }
-    $sdk = & $dotnet --version
+    $sdkOutput = @(& $dotnet --version)
+    $sdk = $sdkOutput | Select-Object -Last 1
     if ($LASTEXITCODE -or $sdk -notmatch '^10\.') { throw "Private .NET 10 SDK is not working for $InstanceId." }
     $workspace = [Environment]::ExpandEnvironmentVariables($Config.windows.workFolder)
     if (-not [IO.Path]::IsPathRooted($workspace)) { $workspace = Join-Path $WindowsRunner $workspace }
@@ -133,6 +134,14 @@ function Invoke-RunnerSetupSmoke {
     } else {
         Send-RunnerSetupGh -Arguments @('api', '-X', 'PUT', "repos/$Repository/contents/$workflowPath") -Body @{ message = 'Add manual Windows runner concurrency smoke test'; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($template)) } | Out-Null
     }
+    # Newly committed workflows can take a moment to appear in the Actions API.
+    $indexed = $false
+    for ($attempt = 0; $attempt -lt 12; $attempt++) {
+        & gh api "repos/$Repository/actions/workflows/windows-runner-smoke.yml" --silent 2>$null
+        if ($LASTEXITCODE -eq 0) { $indexed = $true; break }
+        Start-Sleep -Seconds 5
+    }
+    if (-not $indexed) { throw 'The smoke workflow is not available in Actions. Check repository Actions policy and rerun setup.' }
     $setupId = [guid]::NewGuid().ToString('N')
     Send-RunnerSetupGh -Arguments @('api', '-X', 'POST', "repos/$Repository/actions/workflows/windows-runner-smoke.yml/dispatches") -Body @{ ref = $repo.default_branch; inputs = @{ computer_name = $env:COMPUTERNAME; runner_label = $Label; runner_names = (ConvertTo-Json -InputObject @($ExpectedRunnerNames) -Compress); setup_id = $setupId } } | Out-Null
     $deadline = [DateTime]::UtcNow.AddMinutes(8)

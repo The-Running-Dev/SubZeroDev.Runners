@@ -78,24 +78,96 @@ $evidence = @(
     [pscustomobject]@{ Instance = 'win01'; Name = 'one'; AgentId = 11; Workspace = 'C:\one'; SupervisorPid = 101; Labels = @('shared', 'host') },
     [pscustomobject]@{ Instance = 'win02'; Name = 'two'; AgentId = 22; Workspace = 'C:\two'; SupervisorPid = 202; Labels = @('shared', 'host') }
 )
-$remote = @{ Offline = $false; WrongId = $false; Added = 0 }
+$remoteFixture = @{ Offline = $false; WrongId = $false; Added = 0 }
 function Invoke-RunnerSetupGh {
     param($Arguments)
     if ($Arguments[1] -like '*/labels') { return [pscustomobject]@{ labels = @(@{ name = 'shared' }, @{ name = 'host' }) } }
     @([pscustomobject]@{ runners = @(
-        @{ name = 'one'; id = $(if ($remote.WrongId) { 99 } else { 11 }); status = $(if ($remote.Offline) { 'offline' } else { 'online' }); labels = @(@{ name = 'shared' }) },
+        @{ name = 'one'; id = $(if ($remoteFixture.WrongId) { 99 } else { 11 }); status = $(if ($remoteFixture.Offline) { 'offline' } else { 'online' }); labels = @(@{ name = 'shared' }) },
         @{ name = 'two'; id = 22; status = 'online'; labels = @(@{ name = 'shared' }) }
     ) })
 }
-Set-Item Function:gh -Value { $null = $input | Out-String; $remote.Added++; $global:LASTEXITCODE = 0 }
+Set-Item Function:gh -Value { $null = $input | Out-String; $remoteFixture.Added++; $global:LASTEXITCODE = 0 }
 Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example
-Assert ($remote.Added -eq 2) 'Existing runners did not receive their missing targeting labels.'
-$remote.Offline = $true
+Assert ($remoteFixture.Added -eq 2) 'Existing runners did not receive their missing targeting labels.'
+$remoteFixture.Offline = $true
 Assert-Throws { Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example } 'Offline runner accepted.'
-$remote.Offline = $false; $remote.WrongId = $true
+$remoteFixture.Offline = $false; $remoteFixture.WrongId = $true
 Assert-Throws { Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example } 'Mismatched registration ID accepted.'
-$remote.WrongId = $false; $evidence[1].Workspace = 'C:\one'
+$remoteFixture.WrongId = $false; $evidence[1].Workspace = 'C:\one'
 Assert-Throws { Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example } 'Shared workspace accepted.'
 Remove-Item Function:gh
 
+# Existing clone updates must protect identity, scope, local files and commits.
+. $functions
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ('host-setup-' + [guid]::NewGuid().ToString('N'))
+$cloneFixture = @{ Origin = 'https://github.com/The-Running-Dev/SubZeroDev.Runners.git'; Dirty = $false; Diverged = $false; Checkouts = 0 }
+try {
+    $clone = Join-Path $fixture 'win01'
+    New-Item -ItemType Directory -Path (Join-Path $clone '.git') -Force | Out-Null
+    $settingsPath = Join-Path $clone 'runners.local.json'
+    '{"windows":{"instanceId":"win01"},"github":{"url":"https://github.com/AbsoluteZeroDev"}}' | Set-Content $settingsPath
+    Set-Item Function:Invoke-RunnerSetupGit -Value {
+        param($Arguments, [switch] $Capture)
+        if ($Arguments -contains 'get-url') { return $cloneFixture.Origin }
+        if ($Arguments -contains '--porcelain' -and $cloneFixture.Dirty) { return ' M important.ps1' }
+        if ($Arguments -contains 'checkout') { $cloneFixture.Checkouts++ }
+    }
+    Set-Item Function:git -Value { $global:LASTEXITCODE = $(if ($cloneFixture.Diverged) { 1 } else { 0 }) }
+    $syncOptions = @{ Clone = $clone; InstanceId = 'win01'; SourceCommit = ('a' * 40); GitHubUrl = 'https://github.com/AbsoluteZeroDev' }
+    Sync-RunnerSetupInstance @syncOptions
+    Assert ($cloneFixture.Checkouts -eq 1) 'Clean clone was not advanced.'
+    $cloneFixture.Dirty = $true
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Dirty clone was overwritten.'
+    $cloneFixture.Dirty = $false; $cloneFixture.Diverged = $true
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Divergent commits were discarded.'
+    $cloneFixture.Diverged = $false
+    $before = Get-Content -Raw $settingsPath
+    $syncOptions.InstanceId = 'win02'
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Clone instance identity was reused.'
+    $syncOptions.InstanceId = 'win01'; $syncOptions.GitHubUrl = 'https://github.com/elsewhere'
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Saved GitHub target was silently replaced.'
+    Assert ((Get-Content -Raw $settingsPath) -eq $before -and $cloneFixture.Checkouts -eq 1) 'Rejected update changed settings or checked out code.'
+    Remove-Item Function:git
+
+    # Exercise the real optional smoke orchestration with synthetic GitHub responses and checker evidence.
+    . $functions
+    New-Item -ItemType Directory -Path (Join-Path $clone 'tests') -Force | Out-Null
+    Copy-Item (Join-Path $PSScriptRoot 'windows-runner-smoke.yml') (Join-Path $clone 'tests')
+    Copy-Item (Join-Path $PSScriptRoot 'Assert-WindowsRunnerSmoke.ps1') (Join-Path $clone 'tests')
+    $smokeFixture = @{ Mismatch = $false; Dispatch = $null; Writes = 0; Jobs = @(
+        @{ runner_name = 'custom-one'; runner_id = 11; conclusion = 'success'; steps = @(@{ name = 'Hold slot for overlap check'; started_at = '2026-11-05T10:00:00Z'; completed_at = '2026-11-05T10:01:30Z' }) },
+        @{ runner_name = 'custom-two'; runner_id = 22; conclusion = 'success'; steps = @(@{ name = 'Hold slot for overlap check'; started_at = '2026-11-05T10:00:10Z'; completed_at = '2026-11-05T10:01:40Z' }) }
+    ) }
+    $smokeFixture.Content = Get-Content -Raw (Join-Path $PSScriptRoot 'windows-runner-smoke.yml')
+    Set-Item Function:gh -Value {
+        $global:LASTEXITCODE = 0
+        if ($args[1] -eq 'repos/example/smoke') { return '{"private":true,"default_branch":"main"}' }
+        if ($args[1] -like '*/contents/*') {
+            $text = if ($smokeFixture.Mismatch) { 'an existing different workflow' } else { $smokeFixture.Content }
+            return (@{ content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text)) } | ConvertTo-Json)
+        }
+        if ($args[1] -like '*/jobs?*') { return (@{ total_count = 2; jobs = $smokeFixture.Jobs } | ConvertTo-Json -Depth 10) }
+    }
+    Set-Item Function:Send-RunnerSetupGh -Value {
+        param($Arguments, $Body)
+        $smokeFixture.Writes++
+        $smokeFixture.Dispatch = $Body
+    }
+    Set-Item Function:Invoke-RunnerSetupGh -Value {
+        param($Arguments)
+        @{ workflow_runs = @(@{ id = 81; display_title = "Windows runner smoke $($smokeFixture.Dispatch.inputs.setup_id)"; status = 'completed'; conclusion = 'success'; html_url = 'https://github.com/example/smoke/actions/runs/81' }) }
+    }
+    Invoke-RunnerSetupSmoke -Repository example/smoke -Label pair-label -SourceClone $clone -ExpectedRunnerNames @('custom-one', 'custom-two')
+    Assert ($smokeFixture.Writes -eq 1 -and $smokeFixture.Dispatch.inputs.runner_label -eq 'pair-label') 'Smoke workflow was overwritten or dispatch targeted the wrong pair.'
+    Assert ($smokeFixture.Dispatch.inputs.runner_names -eq '["custom-one","custom-two"]') 'Dispatch lost actual expected names.'
+    $smokeFixture.Mismatch = $true
+    Assert-Throws { Invoke-RunnerSetupSmoke -Repository example/smoke -Label pair-label -SourceClone $clone -ExpectedRunnerNames @('custom-one', 'custom-two') } 'Existing differing smoke workflow was overwritten.'
+    Assert ($smokeFixture.Writes -eq 1) 'Rejected smoke workflow caused a GitHub write.'
+    Remove-Item Function:gh
+} finally {
+    Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Output 'PASS: authentication, deterministic host orchestration, target/smoke boundaries, pair labels, registration identity/online checks and isolation (external operations mocked).'
+Write-Output 'PASS: dirty/divergent/mismatched clone rejection and automatic smoke dispatch/correlation/evidence checking without overwriting existing workflows (GitHub operations mocked).'
