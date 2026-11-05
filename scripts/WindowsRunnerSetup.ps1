@@ -34,6 +34,16 @@ function Confirm-RunnerSetupAuthentication {
         & gh auth login --hostname github.com --web --git-protocol https --scopes $scopes
         if ($LASTEXITCODE) { throw 'GitHub authorization failed.' }
     }
+    if ($WithSmoke -and -not $tokenEnvironment) {
+        $headers = & gh api --include user
+        if ($LASTEXITCODE) { throw 'Cannot inspect the active GitHub authorization.' }
+        $scopeHeader = $headers | Where-Object { $_ -imatch '^X-OAuth-Scopes:' } | Select-Object -First 1
+        if ($scopeHeader -and 'workflow' -notin (($scopeHeader -replace '^[^:]+:', '').Split(',').Trim())) {
+            if ($NonInteractive) { throw 'The stored GitHub login lacks workflow permission. Provision the required scope before unattended smoke setup.' }
+            & gh auth refresh --hostname github.com --scopes $scopes
+            if ($LASTEXITCODE) { throw 'GitHub workflow authorization failed.' }
+        }
+    }
     # Prove runner administration access without printing or persisting a registration token.
     & gh api -X POST "$Scope/actions/runners/registration-token" --silent
     if ($LASTEXITCODE -and -not $NonInteractive -and -not $tokenEnvironment) {

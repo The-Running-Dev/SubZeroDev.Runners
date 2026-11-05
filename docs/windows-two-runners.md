@@ -20,6 +20,8 @@ Defaults: two instances (`win01`, `win02`) in `%LOCALAPPDATA%\SubZeroDev\Runners
 `AbsoluteZeroDev`, with sign-in tasks. The `_setup` directory is a reserved controller checkout;
 each instance has its own clone. All clones use one resolved source commit for that run. Package
 installs requiring a reboot stop setup and ask you to rerun after the reboot; setup never reboots for you.
+Use a unique Windows computer name per host; setup refuses existing runner-name conflicts rather than
+taking another machine's registration.
 
 ```powershell
 # Existing C:\Actions layout / 128 GB host:
