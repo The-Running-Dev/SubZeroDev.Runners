@@ -56,22 +56,20 @@ function Test-TaskPlan([string] $Clone) {
     . (Join-Path $Clone 'scripts\Common.ps1')
     $InstanceId = $Config.windows.instanceId
     $Name = $Config.windows.name
-    $script:TaskRecords = @()
-    $script:RemovedTasks = @()
-    $script:StartedTasks = @()
+    $taskCapture = @{ Records = [Collections.Generic.List[object]]::new(); Removed = [Collections.Generic.List[string]]::new(); Started = [Collections.Generic.List[string]]::new() }
     # Construct real Windows task actions/triggers/settings, but intercept registration and starts.
     # This verifies the actual installer tail and trim script without changing the CI host's tasks.
     function Register-ScheduledTask {
         param($TaskPath, $TaskName, $Action, $Trigger, $Principal, $Settings, $Description, [switch] $Force)
-        $script:TaskRecords += [pscustomobject]@{ Path = $TaskPath; Name = $TaskName; Action = $Action; Trigger = $Trigger; Principal = $Principal; Settings = $Settings }
+        $taskCapture.Records.Add([pscustomobject]@{ Path = $TaskPath; Name = $TaskName; Action = $Action; Trigger = $Trigger; Principal = $Principal; Settings = $Settings })
     }
-    function Unregister-ScheduledTask { param($TaskPath, $TaskName, $Confirm, $ErrorAction) $script:RemovedTasks += $TaskName }
-    function Start-ScheduledTask { param($TaskPath, $TaskName) $script:StartedTasks += $TaskName }
+    function Unregister-ScheduledTask { param($TaskPath, $TaskName, $Confirm, $ErrorAction) $taskCapture.Removed.Add($TaskName) }
+    function Start-ScheduledTask { param($TaskPath, $TaskName) $taskCapture.Started.Add($TaskName) }
     function Get-SupervisorProcess { $null }
     function Get-RunnerStatus { 'online' }
     . $startup | Out-Null
-    Assert ($script:TaskRecords.Count -eq 2) 'Expected startup and trim task plans.'
-    $startTask, $trimTask = $script:TaskRecords
+    Assert ($taskCapture.Records.Count -eq 2) 'Expected startup and trim task plans.'
+    $startTask, $trimTask = $taskCapture.Records
     Assert ($startTask.Name -eq $WindowsTaskName -and $trimTask.Name -eq $LogTrimTaskName) 'Task plan used another instance identity.'
     Assert ($startTask.Path -eq '\SubZeroDev.Runners\' -and $trimTask.Path -eq $startTask.Path) 'Task path changed.'
     Assert ($startTask.Action.Execute -eq $Pwsh -and $startTask.Action.Arguments.Contains('"' + $Supervisor + '"')) 'Startup action targets the wrong supervisor.'
@@ -79,9 +77,9 @@ function Test-TaskPlan([string] $Clone) {
     Assert ($startTask.Trigger.Delay -eq 'PT30S' -and $startTask.Principal.LogonType -eq 'Interactive' -and $startTask.Principal.RunLevel -eq 'Limited') 'Sign-in principal or trigger changed.'
     Assert ($startTask.Settings.MultipleInstances -eq 'IgnoreNew' -and $startTask.Settings.ExecutionTimeLimit -eq 'PT0S') 'Supervisor task lifetime or duplicate policy changed.'
     Assert ($trimTask.Action.Arguments.Contains((Join-Path $Clone 'scripts\Trim-RunnerLogs.ps1'))) 'Trim action targets another clone.'
-    Assert ($script:StartedTasks.Count -eq 1 -and $script:StartedTasks[0] -eq $WindowsTaskName) 'Wrong startup task started.'
-    if ($InstanceId) { Assert ($script:RemovedTasks.Count -eq 0) 'Named setup removed a legacy startup task.' }
-    else { Assert ($script:RemovedTasks.Count -eq 1 -and $script:RemovedTasks[0] -eq 'Start runners') 'Legacy combined startup migration changed.' }
+    Assert ($taskCapture.Started.Count -eq 1 -and $taskCapture.Started[0] -eq $WindowsTaskName) 'Wrong startup task started.'
+    if ($InstanceId) { Assert ($taskCapture.Removed.Count -eq 0) 'Named setup removed a legacy startup task.' }
+    else { Assert ($taskCapture.Removed.Count -eq 1 -and $taskCapture.Removed[0] -eq 'Start runners') 'Legacy combined startup migration changed.' }
 }
 try {
     $aClone = New-Fixture 'a'
