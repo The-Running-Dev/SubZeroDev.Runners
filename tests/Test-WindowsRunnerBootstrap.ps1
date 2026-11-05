@@ -11,6 +11,24 @@ $bootstrapFunctions = [scriptblock]::Create(($definitions.Extent.Text -join "`n"
 . $bootstrapFunctions
 function Assert($Condition, [string] $Message) { if (-not $Condition) { throw $Message } }
 
+# Exercise the real native-process bridge under 5.1 before mocking package operations.
+Invoke-SetupNative -File $env:ComSpec -Arguments @('/d', '/c', 'echo native-stderr-fixture 1>&2 & exit /b 0')
+$rejected = $false
+try { Invoke-SetupNative -File $env:ComSpec -Arguments @('/d', '/c', 'exit /b 5') } catch { $rejected = $true }
+Assert $rejected 'Native failure was hidden by the process bridge.'
+$handoffFixture = Join-Path ([IO.Path]::GetTempPath()) ('runner setup ' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $handoffFixture -Force | Out-Null
+    $worker = Join-Path $handoffFixture 'worker fixture.ps1'
+    $options = Join-Path $handoffFixture 'options fixture.json'
+    'param([string] $OptionsPath) Get-Content -Raw -LiteralPath $OptionsPath' | Set-Content -LiteralPath $worker -Encoding UTF8
+    @{ Count = 2; InstallRoot = "C:\A folder\Ben's runners"; ExtraLabels = @('first-label', 'second-label') } | ConvertTo-Json | Set-Content -LiteralPath $options -Encoding UTF8
+    $result = Invoke-SetupNative -File "$env:ProgramFiles\PowerShell\7\pwsh.exe" -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-OptionsPath', $options) -Capture
+    $result = $result | ConvertFrom-Json
+    Assert ($result.Count -eq 2 -and $result.InstallRoot -eq "C:\A folder\Ben's runners" -and $result.ExtraLabels.Count -eq 2) 'PowerShell 5.1 to 7 handoff damaged options or paths with spaces.'
+} finally { Remove-Item -LiteralPath $handoffFixture -Recurse -Force -ErrorAction SilentlyContinue }
+Write-Output 'PASS: actual Windows PowerShell 5.1 native exit handling and PowerShell 7 handoff with spaced paths (no installation or registration).'
+
 $state = @{ Tools = @{}; Installs = [Collections.Generic.List[string]]::new(); Repairs = 0; Fail = $false }
 function Update-SetupPath { }
 function Find-SetupTool([string] $Name) { $state.Tools[$Name] }
