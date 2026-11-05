@@ -1,0 +1,183 @@
+#Requires -Version 7.2
+# Host orchestration fixtures only; no target runners or GitHub repositories are changed.
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path $PSScriptRoot -Parent
+$functions = Join-Path $repo 'scripts\WindowsRunnerSetup.ps1'
+. $functions
+function Assert($Condition, [string] $Message) { if (-not $Condition) { throw $Message } }
+function Assert-Throws([scriptblock] $Action, [string] $Message) {
+    $rejected = $false
+    try { & $Action | Out-Null } catch { $rejected = $true }
+    Assert $rejected $Message
+}
+Assert ((Get-RunnerSetupScope 'https://github.com/AbsoluteZeroDev/') -eq 'orgs/AbsoluteZeroDev') 'Organization scope incorrect.'
+Assert ((Get-RunnerSetupScope 'https://github.com/example/project') -eq 'repos/example/project') 'Repository scope incorrect.'
+foreach ($url in 'http://github.com/example', 'https://other.example/example', 'https://github.com/example/project/more', 'https://github.com/example?token=x') {
+    Assert-Throws { Get-RunnerSetupScope $url } 'Unsafe target accepted.'
+}
+
+# Verify authentication reuses a credential and never starts login/refresh in unattended mode.
+$auth = @{ Calls = [Collections.Generic.List[string]]::new(); SignedIn = $true; CanRegister = $true; GrantedScopes = $null }
+$oldGhToken = $env:GH_TOKEN
+$oldGitHubToken = $env:GITHUB_TOKEN
+try {
+    Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+    function gh {
+        $auth.Calls.Add(($args -join ' '))
+        $global:LASTEXITCODE = 0
+        if ($args[0] -eq 'auth' -and $args[1] -eq 'status' -and -not $auth.SignedIn) { $global:LASTEXITCODE = 1 }
+        if ($args[0] -eq 'api' -and -not $auth.CanRegister) { $global:LASTEXITCODE = 1 }
+        if ($args -contains '--include' -and $auth.GrantedScopes) { "X-OAuth-Scopes: $($auth.GrantedScopes)" }
+    }
+    Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $true -WithSmoke $false
+    Assert (-not @($auth.Calls | Where-Object { $_ -match 'auth (login|refresh)' }).Count) 'Existing credential triggered sign-in.'
+    Assert (@($auth.Calls | Where-Object { $_ -like '*registration-token --silent' }).Count -eq 1) 'Runner permissions were not checked without token output.'
+    $auth.SignedIn = $false
+    Assert-Throws { Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $true -WithSmoke $false } 'Unattended setup accepted missing auth.'
+    $auth.Calls.Clear()
+    Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $false -WithSmoke $true
+    Assert (@($auth.Calls | Where-Object { $_ -like 'auth login*--web*admin:org,repo,workflow' }).Count -eq 1) 'Interactive setup did not request the required scopes.'
+    $auth.SignedIn = $true; $auth.GrantedScopes = 'repo, admin:org'; $auth.Calls.Clear()
+    Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $false -WithSmoke $true
+    Assert (@($auth.Calls | Where-Object { $_ -like 'auth refresh*workflow' }).Count -eq 1) 'Missing stored workflow scope was not requested.'
+    $auth.Calls.Clear()
+    Assert-Throws { Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $true -WithSmoke $true } 'Unattended smoke accepted missing workflow scope.'
+    Assert (-not @($auth.Calls | Where-Object { $_ -like 'auth refresh*' }).Count) 'Unattended smoke prompted for authorization.'
+    $auth.GrantedScopes = 'repo, admin:org, workflow'
+    Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $true -WithSmoke $true
+    $auth.SignedIn = $false
+    $env:GH_TOKEN = 'synthetic-test-value'
+    $auth.Calls.Clear()
+    Assert-Throws { Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $false -WithSmoke $true } 'Invalid environment credential triggered browser fallback.'
+    Assert (-not @($auth.Calls | Where-Object { $_ -match 'auth (login|refresh)' }).Count) 'Environment credential triggered sign-in.'
+} finally {
+    $env:GH_TOKEN = $oldGhToken
+    $env:GITHUB_TOKEN = $oldGitHubToken
+    Remove-Item Function:gh
+}
+
+# Verify the real high-level flow and pair-only targeting on hosts with more than two instances.
+. $functions
+$flow = @{ Auth = 0; Clones = @(); Installs = @(); Verified = 0; Smoke = @() }
+function Confirm-RunnerSetupAuthentication { param($Scope, $NonInteractive, $WithSmoke) $flow.Auth++ }
+function Sync-RunnerSetupInstance { param($Clone, $InstanceId, $SourceCommit, $GitHubUrl) $flow.Clones += $Clone }
+function Install-RunnerSetupInstance { param($Clone, $InstanceId, $GitHubUrl, $Labels) $flow.Installs += [pscustomobject]@{ Id = $InstanceId; Labels = $Labels } }
+function Get-RunnerSetupEvidence {
+    param($Clone, $InstanceId)
+    [pscustomobject]@{ Instance = $InstanceId; Name = "custom-$InstanceId"; AgentId = [int]$InstanceId.Substring(3); Workspace = "$Clone\work"; SupervisorPid = 100 + [int]$InstanceId.Substring(3) }
+}
+function Confirm-RunnerSetupHost { param($Instances, $Scope) $flow.Verified = $Instances.Count }
+function Invoke-RunnerSetupSmoke { param($Repository, $Label, $SourceClone, $ExpectedRunnerNames) $flow.Smoke += [pscustomobject]@{ Repo = $Repository; Label = $Label; Names = $ExpectedRunnerNames } }
+$options = @{ Count = 3; InstallRoot = 'C:\Fixtures'; GitHubUrl = 'https://github.com/AbsoluteZeroDev'; ExtraLabels = @('extra'); SourceCommit = ('a' * 40); SmokeRepository = 'AbsoluteZeroDev/RunnerSmoke'; NonInteractive = $true }
+Invoke-WindowsRunnerHostSetup @options
+Assert ($flow.Auth -eq 1 -and $flow.Verified -eq 3 -and $flow.Installs.Count -eq 3) 'Host setup skipped authentication, instances or verification.'
+Assert (($flow.Installs.Id -join ',') -eq 'win01,win02,win03') 'Instance IDs were not deterministic.'
+$pair = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())"
+Assert ($flow.Installs[0].Labels -contains $pair -and $flow.Installs[1].Labels -contains $pair -and $flow.Installs[2].Labels -notcontains $pair) 'Smoke targeting did not select only the first two instances.'
+Assert (($flow.Smoke[0].Names -join ',') -eq 'custom-win01,custom-win02') 'Smoke ignored actual persisted identities.'
+$options.SmokeRepository = 'DifferentOrg/Smoke'
+Assert-Throws { Invoke-WindowsRunnerHostSetup @options } 'Cross-target smoke repository accepted.'
+$options.SmokeRepository = ''
+$options.Count = 1
+Invoke-WindowsRunnerHostSetup @options
+Assert ($flow.Smoke.Count -eq 1) 'Setup dispatched a smoke test without a requested repository.'
+
+# Verify online state, remote/local ID equality, isolation and adding labels to existing registrations.
+. $functions
+$evidence = @(
+    [pscustomobject]@{ Instance = 'win01'; Name = 'one'; AgentId = 11; Workspace = 'C:\one'; SupervisorPid = 101; Labels = @('shared', 'host') },
+    [pscustomobject]@{ Instance = 'win02'; Name = 'two'; AgentId = 22; Workspace = 'C:\two'; SupervisorPid = 202; Labels = @('shared', 'host') }
+)
+$remoteFixture = @{ Offline = $false; WrongId = $false; Added = 0 }
+function Invoke-RunnerSetupGh {
+    param($Arguments)
+    if ($Arguments[1] -like '*/labels') { return [pscustomobject]@{ labels = @(@{ name = 'shared' }, @{ name = 'host' }) } }
+    @([pscustomobject]@{ runners = @(
+        @{ name = 'one'; id = $(if ($remoteFixture.WrongId) { 99 } else { 11 }); status = $(if ($remoteFixture.Offline) { 'offline' } else { 'online' }); labels = @(@{ name = 'shared' }) },
+        @{ name = 'two'; id = 22; status = 'online'; labels = @(@{ name = 'shared' }) }
+    ) })
+}
+Set-Item Function:gh -Value { $null = $input | Out-String; $remoteFixture.Added++; $global:LASTEXITCODE = 0 }
+Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example
+Assert ($remoteFixture.Added -eq 2) 'Existing runners did not receive their missing targeting labels.'
+$remoteFixture.Offline = $true
+Assert-Throws { Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example } 'Offline runner accepted.'
+$remoteFixture.Offline = $false; $remoteFixture.WrongId = $true
+Assert-Throws { Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example } 'Mismatched registration ID accepted.'
+$remoteFixture.WrongId = $false; $evidence[1].Workspace = 'C:\one'
+Assert-Throws { Confirm-RunnerSetupHost -Instances $evidence -Scope orgs/example } 'Shared workspace accepted.'
+Remove-Item Function:gh
+
+# Existing clone updates must protect identity, scope, local files and commits.
+. $functions
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ('host-setup-' + [guid]::NewGuid().ToString('N'))
+$cloneFixture = @{ Origin = 'https://github.com/The-Running-Dev/SubZeroDev.Runners.git'; Dirty = $false; Diverged = $false; Checkouts = 0 }
+try {
+    $clone = Join-Path $fixture 'win01'
+    New-Item -ItemType Directory -Path (Join-Path $clone '.git') -Force | Out-Null
+    $settingsPath = Join-Path $clone 'runners.local.json'
+    '{"windows":{"instanceId":"win01"},"github":{"url":"https://github.com/AbsoluteZeroDev"}}' | Set-Content $settingsPath
+    Set-Item Function:Invoke-RunnerSetupGit -Value {
+        param($Arguments, [switch] $Capture)
+        if ($Arguments -contains 'get-url') { return $cloneFixture.Origin }
+        if ($Arguments -contains '--porcelain' -and $cloneFixture.Dirty) { return ' M important.ps1' }
+        if ($Arguments -contains 'checkout') { $cloneFixture.Checkouts++ }
+    }
+    Set-Item Function:git -Value { $global:LASTEXITCODE = $(if ($cloneFixture.Diverged) { 1 } else { 0 }) }
+    $syncOptions = @{ Clone = $clone; InstanceId = 'win01'; SourceCommit = ('a' * 40); GitHubUrl = 'https://github.com/AbsoluteZeroDev' }
+    Sync-RunnerSetupInstance @syncOptions
+    Assert ($cloneFixture.Checkouts -eq 1) 'Clean clone was not advanced.'
+    $cloneFixture.Dirty = $true
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Dirty clone was overwritten.'
+    $cloneFixture.Dirty = $false; $cloneFixture.Diverged = $true
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Divergent commits were discarded.'
+    $cloneFixture.Diverged = $false
+    $before = Get-Content -Raw $settingsPath
+    $syncOptions.InstanceId = 'win02'
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Clone instance identity was reused.'
+    $syncOptions.InstanceId = 'win01'; $syncOptions.GitHubUrl = 'https://github.com/elsewhere'
+    Assert-Throws { Sync-RunnerSetupInstance @syncOptions } 'Saved GitHub target was silently replaced.'
+    Assert ((Get-Content -Raw $settingsPath) -eq $before -and $cloneFixture.Checkouts -eq 1) 'Rejected update changed settings or checked out code.'
+    Remove-Item Function:git
+
+    # Exercise the real optional smoke orchestration with synthetic GitHub responses and checker evidence.
+    . $functions
+    New-Item -ItemType Directory -Path (Join-Path $clone 'tests') -Force | Out-Null
+    Copy-Item (Join-Path $PSScriptRoot 'windows-runner-smoke.yml') (Join-Path $clone 'tests')
+    Copy-Item (Join-Path $PSScriptRoot 'Assert-WindowsRunnerSmoke.ps1') (Join-Path $clone 'tests')
+    $smokeFixture = @{ Mismatch = $false; Dispatch = $null; Writes = 0; Jobs = @(
+        @{ runner_name = 'custom-one'; runner_id = 11; conclusion = 'success'; steps = @(@{ name = 'Hold slot for overlap check'; started_at = '2026-11-05T10:00:00Z'; completed_at = '2026-11-05T10:01:30Z' }) },
+        @{ runner_name = 'custom-two'; runner_id = 22; conclusion = 'success'; steps = @(@{ name = 'Hold slot for overlap check'; started_at = '2026-11-05T10:00:10Z'; completed_at = '2026-11-05T10:01:40Z' }) }
+    ) }
+    $smokeFixture.Content = Get-Content -Raw (Join-Path $PSScriptRoot 'windows-runner-smoke.yml')
+    Set-Item Function:gh -Value {
+        $global:LASTEXITCODE = 0
+        if ($args[1] -eq 'repos/example/smoke') { return '{"private":true,"default_branch":"main"}' }
+        if ($args[1] -like '*/contents/*') {
+            $text = if ($smokeFixture.Mismatch) { 'an existing different workflow' } else { $smokeFixture.Content }
+            return (@{ content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text)) } | ConvertTo-Json)
+        }
+        if ($args[1] -like '*/jobs?*') { return (@{ total_count = 2; jobs = $smokeFixture.Jobs } | ConvertTo-Json -Depth 10) }
+    }
+    Set-Item Function:Send-RunnerSetupGh -Value {
+        param($Arguments, $Body)
+        $smokeFixture.Writes++
+        $smokeFixture.Dispatch = $Body
+    }
+    Set-Item Function:Invoke-RunnerSetupGh -Value {
+        param($Arguments)
+        @{ workflow_runs = @(@{ id = 81; display_title = "Windows runner smoke $($smokeFixture.Dispatch.inputs.setup_id)"; status = 'completed'; conclusion = 'success'; html_url = 'https://github.com/example/smoke/actions/runs/81' }) }
+    }
+    Invoke-RunnerSetupSmoke -Repository example/smoke -Label pair-label -SourceClone $clone -ExpectedRunnerNames @('custom-one', 'custom-two')
+    Assert ($smokeFixture.Writes -eq 1 -and $smokeFixture.Dispatch.inputs.runner_label -eq 'pair-label') 'Smoke workflow was overwritten or dispatch targeted the wrong pair.'
+    Assert ($smokeFixture.Dispatch.inputs.runner_names -eq '["custom-one","custom-two"]') 'Dispatch lost actual expected names.'
+    $smokeFixture.Mismatch = $true
+    Assert-Throws { Invoke-RunnerSetupSmoke -Repository example/smoke -Label pair-label -SourceClone $clone -ExpectedRunnerNames @('custom-one', 'custom-two') } 'Existing differing smoke workflow was overwritten.'
+    Assert ($smokeFixture.Writes -eq 1) 'Rejected smoke workflow caused a GitHub write.'
+    Remove-Item Function:gh
+} finally {
+    Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Output 'PASS: authentication, deterministic host orchestration, target/smoke boundaries, pair labels, registration identity/online checks and isolation (external operations mocked).'
+Write-Output 'PASS: dirty/divergent/mismatched clone rejection and automatic smoke dispatch/correlation/evidence checking without overwriting existing workflows (GitHub operations mocked).'
