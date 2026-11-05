@@ -75,6 +75,8 @@ try {
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($repair))
         $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Verb RunAs -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -Wait -PassThru
         if ($process.ExitCode) { throw 'Elevated WinGet repair failed. Rerun setup after resolving the displayed App Installer error.' }
+        # Register/repair for the original user too, including when UAC used another administrator.
+        Repair-WinGetPackageManager -Force -Latest -ErrorAction Stop | Out-Host
     }
 }
 

@@ -17,7 +17,7 @@ foreach ($url in 'http://github.com/example', 'https://other.example/example', '
 }
 
 # Verify authentication reuses a credential and never starts login/refresh in unattended mode.
-$auth = @{ Calls = [Collections.Generic.List[string]]::new(); SignedIn = $true; CanRegister = $true }
+$auth = @{ Calls = [Collections.Generic.List[string]]::new(); SignedIn = $true; CanRegister = $true; GrantedScopes = $null }
 $oldGhToken = $env:GH_TOKEN
 $oldGitHubToken = $env:GITHUB_TOKEN
 try {
@@ -27,6 +27,7 @@ try {
         $global:LASTEXITCODE = 0
         if ($args[0] -eq 'auth' -and $args[1] -eq 'status' -and -not $auth.SignedIn) { $global:LASTEXITCODE = 1 }
         if ($args[0] -eq 'api' -and -not $auth.CanRegister) { $global:LASTEXITCODE = 1 }
+        if ($args -contains '--include' -and $auth.GrantedScopes) { "X-OAuth-Scopes: $($auth.GrantedScopes)" }
     }
     Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $true -WithSmoke $false
     Assert (-not @($auth.Calls | Where-Object { $_ -match 'auth (login|refresh)' }).Count) 'Existing credential triggered sign-in.'
@@ -36,6 +37,15 @@ try {
     $auth.Calls.Clear()
     Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $false -WithSmoke $true
     Assert (@($auth.Calls | Where-Object { $_ -like 'auth login*--web*admin:org,repo,workflow' }).Count -eq 1) 'Interactive setup did not request the required scopes.'
+    $auth.SignedIn = $true; $auth.GrantedScopes = 'repo, admin:org'; $auth.Calls.Clear()
+    Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $false -WithSmoke $true
+    Assert (@($auth.Calls | Where-Object { $_ -like 'auth refresh*workflow' }).Count -eq 1) 'Missing stored workflow scope was not requested.'
+    $auth.Calls.Clear()
+    Assert-Throws { Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $true -WithSmoke $true } 'Unattended smoke accepted missing workflow scope.'
+    Assert (-not @($auth.Calls | Where-Object { $_ -like 'auth refresh*' }).Count) 'Unattended smoke prompted for authorization.'
+    $auth.GrantedScopes = 'repo, admin:org, workflow'
+    Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $true -WithSmoke $true
+    $auth.SignedIn = $false
     $env:GH_TOKEN = 'synthetic-test-value'
     $auth.Calls.Clear()
     Assert-Throws { Confirm-RunnerSetupAuthentication -Scope orgs/AbsoluteZeroDev -NonInteractive $false -WithSmoke $true } 'Invalid environment credential triggered browser fallback.'
