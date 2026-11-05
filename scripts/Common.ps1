@@ -31,42 +31,7 @@ $WindowsTaskName = 'Start Windows runner'
 $LogTrimTaskName = 'Trim logs'
 # Named instances live in separate clones, with their own tasks and supervisor.
 if ($Config.windows.instanceId) {
-    if ($Config.windows.instanceId -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}
-
-# The running supervisor, found through the pid file it writes. A pid that now belongs to
-# another process (stale file after a hard kill) is ignored and the file removed.
-function Get-SupervisorProcess {
-    if (-not (Test-Path -LiteralPath $SupervisorPidFile)) { return }
-    $id = [int](Get-Content -LiteralPath $SupervisorPidFile -TotalCount 1)
-    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$id"
-    if ($process -and $process.CommandLine -and $process.CommandLine.TrimEnd().EndsWith(('"' + $Supervisor + '"'))) { return $process }
-    Remove-Item -LiteralPath $SupervisorPidFile -ErrorAction SilentlyContinue
-}
-
-# True while the Windows runner is executing a job (its Runner.Worker exists).
-function Test-WindowsRunnerBusy {
-    [bool](Get-CimInstance Win32_Process -Filter "Name='Runner.Worker.exe'" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($WindowsRunner, [StringComparison]::OrdinalIgnoreCase) })
-}
-
-# True while the Linux container is executing a job.
-function Test-LinuxRunnerBusy {
-    & $Docker exec $Config.linux.container pgrep -f Runner.Worker 2>$null | Out-Null
-    $LASTEXITCODE -eq 0
-}
-
-# A Windows toast. Clicking it opens $Open (a log file) when given.
-function Show-Notification([string] $Title, [string] $Message, [string] $Open) {
-    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'Show-Notification.ps1'), '-Title', $Title, '-Message', $Message)
-    if ($Open) { $arguments += '-Open', $Open }
-    # Toasts need the WinRT projection, which only Windows PowerShell 5.1 has.
-    & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @arguments
-}
-
-# A hidden, profile-free pwsh command line for a script in this folder.
-function Get-HiddenPwshCommand([string] $Script) {
-    "`"$Pwsh`" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $PSScriptRoot $Script)`""
-}
-) { throw 'Invalid windows.instanceId: use 1-40 letters, digits, underscores or hyphens.' }
+    if ($Config.windows.instanceId -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$') { throw 'Invalid windows.instanceId: use 1-40 letters, digits, underscores or hyphens.' }
     $WindowsMutexName += ".$($Config.windows.instanceId)"
     $WindowsTaskName += " ($($Config.windows.instanceId))"
     $LogTrimTaskName += " ($($Config.windows.instanceId))"

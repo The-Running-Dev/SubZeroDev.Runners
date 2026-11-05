@@ -1,0 +1,20 @@
+name: Windows runner validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  instances:
+    name: PowerShell parser and instance regressions
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse all PowerShell files and exercise isolated instances
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerInstances.ps1
