@@ -12,7 +12,10 @@ param(
     [string] $GitHubUrl = 'https://github.com/AbsoluteZeroDev',
     [string] $WorkFolder = '%TEMP%\szr',
     # Take over a runner already registered under -Name elsewhere; that machine stops receiving jobs.
-    [switch] $Replace
+    [switch] $Replace,
+    # One clone per instance. Gives each instance its own name, workspace, mutex and tasks.
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')]
+    [string] $InstanceId
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -34,9 +37,32 @@ if ($LASTEXITCODE) { throw 'Sign in first: gh auth login --hostname github.com -
 $localPath = Join-Path $root 'runners.local.json'
 $local = if (Test-Path -LiteralPath $localPath) { Get-Content -Raw $localPath | ConvertFrom-Json -AsHashtable } else { @{} }
 $shared = Get-Content -Raw (Join-Path $root 'runners.json') | ConvertFrom-Json
+if ($InstanceId -and $local.windows.instanceId -and $local.windows.instanceId -ne $InstanceId) {
+    throw "This clone belongs to instance $($local.windows.instanceId). Use a separate clone for $InstanceId."
+}
+$existingDirectory = if ($local.windows.directory) { $local.windows.directory } else { $shared.windows.directory }
+if ($InstanceId -and -not $local.windows.instanceId -and (Test-Path -LiteralPath (Join-Path $root "$existingDirectory\.runner"))) {
+    throw 'This clone already has an unnamed runner. Use a fresh clone for a named instance.'
+}
+# Windows task names are case-insensitive; retain the saved spelling so a rerun cannot change the mutex.
+if ($local.windows.instanceId) { $InstanceId = $local.windows.instanceId }
+if ($InstanceId -and $InstanceId -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$') {
+    throw 'Invalid windows.instanceId: use 1-40 letters, digits, underscores or hyphens.'
+}
+if (-not $PSBoundParameters.ContainsKey('GitHubUrl') -and $local.github.url) { $GitHubUrl = $local.github.url }
+if (-not $PSBoundParameters.ContainsKey('ExtraLabels')) { $ExtraLabels = @($local.windows.labels | Where-Object { $_ }) }
+if (-not $PSBoundParameters.ContainsKey('Name')) {
+    if ($local.windows.name) { $Name = $local.windows.name }
+    elseif ($InstanceId) { $Name += ".$InstanceId" }
+}
+if (-not $PSBoundParameters.ContainsKey('WorkFolder')) {
+    if ($local.windows.workFolder) { $WorkFolder = $local.windows.workFolder }
+    elseif ($InstanceId) { $WorkFolder = "%TEMP%\szr\$InstanceId" }
+}
 $local.github = $local.github ?? @{}
 $local.github.url = $GitHubUrl
 $local.windows = $local.windows ?? @{}
+if ($InstanceId) { $local.windows.instanceId = $InstanceId }
 $local.windows.name = $Name
 $local.windows.labels = @(@($shared.windows.labels) + $ExtraLabels | Select-Object -Unique)
 $local.windows.workFolder = $WorkFolder
@@ -108,7 +134,7 @@ else {
 }
 
 # Start at sign-in: the supervisor itself, not Start-Runners.ps1, which also needs Docker Desktop and the Linux container.
-Unregister-ScheduledTask -TaskPath $TaskPath -TaskName 'Start runners' -Confirm:$false -ErrorAction SilentlyContinue
+if (-not $InstanceId) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName 'Start runners' -Confirm:$false -ErrorAction SilentlyContinue }
 $user = "$env:USERDOMAIN\$env:USERNAME"
 $action = New-ScheduledTaskAction -Execute $Pwsh -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Supervisor`"" -WorkingDirectory $WindowsRunner
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
@@ -116,10 +142,10 @@ $trigger.Delay = 'PT30S'
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 # The supervisor never exits on its own, so no time limit; it also holds a mutex against a second copy.
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskPath $TaskPath -TaskName 'Start Windows runner' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the SubZeroDev Windows runner supervisor at sign-in.' -Force | Out-Null
+Register-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the SubZeroDev Windows runner supervisor at sign-in.' -Force | Out-Null
 & (Join-Path $PSScriptRoot 'Register-LogTrimTask.ps1')
 
-if (-not (Get-SupervisorProcess)) { Start-ScheduledTask -TaskPath $TaskPath -TaskName 'Start Windows runner' }
+if (-not (Get-SupervisorProcess)) { Start-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName }
 for ($attempt = 0; $attempt -lt 24 -and ($status = Get-RunnerStatus) -ne 'online'; $attempt++) { Start-Sleep -Seconds 5 }
 if ($status -ne 'online') { throw "$Name is $status after 2 minutes; see the newest Console_*.log in $(Join-Path $WindowsRunner '_diag')." }
 Write-Output "$Name is online with labels self-hosted, Windows, X64, $labels."

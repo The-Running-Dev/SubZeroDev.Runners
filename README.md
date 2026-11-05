@@ -45,12 +45,12 @@ Neither needs inbound ports.
 | `Stop-Runners.ps1 [-Drain] [-TimeoutMinutes 120]` | Kills the Windows supervisor (from `supervisor.pid`) and its runner, stops the Linux container, then the sidecar (in sidecar mode). `-Drain` first waits for running jobs to finish and stops nothing if one is still running at the timeout. Registrations stay |
 | `Register-Runners.ps1` | Drains and stops both runners, removes their current registrations, registers them under `github.url` with the names and labels from `runners.json`, starts them. Needs `gh` signed in as an admin |
 | `Set-WindowsStartup.ps1 [-Mode Disabled\|Logon]` | Applies `windows.startup` (or `-Mode`). `Logon` registers `\SubZeroDev.Runners\Start runners`, run 30 s after this user signs in and retried up to three times if `Start-Runners.ps1` fails; `Disabled` removes it. Both remove the older `SubZeroDev.Runners` Run entry (Windows could skip it at sign-in) |
-| `Install-WindowsRunner.ps1 [-Name] [-ExtraLabels] [-GitHubUrl] [-WorkFolder] [-Replace]` | Sets up the Windows runner alone on another machine (no Docker Desktop, no Linux runner), from a clone outside Dropbox, as a non-elevated user: writes `runners.local.json`, downloads the runner and checks its published SHA-256, installs the private .NET 10 SDK, registers it under a per-machine name (default `subzerodev.runner.windows.<computer>`) with the shared labels plus `-ExtraLabels`, and registers `\SubZeroDev.Runners\Start Windows runner` (the supervisor at sign-in) and the log trim. Refuses a name already registered elsewhere unless `-Replace`. On such a machine, stop it with `taskkill /PID (Get-Content windows\supervisor.pid) /T /F`; the scripts that also drive Docker do not apply there |
+| `Install-WindowsRunner.ps1 [-InstanceId] [-Name] [-ExtraLabels] [-GitHubUrl] [-WorkFolder] [-Replace]` | Sets up the Windows runner alone on another machine (no Docker Desktop, no Linux runner), from a clone outside Dropbox, as a non-elevated user: writes `runners.local.json`, downloads the runner and checks its published SHA-256, installs the private .NET 10 SDK, registers it under a per-machine name (default `subzerodev.runner.windows.<computer>`) with the shared labels plus `-ExtraLabels`, and registers `\SubZeroDev.Runners\Start Windows runner` (the supervisor at sign-in) and the log trim. Refuses a name already registered elsewhere unless `-Replace`. On such a machine, stop it with `taskkill /PID (Get-Content windows\supervisor.pid) /T /F`; the scripts that also drive Docker do not apply there |
 | `New-LinuxRunner.ps1 [-Build]` | Recreates the Docker sidecar (when `linux.docker.mode` is `sidecar`; removes it otherwise) and the container from `runners.json` (`-Build` rebuilds the image first, on `linux.baseImage`) and keeps the registration's work folder in step |
 | `Set-DropboxIgnored.ps1` | Marks everything matched by `dropbox-ignore.txt` with `com.dropbox.ignored`. Idempotent |
 | `Trim-RunnerLogs.ps1` | Deletes `_diag` files older than `logs.retentionDays` in both runners, keeping the newest Runner/Worker/Console log of each runner |
 | `Register-LogTrimTask.ps1` | Schedules the trim daily at `logs.trimAt` as `\SubZeroDev.Runners\Trim logs`. `trimAt: null` removes it |
-| `Run-WindowsRunner.ps1` | The supervisor: one instance per user (mutex), writes `supervisor.pid`, relaunches `run.cmd` 30 s after it exits, one `_diag\Console_*-utc.log` per launch, and a toast after three quick exits in a row |
+| `Run-WindowsRunner.ps1` | The supervisor: one supervisor per named Windows instance (mutex; unnamed installations keep the original mutex), writes `supervisor.pid`, relaunches `run.cmd` 30 s after it exits, one `_diag\Console_*-utc.log` per launch, and a toast after three quick exits in a row |
 | `Show-Notification.ps1` | Windows toast (runs under Windows PowerShell 5.1, which has WinRT); used by the two above |
 | `Clear-WindowsActionCache.ps1`, `Clear-LinuxWorkspace.sh` | Job-completed hooks: clear downloaded actions (and Linux checkouts) with retries; on Linux also the job's leftover containers, networks and anonymous volumes. NuGet caches, images and build cache stay |
 
@@ -65,6 +65,51 @@ docker logs --tail 40 subzerodev-runner-linux
 After editing `runners.json` or `runners.local.json`: rerun `Set-WindowsStartup.ps1` for `windows.startup`,
 `Register-LogTrimTask.ps1` for `logs`, `New-LinuxRunner.ps1` for anything under `linux`,
 `Register-Runners.ps1` for `github` or a runner name.
+
+## Multiple Windows runners on one machine
+
+For complete prerequisite, installation, scheduled-task verification and concurrent-job smoke commands,
+see [the two-runner Windows runbook](docs/windows-two-runners.md).
+
+Use a **separate clone outside Dropbox for each instance**. The Windows installer accepts
+`-InstanceId`: it appends the ID to the default per-machine name and gives each instance
+its own workspace, supervisor mutex, startup task and log trim task. Each clone also keeps
+its own registration, binaries, private SDK, NuGet cache and logs. Instance IDs must be unique on the host.
+
+From a normal, non-elevated PowerShell 7 window on the target machine, with Git, GitHub CLI
+and PowerShell 7 installed, sign in if needed:
+
+```powershell
+gh auth login --hostname github.com --web --scopes admin:org
+$ErrorActionPreference = 'Stop'
+foreach ($id in 'win01', 'win02') {
+    $clone = Join-Path 'C:\Actions' $id
+    if (-not (Test-Path -LiteralPath $clone)) {
+        git clone https://github.com/The-Running-Dev/SubZeroDev.Runners.git $clone
+        if ($LASTEXITCODE) { throw "Cloning $id failed." }
+    }
+    & "$clone\scripts\Install-WindowsRunner.ps1" -InstanceId $id -ExtraLabels subzerodev-windows-large
+}
+gh api orgs/AbsoluteZeroDev/actions/runners --paginate --jq '.runners[] | {name,status,busy}'
+```
+
+The default target is https://github.com/AbsoluteZeroDev; pass `-GitHubUrl` to use another
+organization or repository. Existing clones must contain the updated installer.
+Do not copy a configured runner folder or reuse a clone for a different instance ID.
+Reruns retain the saved instance ID, runner name and workspace unless explicitly changed.
+
+Default workspaces are `%TEMP%\szr\win01` and `%TEMP%\szr\win02`.
+Custom absolute `-WorkFolder` values must differ. Startup tasks are
+`Start Windows runner (win01)` / `Start Windows runner (win02)` under
+`\SubZeroDev.Runners\`, with corresponding named trim tasks.
+
+Both retain `subzerodev-windows`, so existing eligible jobs can run concurrently, up to two.
+Use `subzerodev-windows-large` to target only this machine. There are no per-runner CPU/RAM
+limits; jobs share the host user, installed tools, ports and machine-wide state.
+Two is a starting concurrency setting; available RAM alone does not determine capacity.
+
+Startup still requires the Windows user to sign in. Use the Windows-only installer/supervisor;
+the combined start/stop/register scripts also manage Linux and Docker.
 
 ## Using the runners from a repository
 

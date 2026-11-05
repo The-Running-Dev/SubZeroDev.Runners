@@ -26,6 +26,16 @@ $Supervisor = Join-Path $PSScriptRoot 'Run-WindowsRunner.ps1'
 $SupervisorPidFile = Join-Path $WindowsRunner 'supervisor.pid'
 $StartupValueName = 'SubZeroDev.Runners'
 $TaskPath = '\SubZeroDev.Runners\'
+$WindowsMutexName = 'Local\SubZeroDev.Runners.Windows'
+$WindowsTaskName = 'Start Windows runner'
+$LogTrimTaskName = 'Trim logs'
+# Named instances live in separate clones, with their own tasks and supervisor.
+if ($Config.windows.instanceId) {
+    if ($Config.windows.instanceId -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$') { throw 'Invalid windows.instanceId: use 1-40 letters, digits, underscores or hyphens.' }
+    $WindowsMutexName += ".$($Config.windows.instanceId)"
+    $WindowsTaskName += " ($($Config.windows.instanceId))"
+    $LogTrimTaskName += " ($($Config.windows.instanceId))"
+}
 
 # The running supervisor, found through the pid file it writes. A pid that now belongs to
 # another process (stale file after a hard kill) is ignored and the file removed.

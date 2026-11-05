@@ -1,0 +1,23 @@
+name: Windows runner validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  instances:
+    name: PowerShell parser and instance regressions
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Parse all PowerShell files and exercise isolated instances
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerInstances.ps1
+      - name: Verify smoke evidence checker with synthetic job results
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerSmokeEvidence.ps1
