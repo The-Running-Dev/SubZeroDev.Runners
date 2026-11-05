@@ -14,7 +14,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Parse all PowerShell files and exercise isolated instances
         shell: pwsh
         run: ./tests/Test-WindowsRunnerInstances.ps1

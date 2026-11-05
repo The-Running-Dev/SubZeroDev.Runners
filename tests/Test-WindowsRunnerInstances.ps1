@@ -9,6 +9,7 @@ foreach ($file in Get-ChildItem (Join-Path $repo 'scripts'), $PSScriptRoot -Filt
     $ast = [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)
     if ($parseErrors.Count) { throw "PowerShell syntax errors in $($file.FullName): $($parseErrors -join '; ')" }
     if ($file.Name -eq 'Install-WindowsRunner.ps1') {
+        $installerParameters = $ast.ParamBlock.Extent.Text
         $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
         if (($parameterNames -join ',') -ne 'Name,ExtraLabels,GitHubUrl,WorkFolder,Replace,InstanceId') {
             throw 'Installer parameter order changed or the instance parameter is missing.'
@@ -29,7 +30,7 @@ Write-Output 'PASS: complete PowerShell files parse; installer parameter order a
 $installer = Get-Content -Raw (Join-Path $repo 'scripts\Install-WindowsRunner.ps1')
 $start = $installer.IndexOf('$localPath =')
 $end = $installer.IndexOf('$parts =')
-$setup = [scriptblock]::Create($installer.Substring($start, $end - $start).Replace('$PSScriptRoot\Common.ps1', '$root\scripts\Common.ps1'))
+$setup = [scriptblock]::Create($installerParameters + "`n" + $installer.Substring($start, $end - $start).Replace('$PSScriptRoot\Common.ps1', '$root\scripts\Common.ps1'))
 $startup = [scriptblock]::Create($installer.Substring($installer.IndexOf('# Start at sign-in:')))
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('runner-instances-' + [guid]::NewGuid().ToString('N'))
 function Assert($Condition, [string] $Message) {
@@ -46,7 +47,9 @@ function New-Fixture([string] $Id) {
 function Invoke-Settings {
     param([string] $Clone, [string] $InstanceId, [string] $Name = "subzerodev.runner.windows.$($env:COMPUTERNAME.ToLowerInvariant())", [string] $WorkFolder = '%TEMP%\szr', [string[]] $ExtraLabels = @(), [string] $GitHubUrl = 'https://github.com/AbsoluteZeroDev')
     $root = $Clone
-    . $setup
+    $arguments = @{}
+    foreach ($key in $PSBoundParameters.Keys) { if ($key -ne 'Clone') { $arguments[$key] = $PSBoundParameters[$key] } }
+    . $setup @arguments
     [pscustomobject]@{ Config = $Config; Mutex = $WindowsMutexName; StartTask = $WindowsTaskName; TrimTask = $LogTrimTaskName; Runner = $WindowsRunner }
 }
 function Test-TaskPlan([string] $Clone) {
