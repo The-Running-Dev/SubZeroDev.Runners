@@ -15,6 +15,8 @@ Windows may request package-installation elevation or an elevated WinGet repair;
 runner registration and job processes continue under the original unelevated user. A new GitHub login
 still requires your browser/device approval. Windows Server/Core, LocalSystem and an elevated runner
 account are not supported by this interactive-user setup.
+The bootstrap permits scripts/modules for its current PowerShell process only; it does not change
+the machine's or user's persistent execution policy, and enforced organization policy still applies.
 
 Defaults: two instances (`win01`, `win02`) in `%LOCALAPPDATA%\SubZeroDev\Runners`, registered to
 `AbsoluteZeroDev`, with sign-in tasks. The `_setup` directory is a reserved controller checkout;

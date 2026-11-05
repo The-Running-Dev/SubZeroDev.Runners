@@ -129,6 +129,8 @@ function Start-WindowsRunnerSetup {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Use 64-bit PowerShell on x64 Windows 10/11 or a compatible Windows VM.' }
     $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Open a normal PowerShell window and run this same setup. Package installers request elevation separately; runner jobs must run unelevated.' }
+    # Stock client policy can block the WinGet repair modules. Do not change persistent policy.
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop
     if (-not [IO.Path]::IsPathRooted($InstallRoot) -or $InstallRoot -match '(?i)\\Dropbox(\\|$)') { throw 'InstallRoot must be an absolute path outside Dropbox.' }
     $fullRoot = [IO.Path]::GetFullPath($InstallRoot)
     if ($fullRoot -eq [IO.Path]::GetPathRoot($fullRoot)) { throw 'InstallRoot must be a dedicated directory, not a drive root.' }
