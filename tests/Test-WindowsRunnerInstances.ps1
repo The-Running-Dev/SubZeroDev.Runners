@@ -3,7 +3,8 @@
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 # Parse complete files before extracting the settings phase. A valid fragment must not hide a broken installer.
-foreach ($file in Get-ChildItem (Join-Path $repo 'scripts'), $PSScriptRoot -Filter *.ps1 -Recurse) {
+$files = @(Get-ChildItem (Join-Path $repo 'scripts'), $PSScriptRoot -Filter *.ps1 -Recurse) + @(Get-Item (Join-Path $repo 'Setup-WindowsRunners.ps1'))
+foreach ($file in $files) {
     $tokens = $null
     $parseErrors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)

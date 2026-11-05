@@ -1,6 +1,7 @@
 # Copy to .github/workflows/windows-runner-smoke.yml in an authorized AbsoluteZeroDev repository.
 # Deliberately a template: this personal-account repository cannot use organization-scoped runners.
 name: Windows runner concurrency smoke
+run-name: Windows runner smoke ${{ inputs.setup_id }}
 
 on:
   workflow_dispatch:
@@ -9,13 +10,26 @@ on:
         description: Windows COMPUTERNAME of the two-runner host
         required: true
         type: string
+      runner_label:
+        description: Label targeting the pair of runners being tested
+        default: subzerodev-windows-large
+        required: true
+        type: string
+      runner_names:
+        description: Optional JSON array of the two expected runner names
+        default: ''
+        type: string
+      setup_id:
+        description: Correlation ID used by automated setup
+        default: manual
+        type: string
 
 permissions: {}
 
 jobs:
   slot:
     name: Smoke slot ${{ matrix.slot }}
-    runs-on: [self-hosted, Windows, subzerodev-windows-large]
+    runs-on: [self-hosted, Windows, '${{ inputs.runner_label }}']
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -24,6 +38,7 @@ jobs:
         slot: [1, 2]
     env:
       EXPECTED_COMPUTER: ${{ inputs.computer_name }}
+      EXPECTED_NAMES: ${{ inputs.runner_names }}
     steps:
       - name: Hold slot for overlap check
         shell: pwsh
@@ -31,6 +46,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ($env:COMPUTERNAME -ine $env:EXPECTED_COMPUTER) { throw 'Job reached a different machine.' }
           $expected = @('win01', 'win02') | ForEach-Object { "subzerodev.runner.windows.$($env:EXPECTED_COMPUTER.ToLowerInvariant()).$_" }
+          if ($env:EXPECTED_NAMES) { $expected = @($env:EXPECTED_NAMES | ConvertFrom-Json) }
+          if ($expected.Count -ne 2) { throw 'Exactly two expected runner names are required.' }
           if ($env:RUNNER_NAME -notin $expected) { throw "Unexpected runner: $env:RUNNER_NAME" }
           Write-Output "Runner=$env:RUNNER_NAME Computer=$env:COMPUTERNAME Workspace=$env:GITHUB_WORKSPACE Start=$([DateTime]::UtcNow.ToString('o'))"
           Start-Sleep -Seconds 90

@@ -21,3 +21,9 @@ jobs:
       - name: Verify smoke evidence checker with synthetic job results
         shell: pwsh
         run: ./tests/Test-WindowsRunnerSmokeEvidence.ps1
+      - name: Exercise bootstrap under stock Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Test-WindowsRunnerBootstrap.ps1
+      - name: Exercise automated host setup with isolated fixtures
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerHostSetup.ps1

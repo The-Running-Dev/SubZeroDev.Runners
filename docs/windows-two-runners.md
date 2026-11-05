@@ -1,5 +1,70 @@
 # Two native Windows runners on one host
 
+## Automatic setup (recommended)
+
+Open a **normal, non-elevated Windows PowerShell** window on a new x64 Windows desktop or VM:
+
+```powershell
+& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1')))
+```
+
+No manual Git clone, prerequisite installation, terminal restart or registration token copying is needed.
+The entry point supports Windows PowerShell 5.1. It uses Microsoft's `Microsoft.WinGet.Client` repair
+route if WinGet is missing/broken, then silently installs missing PowerShell 7.2+, Git and GitHub CLI.
+Windows may request package-installation elevation or an elevated WinGet repair; the GitHub setup,
+runner registration and job processes continue under the original unelevated user. A new GitHub login
+still requires your browser/device approval. Windows Server/Core, LocalSystem and an elevated runner
+account are not supported by this interactive-user setup.
+
+Defaults: two instances (`win01`, `win02`) in `%LOCALAPPDATA%\SubZeroDev\Runners`, registered to
+`AbsoluteZeroDev`, with sign-in tasks. The `_setup` directory is a reserved controller checkout;
+each instance has its own clone. All clones use one resolved source commit for that run. Package
+installs requiring a reboot stop setup and ask you to rerun after the reboot; setup never reboots for you.
+
+```powershell
+# Existing C:\Actions layout / 128 GB host:
+& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) -InstallRoot C:\Actions -ExtraLabels subzerodev-windows-large -SmokeRepository AbsoluteZeroDev/RunnerSmoke
+
+# Another machine: four instances, automatic registration/startup checks:
+& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) -Count 4
+```
+
+Rerunning skips working prerequisites, retains saved names/workspaces/custom labels, keeps the original
+instance spelling, and only advances clean runner clones. Dirty checkouts, local commits that would be
+discarded, another clone/instance identity, and a different saved GitHub target stop setup. For a custom
+target, repeat the same `-GitHubUrl` on reruns. Lowering `-Count` never uninstalls additional instances.
+No `--replace`, `git reset`, `git clean`, auto-logon or host reboot is performed.
+
+Every instance also gets a `subzerodev-host-<computer>` label. Only the first two receive
+`subzerodev-pair-<computer>` for the concurrent-job test; this works even on a host with more than two
+runners. The `subzerodev-windows-large` label is opt-in so ordinary VMs do not receive large-host jobs.
+
+Add `-SmokeRepository AbsoluteZeroDev/RunnerSmoke` to automate the actual GitHub job smoke test.
+Setup creates the named repository private if missing and installs the manual-only smoke workflow if
+absent, then dispatches and checks two distinct expected identities plus overlapping execution. An
+existing repository must be private, within the target organization (or be the exact repository-scoped
+runner target), and permitted by the runner group. Setup does not widen runner-group access or overwrite
+a differing workflow. OAuth credentials need `repo,workflow` access for workflow creation as well as
+runner administration; initial interactive login requests these scopes when smoke is selected. Queued
+or unfinished smoke runs time out after eight minutes and are cancelled when their ID is known.
+
+For unattended provisioning, supply `GH_TOKEN` through the VM provisioner's environment or provision
+a GitHub CLI login in that user profile, then pass `-NonInteractive`. Setup never saves that token to
+its options file, prints it, or embeds it in command arguments. Existing supervisor code strips
+`GH_TOKEN` and `GITHUB_TOKEN` from job environments. OS elevation/reboot requirements still apply;
+preinstall machine-wide prerequisites if a provisioner cannot handle UAC.
+
+If using a local checkout, run `.\Setup-WindowsRunners.ps1` with the same options. `-SourceRef` accepts
+a repository branch/tag/commit (default `main`); it must contain the setup worker. Automated CI exercises
+stock Windows PowerShell parsing and mocked package/authentication/host flows. It does not install
+WinGet on a clean VM or prove registration/startup on the target machine. The script's host checks and,
+if selected, the actual smoke run provide that evidence when you execute it there.
+
+Microsoft's repair reference: <https://learn.microsoft.com/en-us/windows/package-manager/winget/troubleshooting>.
+GitHub CLI environment authentication: <https://cli.github.com/manual/gh_help_environment>.
+
+## Manual setup and inspection
+
 These commands configure two independent clones on the 128 GB Windows machine. Run the installer as the normal Windows user whose account will execute jobs. Startup is at that user's sign-in, not at boot. Both jobs share the host's CPU, memory, installed tools and ports; there are no per-runner resource limits.
 
 ## Prerequisites

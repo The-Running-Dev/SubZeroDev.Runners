@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)] [string] $Repository,
     [Parameter(Mandatory)] [long] $RunId,
-    [string] $ComputerName = $env:COMPUTERNAME
+    [string] $ComputerName = $env:COMPUTERNAME,
+    [string[]] $ExpectedRunnerNames
 )
 $ErrorActionPreference = 'Stop'
 $json = gh api "repos/$Repository/actions/runs/$RunId/jobs?filter=latest&per_page=100"
@@ -12,6 +13,8 @@ $response = $json | ConvertFrom-Json
 if ($response.total_count -ne 2) { throw 'Expected exactly two smoke jobs.' }
 $jobs = @($response.jobs)
 $expected = @('win01', 'win02') | ForEach-Object { "subzerodev.runner.windows.$($ComputerName.ToLowerInvariant()).$_" }
+if ($ExpectedRunnerNames) { $expected = @($ExpectedRunnerNames) }
+if ($expected.Count -ne 2 -or @($expected | Select-Object -Unique).Count -ne 2) { throw 'Exactly two distinct expected runner names are required.' }
 if (@($jobs | Where-Object { $_.conclusion -ne 'success' }).Count) { throw 'Both smoke jobs must finish successfully.' }
 if (@($jobs.runner_id | Select-Object -Unique).Count -ne 2 -or (Compare-Object ($jobs.runner_name | Sort-Object) ($expected | Sort-Object))) {
     throw 'Jobs did not use the two expected runner identities.'

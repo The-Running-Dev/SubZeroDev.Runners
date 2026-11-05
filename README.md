@@ -21,6 +21,36 @@ Any other setting placed there overrides `runners.json` on this machine only. Ea
 Each runner takes one job at a time, so one Windows and one Linux job can run together.
 Neither needs inbound ports.
 
+## One-command Windows setup
+
+On a new x64 Windows machine or VM, open a **normal Windows PowerShell window** and paste:
+
+```powershell
+& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1')))
+```
+
+This repairs missing/broken WinGet, installs missing PowerShell 7/Git/GitHub CLI, refreshes PATH,
+opens GitHub authorization if necessary, and installs **two** independent runners under
+`%LOCALAPPDATA%\SubZeroDev\Runners`. It verifies local tasks, supervisor processes, private .NET 10 SDKs,
+GitHub registration IDs, online state and labels before reporting success. Approve any Windows
+package-installer elevation prompts and the first GitHub sign-in; the runners remain unelevated.
+
+For automatic real parallel-job validation too:
+
+```powershell
+& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) -SmokeRepository AbsoluteZeroDev/RunnerSmoke
+```
+
+The optional smoke repository is created **private** if missing, receives a manual-only validation
+workflow if absent, and must be allowed by the organization runner group. Existing different workflows
+are never overwritten. Setup dispatches the test, waits, and checks distinct runner IDs and overlapping
+execution. Without this option it reports registration/startup verification only.
+
+Use `-Count 4` for four instances, `-InstallRoot C:\Actions` to adopt the earlier layout,
+`-ExtraLabels subzerodev-windows-large` only for the large host, or `-NonInteractive` with an already
+provisioned `GH_TOKEN`/GitHub CLI login. Tokens are never accepted in command arguments or written to
+setup options. See [the Windows runbook](docs/windows-two-runners.md) for details and limitations.
+
 ## Layout
 
 | Path | Contents |
