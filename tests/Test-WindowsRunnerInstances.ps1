@@ -31,7 +31,7 @@ $installer = Get-Content -Raw (Join-Path $repo 'scripts\Install-WindowsRunner.ps
 $start = $installer.IndexOf('$localPath =')
 $end = $installer.IndexOf('$parts =')
 $setup = [scriptblock]::Create($installerParameters + "`n" + $installer.Substring($start, $end - $start).Replace('$PSScriptRoot\Common.ps1', '$root\scripts\Common.ps1'))
-$startup = [scriptblock]::Create($installer.Substring($installer.IndexOf('# Start at sign-in:')))
+$startup = [scriptblock]::Create($installer.Substring($installer.IndexOf('# Start at sign-in:')).Replace('$PSScriptRoot', "(Join-Path `$Clone 'scripts')"))
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('runner-instances-' + [guid]::NewGuid().ToString('N'))
 function Assert($Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }

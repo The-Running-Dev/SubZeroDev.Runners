@@ -18,3 +18,6 @@ jobs:
       - name: Parse all PowerShell files and exercise isolated instances
         shell: pwsh
         run: ./tests/Test-WindowsRunnerInstances.ps1
+      - name: Verify smoke evidence checker with synthetic job results
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerSmokeEvidence.ps1

@@ -1,0 +1,37 @@
+# Copy to .github/workflows/windows-runner-smoke.yml in an authorized AbsoluteZeroDev repository.
+# Deliberately a template: this personal-account repository cannot use organization-scoped runners.
+name: Windows runner concurrency smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      computer_name:
+        description: Windows COMPUTERNAME of the two-runner host
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  slot:
+    name: Smoke slot ${{ matrix.slot }}
+    runs-on: [self-hosted, Windows, subzerodev-windows-large]
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        slot: [1, 2]
+    env:
+      EXPECTED_COMPUTER: ${{ inputs.computer_name }}
+    steps:
+      - name: Hold slot for overlap check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:COMPUTERNAME -ine $env:EXPECTED_COMPUTER) { throw 'Job reached a different machine.' }
+          $expected = @('win01', 'win02') | ForEach-Object { "subzerodev.runner.windows.$($env:EXPECTED_COMPUTER.ToLowerInvariant()).$_" }
+          if ($env:RUNNER_NAME -notin $expected) { throw "Unexpected runner: $env:RUNNER_NAME" }
+          Write-Output "Runner=$env:RUNNER_NAME Computer=$env:COMPUTERNAME Workspace=$env:GITHUB_WORKSPACE Start=$([DateTime]::UtcNow.ToString('o'))"
+          Start-Sleep -Seconds 90
+          Write-Output "Runner=$env:RUNNER_NAME End=$([DateTime]::UtcNow.ToString('o'))"

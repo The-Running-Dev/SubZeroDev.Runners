@@ -68,6 +68,9 @@ After editing `runners.json` or `runners.local.json`: rerun `Set-WindowsStartup.
 
 ## Multiple Windows runners on one machine
 
+For complete prerequisite, installation, scheduled-task verification and concurrent-job smoke commands,
+see [the two-runner Windows runbook](docs/windows-two-runners.md).
+
 Use a **separate clone outside Dropbox for each instance**. The Windows installer accepts
 `-InstanceId`: it appends the ID to the default per-machine name and gives each instance
 its own workspace, supervisor mutex, startup task and log trim task. Each clone also keeps
