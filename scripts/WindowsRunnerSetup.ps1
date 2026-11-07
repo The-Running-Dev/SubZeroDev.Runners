@@ -55,6 +55,35 @@ function Confirm-RunnerSetupAuthentication {
     if ($LASTEXITCODE) { throw 'The active GitHub credential cannot administer runners at the requested target.' }
 }
 
+# Read-only repository preflight. Scope compatibility is necessary, but does not prove runner-group
+# access, workflow label selection, installed toolchains or that a job has actually executed.
+function Confirm-RunnerSetupRepositories {
+    [CmdletBinding()]
+    param([string] $Scope, [string[]] $Repositories)
+    if (-not $Repositories.Count -and $Scope.StartsWith('repos/')) { $Repositories = @($Scope.Substring(6)) }
+    if (-not $Repositories.Count) {
+        Write-Warning 'No -TargetRepositories supplied: repository eligibility has not been checked for this organization registration.'
+        return
+    }
+    # Reject every malformed/cross-scope target before making repository API calls.
+    foreach ($repository in $Repositories) {
+        if ($repository -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*/[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw 'TargetRepositories must contain owner/repository names.' }
+        if (($Scope.StartsWith('orgs/') -and $repository.Split('/')[0] -ine $Scope.Substring(5)) -or
+            ($Scope.StartsWith('repos/') -and $repository -ine $Scope.Substring(6))) {
+            throw "Runner scope $Scope cannot serve $repository. Use its repository-scoped -GitHubUrl or register within the organization that owns it. No runner instance has been changed."
+        }
+    }
+    foreach ($repository in @($Repositories | Select-Object -Unique)) {
+        $metadata = Invoke-RunnerSetupGh -Arguments @('api', "repos/$repository")
+        if ($metadata.full_name -ine $repository) { throw "Repository $repository moved or could not be verified. Use its current owner/repository and registration URL." }
+        if ($Scope.StartsWith('orgs/') -and $metadata.owner.type -ne 'Organization') { throw "$repository is not owned by an organization; personal accounts have no shared account-level runner pool." }
+        if ($metadata.archived -or $metadata.disabled) { throw "Repository $repository is archived or disabled." }
+        $policy = Invoke-RunnerSetupGh -Arguments @('api', "repos/$repository/actions/permissions")
+        if ($policy.enabled -ne $true) { throw "GitHub Actions is disabled or its enabled state could not be verified for $repository." }
+        $repository
+    }
+}
+
 function Sync-RunnerSetupInstance {
     param([string] $Clone, [string] $InstanceId, [string] $SourceCommit, [string] $GitHubUrl)
     $repository = 'https://github.com/The-Running-Dev/SubZeroDev.Runners.git'
@@ -220,6 +249,7 @@ function Invoke-WindowsRunnerHostSetup {
         [string] $InstallRoot,
         [string] $GitHubUrl,
         [string[]] $ExtraLabels,
+        [string[]] $TargetRepositories = @(),
         [ValidatePattern('^[0-9a-f]{40}$')] [string] $SourceCommit,
         [string] $SmokeRepository,
         [bool] $NonInteractive,
@@ -231,6 +261,11 @@ function Invoke-WindowsRunnerHostSetup {
     if ($SmokeRepository -and $SmokeRepository -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*/[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw 'SmokeRepository must be owner/repository.' }
     if ($SmokeRepository -and (($scope.StartsWith('orgs/') -and $SmokeRepository.Split('/')[0] -ine $scope.Split('/')[1]) -or ($scope.StartsWith('repos/') -and $SmokeRepository -ine $scope.Substring(6)))) { throw 'The smoke repository must be within the runner organization, or match its repository-scoped target.' }
     Confirm-RunnerSetupAuthentication -Scope $scope -NonInteractive $NonInteractive -WithSmoke ([bool]$SmokeRepository)
+    $validatedRepositories = @(Confirm-RunnerSetupRepositories -Scope $scope -Repositories $TargetRepositories)
+    if ($validatedRepositories.Count) {
+        Write-Host "Repository scope compatibility and Actions-enabled state verified: $($validatedRepositories -join ', ')."
+        Write-Host 'These checks do not verify runner-group access, workflow runs-on routing or successful job execution.'
+    }
     $computer = $env:COMPUTERNAME.ToLowerInvariant()
     $hostLabel = "subzerodev-host-$computer"
     $pairLabel = "subzerodev-pair-$computer"
@@ -263,5 +298,5 @@ function Invoke-WindowsRunnerHostSetup {
         2 { Write-Host "Runners are set up ($Count), but BuildAgent needs your action first (listed above). Rerun the same command afterwards; finished steps are skipped." -ForegroundColor Yellow }
         default { Write-Warning "Runners are set up ($Count), but the BuildAgent integration failed (exit $buildAgentExit); see the messages above. The runners are not affected." }
     }
-    [pscustomobject]@{ Runners = $Count; BuildAgentExitCode = $buildAgentExit; ActionRequired = ($buildAgentExit -eq 2); Instances = $instances }
+    [pscustomobject]@{ Runners = $Count; BuildAgentExitCode = $buildAgentExit; ActionRequired = ($buildAgentExit -eq 2); Instances = $instances; ScopeValidatedRepositories = $validatedRepositories }
 }
