@@ -14,6 +14,15 @@ function Test-LegacyTaskMissing($ErrorRecord) {
     $ErrorRecord.FullyQualifiedErrorId -match 'NotFound' -or $ErrorRecord.Exception.Message -match 'No MSFT_ScheduledTask objects found'
 }
 
+# Read the key with terminating errors, then select the value so a missing value needs no exception handling. Only a missing
+# key proves absence; access denied, an unavailable provider and other read failures must prevent migration completion.
+function Get-LegacyRunValue([string] $RunKey, [string] $RunValueName) {
+    try { $properties = Get-ItemProperty -LiteralPath $RunKey -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { return }
+    $property = $properties.PSObject.Properties[$RunValueName]
+    if ($property) { $property.Value }
+}
+
 function Remove-LegacyStartupTasks {
     param(
         [string] $TaskPath = $LegacyTaskPath,
@@ -59,11 +68,11 @@ function Remove-LegacyStartupTasks {
         $result.Removed.Add("Removed the legacy task $label.")
     }
     try {
-        $value = (Get-ItemProperty -LiteralPath $RunKey -Name $RunValueName -ErrorAction SilentlyContinue).$RunValueName
+        $value = Get-LegacyRunValue $RunKey $RunValueName
         if ($value) {
             if ("$value".Contains($PSScriptRoot)) {
                 Remove-ItemProperty -LiteralPath $RunKey -Name $RunValueName -ErrorAction Stop
-                if ((Get-ItemProperty -LiteralPath $RunKey -Name $RunValueName -ErrorAction SilentlyContinue).$RunValueName) {
+                if (Get-LegacyRunValue $RunKey $RunValueName) {
                     $result.Failed.Add("The legacy sign-in entry $RunValueName is still in $RunKey after it was removed.")
                 }
                 else { $result.Removed.Add("Removed the legacy sign-in entry $RunValueName from $RunKey.") }
@@ -71,7 +80,7 @@ function Remove-LegacyStartupTasks {
             else { $result.Kept.Add("Left the sign-in entry $RunValueName in ${RunKey}: it does not run this clone's scripts.") }
         }
     }
-    catch { $result.Failed.Add("Could not remove the legacy sign-in entry ${RunValueName}: $($_.Exception.Message)") }
+    catch { $result.Failed.Add("Could not inspect, remove or verify the legacy sign-in entry ${RunValueName}: $($_.Exception.Message)") }
     $result
 }
 
@@ -110,8 +119,9 @@ function Invoke-LegacyMigration {
     if ($cleanup.Failed.Count) {
         $who = if ($Config.windows.instanceId) { "instance $($Config.windows.instanceId)" } else { 'this install' }
         throw ("An earlier version's startup entry for $who could not be removed or verified gone, so the install stopped before any registration change; nothing was started or stopped and no migration is recorded:`n - $(@($cleanup.Failed) -join "`n - ")`n" +
-            "Remove the task in Task Scheduler (taskschd.msc), or repair the Task Scheduler service, then rerun Install-WindowsRunner.ps1 (or scripts\Remove-LegacyTasks.ps1).")
+            "Remove the legacy startup entry in Task Scheduler (taskschd.msc) or the Run registry key, or repair access to it, then rerun Install-WindowsRunner.ps1 (or scripts\Remove-LegacyTasks.ps1).")
     }
     Save-LegacyMigration $Kind @($cleanup.Removed) @($cleanup.Kept)
     [pscustomobject]@{ Kind = $Kind; Changed = $true; Lines = @(@($cleanup.Removed) + @($cleanup.Kept)) }
 }
+
