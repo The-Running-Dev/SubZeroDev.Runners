@@ -3,7 +3,9 @@
 # and verifies the Actions runner, installs the private .NET SDK, registers the runner with GitHub under its own
 # name and the shared labels, and starts it now. No Docker Desktop and no Linux runner. Nothing starts it at sign-in and
 # nothing restarts the supervisor if it dies: Manage-WindowsRunner.ps1 -Action Start starts it again. A sign-in task or Run
-# entry left by an earlier version is removed once (this clone's only).
+# entry left by an earlier version is removed once, first, before any registration change (this clone's only); if it cannot
+# be removed or verified gone the install fails with nothing changed. The supervisor is reported started only after it has
+# written its initialization status.
 # Run it from a git clone of this repository outside Dropbox, in a normal (not elevated) PowerShell 7 window,
 # signed in to Windows as the user the jobs should run as. Safe to rerun.
 param(
@@ -81,6 +83,14 @@ function Get-RunnerStatus {
 }
 if (Get-MaintenanceState) { throw "This runner is held in maintenance ($MaintenanceFile). Run Manage-WindowsRunner.ps1 -Action Start, then rerun this script." }
 
+# Legacy startup migration, before anything else changes: a download, a registration change or a process stop has not happened
+# yet, so a startup entry of an earlier version that cannot be removed or verified gone fails the install here (nonzero, with
+# the fix) and leaves everything as it was. A fresh clone is recorded without asking Task Scheduler; an already migrated one
+# is a no-op; an upgrade removes this clone's entries and verifies them gone (another clone's are kept and do not block).
+. "$PSScriptRoot\LegacyCleanup.ps1"
+$migration = Invoke-LegacyMigration
+foreach ($line in $migration.Lines) { Write-Output $line }
+
 # Runner binaries, checked against the digest GitHub publishes for the release.
 New-Item -ItemType Directory -Force $WindowsRunner | Out-Null
 if (-not (Test-Path -LiteralPath (Join-Path $WindowsRunner 'config.cmd'))) {
@@ -129,16 +139,13 @@ switch ($applied.Result) {
 }
 $problems = @(Confirm-RunnerRegistration -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder)
 if ($problems) { throw "The registration does not match the configuration:`n - $($problems -join "`n - ")" }
-# One-time removal of what earlier versions registered with Windows (this clone's tasks and Run entry only).
-. "$PSScriptRoot\LegacyCleanup.ps1"
-$cleanup = Remove-LegacyStartupTasks
-foreach ($line in @($cleanup.Removed) + @($cleanup.Kept)) { Write-Output $line }
-foreach ($line in $cleanup.Failed) { Write-Warning $line }
 # Housekeeping is not scheduled any more; a failure here must not fail the install.
 try { & (Join-Path $PSScriptRoot 'Trim-RunnerLogs.ps1') | ForEach-Object { Write-Output $_ } }
 catch { Write-Warning "Log trim failed: $($_.Exception.Message)" }
 
-if (-not (Get-SupervisorProcess)) { Start-WindowsRunner | ForEach-Object { Write-Output "Supervisor $_." } }
+# Start-WindowsRunner confirms the supervisor of this clone initialized (or is already running); it throws when it did not,
+# which fails the install before any "online" claim.
+Start-WindowsRunner | ForEach-Object { Write-Output "Supervisor $_." }
 for ($attempt = 0; $attempt -lt 24 -and ($status = Get-RunnerStatus) -ne 'online'; $attempt++) { Start-Sleep -Seconds 5 }
 if ($status -ne 'online') { throw "$Name is $status after 2 minutes; see the newest Console_*.log in $(Join-Path $WindowsRunner '_diag')." }
 Write-Output "$Name is online with labels self-hosted, Windows, X64, $labels."

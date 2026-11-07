@@ -107,7 +107,7 @@ Run these from the instance's clone as the runner's user (`Manage-WindowsRunner.
 | Action | Does |
 | --- | --- |
 | `Status` | One line each for the supervisor (state, PID, restarts, last exit, next retry), the listener process, the running job, and the GitHub registration (online, busy, labels). Exits non-zero unless all are healthy; `-Json` for tools |
-| `Start` | Ends maintenance and starts the supervisor (detached, hidden) if none runs; prints `started (pid N)` or `already running (pid N)` |
+| `Start` | Ends maintenance and starts the supervisor (detached, hidden) if none runs, then waits up to `lifecycle.startTimeoutSeconds` (60) for fresh initialization status; prints `started (pid N)` or `already running (pid N)`, and exits 1 with the supervisor's exit code, init failure or timeout otherwise |
 | `Stop` | Drains, then stops the supervisor and runner. Registration stays |
 | `Restart` | `Stop`, then `Start` |
 | `Maintenance` | Drains and stops, and keeps the supervisor idle (`maintenance.json`) until `Start` |
@@ -127,7 +127,9 @@ without a long run between them, `repeatedDeaths` says so.
 `\SubZeroDev.Runners\`, plus a `SubZeroDev.Runners` Run entry. `scripts\Remove-LegacyTasks.ps1` (also run by
 `Install-WindowsRunner.ps1`) removes this clone's once and does nothing on a second run. A task is removed only when its name
 carries this instance's suffix and its action names this clone's script; other instances' and clones' tasks are reported and
-kept. Removing a task does not end a supervisor it started. Host verification refuses to pass while one remains.
+kept. Removing a task does not end a supervisor it started. The cleanup runs first in `Install-WindowsRunner.ps1`; an entry of this clone that cannot be inspected, removed or confirmed gone fails the install (nonzero, with the fix) before any registration change, and nothing is recorded. Only a verified result is recorded in `windows\legacy-migration.json`; host verification checks that record, not Task Scheduler. `LegacyCleanup.ps1` is the only code that loads the scheduler module.
+
+`Start` is only reported successful once the supervisor of this clone has written fresh initialization status for its own pid. A live process, a stale `supervisor.pid` or `supervisor.json`, or an online listener left by an earlier supervisor is not enough; an early exit (with the exit code), an initialization failure and a timeout all fail `Start`, `Restart`, `Start-Runners.ps1`, the installer and host setup, and no second listener is started to satisfy the check.
 
 A stop is reported successful only when nothing is left running. `Stop`, `Restart`, `Maintenance` and the registration changes
 in `Install-WindowsRunner.ps1` end the supervisor with `taskkill` and then check the process table. A `taskkill` that fails, or
@@ -157,10 +159,13 @@ withdrawing the labels fails, no stop is attempted. A workflow that targets only
 | BuildAgent build | Invocation, mapping and refusal cases; no daemon | **Not collected**: a real build of the owner's project on Docker Desktop |
 | Concurrent jobs | Smoke evidence checker with synthetic results | `-SmokeRepository` run on the host |
 | Supervisor takeover (one listener, maintenance holds, orphan wait) | `Test-LifecycleRecovery.ps1`: the real supervisor script in a child process against a stand-in listener | Same test; no Task Scheduler involved |
+| Start confirms initialization, or fails | `Test-LifecycleRecovery.ps1`: early exit 23 (`Manage` Start and `Restart -Force`, `Start-Runners.ps1`: exit 1, Linux still started), alive-but-never-initializes within a 3 s bound (not killed, no second launch), stale `supervisor.json` of another pid, orphan listener alone | Real child processes only (a stub supervisor, a stand-in listener). Not a live runner |
 | Start launches one supervisor; a second Start finds it | `Test-LifecycleRecovery.ps1`: fake `Start-Process` (arguments, working directory, hidden, maintenance ended first, already running); real `Manage-WindowsRunner.ps1 -Action Start` twice against the real supervisor | Same test: a real `Start` launched the replacement of a killed supervisor, the second `Start` reported its pid and started nothing |
 | Dead supervisor is reported down and started by hand | `Test-LifecycleRecovery.ps1`: recovery bookkeeping, `Status` exit 1 and the `Recovery` row, real killed supervisor then explicit `Start` | Same test. Nothing restarts it, by design |
 | Intentional stop stays stopped | `Test-LifecycleRecovery.ps1`: verified `taskkill` then process-table check; stop failure, supervisor, listener and worker still running | Real supervisor and listener stand-in in the same test |
 | Failed stop keeps maintenance and exits 1 | `Test-LifecycleRecovery.ps1`: entry points in child processes with a fake `gh` and `docker` and a supervisor `taskkill` refuses to end (`Manage` Stop/Restart/Maintenance, `Stop-Runners.ps1`: exit 1) | **Not collected** against a real Docker daemon |
+| Legacy startup entry that cannot be removed fails the install | `Test-LifecycleRecovery.ps1`, `Test-WindowsRunnerInstances.ps1` (throwaway installer, scheduler faked to fail before any registration change), `Test-WindowsRunnerHostSetup.ps1` (real worker process exits non-zero, no success output) | Real Task Scheduler only in the throwaway-folder case below; no live failure induced |
+| No scheduler access outside the migration | `Test-LifecycleRecovery.ps1`: a fake `ScheduledTasks` module and `schtasks` shim record any call across setup evidence, Start, Stop, Status and a fresh install (with a negative control); source check | Same test. A fresh install does not probe the scheduler; another clone's same-name task is kept and does not block |
 | Legacy tasks are removed once, only this clone's | `Test-LifecycleRecovery.ps1`: real Task Scheduler and registry, in a throwaway task folder and Run key per case (this clone's removed, another clone's and unlisted kept, second run does nothing, a supervisor the task started keeps running); `Test-WindowsRunnerInstances.ps1`: instance-suffixed names | Same tests; the real tasks of this host are fingerprinted before and after and unchanged |
 | Task Scheduler restarts a killed or crashed supervisor (historical) | Simulated only, no longer applicable | **Collected, negative, and the reason the scheduler was dropped** (Windows 11 build 26200, 2026-11-07, throwaway tasks under `\SubZeroDev.Runners.Probe\`, restart 3-5 x 1 min): after `taskkill /T /F`, `Stop-Process`, `exit 0`, `exit 1`, `exit 3` and `throw`, the task launched once and was not restarted within 3 minutes. Kept as history; no scheduler infrastructure is built on it |
 | Config change reaches the registration | Registration plan cases (name, target, work folder, labels) | **Not collected** against GitHub |
@@ -265,7 +270,7 @@ Expected identities (`<computer>` is lowercase `COMPUTERNAME`):
 | Mutex | `Local\SubZeroDev.Runners.Windows.win01` | `Local\SubZeroDev.Runners.Windows.win02` |
 | Supervisor | `C:\Actions\win01\windows\supervisor.pid` | `C:\Actions\win02\windows\supervisor.pid` |
 
-There are no scheduled tasks; any `Start Windows runner (...)` or `Trim logs (...)` task left by an earlier version is removed by the installer. Both retain `subzerodev-windows` and add `subzerodev-windows-large`. Each clone has separate binaries, registration, SDK, NuGet cache, logs and PID file. Reruns retain saved identity, scope and labels when those arguments are omitted. Existing unnamed installations keep their original mutex name.
+There are no scheduled tasks; any `Start Windows runner (...)` or `Trim logs (...)` task left by an earlier version is removed by the installer first (if one of this clone's cannot be removed, the install fails and says how to fix it). Both retain `subzerodev-windows` and add `subzerodev-windows-large`. Each clone has separate binaries, registration, SDK, NuGet cache, logs and PID file. Reruns retain saved identity, scope and labels when those arguments are omitted. Existing unnamed installations keep their original mutex name.
 
 ## Verify registration and supervisors on the host
 
@@ -276,9 +281,7 @@ $local = @(foreach ($id in 'win01', 'win02') {
     $config = Get-Content -Raw "$clone\runners.local.json" | ConvertFrom-Json
     $registration = Get-Content -Raw "$clone\windows\.runner" | ConvertFrom-Json
     $supervisor = Join-Path $clone 'scripts\Run-WindowsRunner.ps1'
-    $legacy = @(Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -ErrorAction SilentlyContinue |
-        Where-Object { $_.TaskName -in "Start Windows runner ($id)", "Trim logs ($id)" })
-    if ($legacy) { throw "Legacy scheduled task still registered for $id; run $clone\scripts\Remove-LegacyTasks.ps1." }
+    if (-not (Test-Path -LiteralPath "$clone\windows\legacy-migration.json")) { throw "The legacy startup migration of $id is not recorded; run $clone\scripts\Remove-LegacyTasks.ps1." }
     $supervisorPid = [int](Get-Content "$clone\windows\supervisor.pid")
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$supervisorPid"
     if (-not $process -or $process.CommandLine -notlike "*$supervisor*") { throw "Supervisor not running for $id." }

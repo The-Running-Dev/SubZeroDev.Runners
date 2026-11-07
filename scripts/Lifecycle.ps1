@@ -314,17 +314,71 @@ function Stop-WindowsRunner {
     $result | Add-Member -NotePropertyName Cancelled -NotePropertyValue $cancelled -PassThru
 }
 
-# Ends maintenance and starts the supervisor as a detached, hidden process of this user. A supervisor that is already running
-# is never started twice or interrupted (its mutex would also refuse a second one). Nothing starts it at sign-in and nothing
-# restarts it if it dies: this is the only way it starts. A supervisor found dead without a clean stop is recorded by the next
-# supervisor (Get-SupervisorRecovery), so starting it by hand keeps that history.
+# supervisor.json as written by supervisor $ProcessId once it initialized: its own pid, a start time not before $Since, and a
+# live state. A leftover file of an earlier supervisor (another pid, an older start, 'stopped') is not evidence. $null if none.
+function Get-SupervisorInitialization([int] $ProcessId, [datetime] $Since) {
+    $status = Get-SupervisorStatus
+    if (-not $status -or $status.pid -ne $ProcessId -or -not $status.startedUtc) { return }
+    if ($status.state -notin 'starting', 'running', 'backoff', 'maintenance', 'waiting-for-orphan') { return }
+    try { $startedUtc = ([datetime]$status.startedUtc).ToUniversalTime() } catch { return }
+    if ($startedUtc -lt $Since.ToUniversalTime()) { return }
+    $status
+}
+
+# Waits, bounded, until the supervisor process $Process of this instance has initialized (Get-SupervisorInitialization) and is
+# still the process Get-SupervisorProcess identifies. Not enough: a process object, a pid file, an old supervisor.json, or a
+# listener that is online with GitHub. Throws, naming the exit code when there is one, if it exits first or the time runs out.
+# A launched process that exits 0 because another supervisor of this instance holds the mutex adopts that one if it has
+# initialized. This confirms initialization, not that the supervisor stays up: nothing restarts a supervisor that dies later.
+function Wait-SupervisorInitialized {
+    param([object] $Process, [datetime] $Since, [int] $TimeoutSeconds = $SupervisorStartTimeoutSeconds)
+    $expectedId = [int]$Process.Id
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $found = Get-SupervisorProcess
+        if ($found -and [int]$found.ProcessId -eq $expectedId) {
+            $initialized = Get-SupervisorInitialization $expectedId $Since
+            if ($initialized) { return [pscustomobject]@{ ProcessId = $expectedId; State = $initialized.state; Adopted = ($expectedId -ne [int]$Process.Id) } }
+        }
+        $last = Get-SupervisorStatus
+        $seen = if ($last) { "supervisor.json: pid $($last.pid), state $($last.state), started $($last.startedUtc)" } else { 'no supervisor.json' }
+        if ($expectedId -eq [int]$Process.Id -and $Process.PSObject.Properties['HasExited'] -and $Process.HasExited) {
+            $exitCode = $Process.ExitCode
+            $winner = Get-SupervisorProcess
+            if ($exitCode -eq 0 -and $winner -and [int]$winner.ProcessId -ne $expectedId) { $expectedId = [int]$winner.ProcessId; $Since = [datetime]::MinValue; continue }
+            throw "The supervisor (pid $($Process.Id)) exited with code $exitCode before it initialized ($seen). Run it in a console to see why: pwsh -File `"$Supervisor`""
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "The supervisor (pid $expectedId) did not report that it initialized within $TimeoutSeconds seconds ($seen). If it is still running, stop it with Manage-WindowsRunner.ps1 -Action Stop; run it in a console to see why: pwsh -File `"$Supervisor`""
+        }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+# Ends maintenance and starts the supervisor as a detached, hidden process of this user, and returns only once that supervisor
+# has confirmed it initialized (Wait-SupervisorInitialized); it throws if it exited, never initialized or timed out. A supervisor
+# that is already running is never started twice or interrupted (its mutex would also refuse a second one), and its identity and
+# initialization are verified the same way. Nothing starts it at sign-in and nothing restarts it if it dies: this is the only
+# way it starts. A supervisor found dead without a clean stop is recorded by the next supervisor (Get-SupervisorRecovery), so
+# starting it by hand keeps that history. A supervisor waiting for an orphaned listener says so; it starts no second listener.
 function Start-WindowsRunner {
+    param([int] $TimeoutSeconds = $SupervisorStartTimeoutSeconds)
     Exit-RunnerMaintenance $MaintenanceFile $WindowsRunner | Out-Null
     $running = Get-SupervisorProcess
-    if ($running) { return "already running (pid $($running.ProcessId))" }
-    # The command line ends with the quoted script path: Get-SupervisorProcess recognises the supervisor by that.
-    $process = Start-Process $Pwsh -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$Supervisor`"") -WorkingDirectory $WindowsRunner -WindowStyle Hidden -PassThru
-    "started (pid $($process.Id))"
+    if ($running) { $ready = Wait-SupervisorInitialized ([pscustomobject]@{ Id = $running.ProcessId }) ([datetime]::MinValue) $TimeoutSeconds }
+    else {
+        $launchedUtc = [DateTime]::UtcNow.AddSeconds(-2)
+        # The command line ends with the quoted script path: Get-SupervisorProcess recognises the supervisor by that.
+        $process = Start-Process $Pwsh -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$Supervisor`"") -WorkingDirectory $WindowsRunner -WindowStyle Hidden -PassThru
+        $ready = Wait-SupervisorInitialized $process $launchedUtc $TimeoutSeconds
+    }
+    $note = ''
+    if ($ready.State -eq 'waiting-for-orphan') {
+        $listeners = @(Get-WindowsRunnerListeners | ForEach-Object { $_.ProcessId }) -join ', '
+        $note = " - waiting for the existing listener (pid $listeners) to exit; no second listener is started"
+    }
+    elseif ($ready.State -eq 'maintenance') { $note = ' - in maintenance, no listener until maintenance ends' }
+    "$(if ($running -or $ready.Adopted) { 'already running' } else { 'started' }) (pid $($ready.ProcessId))$note"
 }
 # --- Linux runner commands ---------------------------------------------------------------------------------------
 

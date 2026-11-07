@@ -70,7 +70,8 @@
     "restartDelaySeconds": 30,
     "quickExitSeconds": 300,
     "quickExitLimit": 3,
-    "backoffMaxSeconds": 600
+    "backoffMaxSeconds": 600,
+    "startTimeoutSeconds": 60
   },
   "logs": {
     "retentionDays": 14,

@@ -98,10 +98,10 @@ function Get-RunnerSetupEvidence {
     . (Join-Path $Clone 'scripts\Common.ps1')
     $registration = Get-Content -Raw -LiteralPath (Join-Path $WindowsRunner '.runner') | ConvertFrom-Json
     if ($Config.windows.instanceId -ne $InstanceId -or $registration.agentName -ne $Config.windows.name) { throw "Registration identity mismatch for $InstanceId." }
-    # Nothing may start the supervisor behind the operator's back: no task from an earlier version is left for this instance.
-    foreach ($legacyName in $LegacyWindowsTaskName, $LegacyLogTrimTaskName) {
-        if (ScheduledTasks\Get-ScheduledTask -TaskPath $LegacyTaskPath -TaskName $legacyName -ErrorAction SilentlyContinue) { throw "A legacy scheduled task $LegacyTaskPath$legacyName remains for $InstanceId; run scripts\Remove-LegacyTasks.ps1." }
-    }
+    # Nothing may start the supervisor behind the operator's back. The installer verified this instance's legacy startup entries
+    # gone (or never present) and recorded it; this reads that record. It does not ask Task Scheduler, so another clone's task
+    # of the same name cannot block this instance and the scheduler is not needed to verify setup.
+    if (-not (Get-LegacyMigration)) { throw "The legacy startup migration of $InstanceId is not recorded as complete ($LegacyMigrationFile); rerun scripts\Install-WindowsRunner.ps1 or scripts\Remove-LegacyTasks.ps1 in that clone." }
     $supervisorProcess = Get-SupervisorProcess
     if (-not $supervisorProcess) { throw "Supervisor is not running for $InstanceId." }
     $dotnet = Join-Path $WindowsRunner '_tool\dotnet\dotnet.exe'
@@ -196,7 +196,7 @@ function Confirm-RunnerSetupHost {
         }
     }
     $Instances | Select-Object Instance, Name, AgentId, Workspace, SupervisorPid | Format-Table -AutoSize | Out-Host
-    Write-Host 'Verified on this host: registrations online, unique identities/workspaces/processes, no legacy startup tasks and labels.'
+    Write-Host 'Verified on this host: registrations online, unique identities/workspaces/processes, recorded legacy-startup migration and labels.'
 }
 
 # Provisions or verifies the host-level BuildAgent integration from an instance's clone, in its own PowerShell so the clone's

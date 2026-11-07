@@ -32,17 +32,23 @@ $installer = Get-Content -Raw (Join-Path $repo 'scripts\Install-WindowsRunner.ps
 $start = $installer.IndexOf('$localPath =')
 $end = $installer.IndexOf('$parts =')
 $setup = [scriptblock]::Create($installerParameters + "`n" + $installer.Substring($start, $end - $start).Replace('$PSScriptRoot\Common.ps1', '$root\scripts\Common.ps1'))
-# The installer's tail: legacy cleanup, housekeeping, direct supervisor start, online wait. Nothing is registered with Windows.
-$tailMarker = '# One-time removal of what earlier versions registered'
-if ($installer.IndexOf($tailMarker) -lt 0) { throw 'The installer tail marker is gone; update this test.' }
-$tailText = $installer.Substring($installer.IndexOf($tailMarker))
-foreach ($forbidden in 'Register-ScheduledTask', 'Set-WindowsStartup', 'Register-LogTrimTask', 'Start-ScheduledTask') {
+# The whole installer from the settings phase on, run in-process (the real one refuses an elevated session, as on CI). Every call
+# that would download, register, stop or start is replaced after the real modules load, and the process launch and the scheduler
+# are faked, so nothing is registered with Windows and no real task or Run entry is looked at.
+foreach ($forbidden in 'Register-ScheduledTask', 'Set-WindowsStartup', 'Register-LogTrimTask', 'Start-ScheduledTask', 'ScheduledTasks', 'schtasks') {
     if ($installer.Contains($forbidden)) { throw "The installer still mentions $forbidden." }
 }
-# LegacyCleanup.ps1 is not loaded (the test fakes Remove-LegacyStartupTasks) and the real housekeeping must not run: it trims caches.
-$tailText = $tailText.Replace('. "$PSScriptRoot\LegacyCleanup.ps1"', '').Replace("& (Join-Path `$PSScriptRoot 'Trim-RunnerLogs.ps1')", '$direct.Trimmed.Add($WindowsRunner)')
-if ($tailText.Contains('Trim-RunnerLogs.ps1') -or $tailText.Contains('LegacyCleanup.ps1')) { throw 'The installer tail changed; update the test replacements.' }
-$startup = [scriptblock]::Create($tailText)
+$order = 'Invoke-LegacyMigration', 'Get-RunnerArchive', 'Invoke-RunnerRegistration', 'Trim-RunnerLogs.ps1', 'Start-WindowsRunner' | ForEach-Object { $installer.IndexOf($_) }
+if ($order -contains -1 -or (($order | Sort-Object) -join ',') -ne ($order -join ',')) { throw "The installer no longer migrates legacy startup entries before it downloads, registers or starts: $($order -join ',')." }
+$archiveLoad = '. "$PSScriptRoot\RunnerArchive.ps1"'
+$cleanupLoad = '. "$PSScriptRoot\LegacyCleanup.ps1"'
+$fullText = $installer.Substring($start).
+    Replace('& (Join-Path $PSScriptRoot ''Trim-RunnerLogs.ps1'')', '$trace.Add(''trim'')').
+    Replace($archiveLoad, $archiveLoad + "`n. `$injectFakes").
+    Replace($cleanupLoad, $cleanupLoad + "`n. `$injectScheduler").
+    Replace('$PSScriptRoot', '$scriptsDir')
+foreach ($needle in '$trace.Add', '$injectFakes', '$injectScheduler') { if (-not $fullText.Contains($needle)) { throw "The installer changed; update the test replacements ($needle)." } }
+$full = [scriptblock]::Create($installerParameters + "`n" + $fullText)
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('runner-instances-' + [guid]::NewGuid().ToString('N'))
 function Assert($Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
@@ -63,42 +69,152 @@ function Invoke-Settings {
     . $setup @arguments
     [pscustomobject]@{ Config = $Config; Mutex = $WindowsMutexName; LegacyStartTask = $LegacyWindowsTaskName; LegacyTrimTask = $LegacyLogTrimTaskName; Runner = $WindowsRunner }
 }
-function Test-DirectStart([string] $Clone) {
-    . (Join-Path $Clone 'scripts\Common.ps1')
-    . (Join-Path $Clone 'scripts\Registration.ps1')
-    . (Join-Path $Clone 'scripts\Lifecycle.ps1')
-    $InstanceId = $Config.windows.instanceId
-    $Name = $Config.windows.name
-    $direct = @{ Started = [Collections.Generic.List[object]]::new(); Trimmed = [Collections.Generic.List[string]]::new(); Cleanups = [Collections.Generic.List[object]]::new() }
-    # Run the real installer tail and the real Start-WindowsRunner, with the process launch and the cleanup intercepted. Nothing
-    # is registered with Windows, no process is started, and no real task or Run entry is looked at.
+# Installer harness. Everything that downloads, registers, stops or starts is replaced after the real modules load; the
+# supervisor launch and Task Scheduler are fakes that record what was asked of them.
+$injectFakes = {
+    function Get-RunnerArchive { $trace.Add('archive'); throw 'The test fake must not download.' }
+    function Get-GitHubRunner { $trace.Add('github'); [pscustomobject]@{ Status = 'online' } }
+    function Get-LocalRegistration { $trace.Add('local-registration'); $null }
+    function Get-RegistrationPlan { $trace.Add('plan'); [pscustomobject]@{ Reasons = @(); LinkedId = $null } }
+    function Invoke-RunnerRegistration { $trace.Add('register'); [pscustomobject]@{ Result = 'unchanged' } }
+    function Confirm-RunnerRegistration { $trace.Add('confirm'); @() }
+    function Stop-WindowsRunner { $trace.Add('stop'); [pscustomobject]@{ Outcome = 'stopped' } }
+    function Stop-WindowsRunnerProcesses { $trace.Add('stop'); [pscustomobject]@{ Stopped = $true } }
+    function Get-SupervisorProcess { if ($direct.Started.Count) { [pscustomobject]@{ ProcessId = 987700 } } }
     function Start-Process {
         param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch] $PassThru)
+        $trace.Add('start')
         $direct.Started.Add([pscustomobject]@{ FilePath = $FilePath; ArgumentList = @($ArgumentList); WorkingDirectory = $WorkingDirectory; WindowStyle = $WindowStyle })
+        # What a healthy supervisor writes once it has initialized.
+        Set-SupervisorStatusValues @{ state = 'running'; pid = 987700; startedUtc = [DateTime]::UtcNow.ToString('o') }
         [pscustomobject]@{ Id = 987700 }
     }
+}
+# Scheduler fake: the real Remove-LegacyStartupTasks (names, ownership, verification) over Get/Remove scriptblocks that log into
+# $trace as get:<name> / remove:<name>. $schedulerPlan: Tasks (name -> script it runs), InspectError, RemoveError.
+$injectScheduler = {
+    $realRemove = ${function:Remove-LegacyStartupTasks}
+    $fakeTasks = $schedulerPlan.Tasks
+    $fakeGone = [Collections.Generic.HashSet[string]]::new()
+    $fakeInspectError = $schedulerPlan.InspectError
+    $fakeRemoveError = $schedulerPlan.RemoveError
+    $fakeGet = {
+        param($Path, $TaskName)
+        $trace.Add("get:$TaskName")
+        if ($fakeInspectError) { throw $fakeInspectError }
+        if ($fakeTasks.ContainsKey($TaskName) -and -not $fakeGone.Contains($TaskName)) {
+            return [pscustomobject]@{ Actions = @([pscustomobject]@{ Arguments = "-File `"$($fakeTasks[$TaskName])`"" }) }
+        }
+        throw "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$TaskName'."
+    }.GetNewClosure()
+    $fakeRemove = {
+        param($Path, $TaskName)
+        $trace.Add("remove:$TaskName")
+        if ($fakeRemoveError) { throw $fakeRemoveError }
+        [void]$fakeGone.Add($TaskName)
+    }.GetNewClosure()
     function Remove-LegacyStartupTasks {
-        # Called with no arguments by the installer: what it would target is decided by the names in this scope.
-        $direct.Cleanups.Add([pscustomobject]@{ Start = $LegacyWindowsTaskName; Trim = $LegacyLogTrimTaskName; Script = $Supervisor; Combined = (-not $Config.windows.instanceId) })
-        [pscustomobject]@{ Removed = @(); Kept = @(); Failed = @() }
+        # Called with no arguments by the migration: the names and scripts are the real defaults of this scope. The Run key is a
+        # throwaway that does not exist.
+        & $realRemove -RunKey 'HKCU:\Software\SubZeroDevRunnersTest-DoesNotExist' -GetTask $fakeGet -RemoveTask $fakeRemove
     }
-    function Get-SupervisorProcess { $null }
-    function Get-RunnerStatus { 'online' }
-    . $startup | Out-Null
-    Assert ($direct.Started.Count -eq 1) "Expected exactly one supervisor launch, got $($direct.Started.Count)."
-    $launch = $direct.Started[0]
-    Assert ($launch.FilePath -eq $Pwsh -and $launch.WindowStyle -eq 'Hidden') 'The supervisor is not launched as a hidden pwsh.'
-    Assert ($launch.ArgumentList[-2] -eq '-File' -and $launch.ArgumentList[-1] -eq ('"' + $Supervisor + '"')) "Launch targets the wrong supervisor: $($launch.ArgumentList -join ' ')"
-    Assert ($Supervisor.StartsWith($Clone, [StringComparison]::OrdinalIgnoreCase) -and $launch.WorkingDirectory -eq $WindowsRunner -and $WindowsRunner.StartsWith($Clone, [StringComparison]::OrdinalIgnoreCase)) 'Launch targets another clone.'
-    Assert ($direct.Cleanups.Count -eq 1 -and $direct.Trimmed.Count -eq 1) 'The installer tail did not run the one-time cleanup and the housekeeping once each.'
-    $cleanup = $direct.Cleanups[0]
-    if ($InstanceId) {
-        Assert ($cleanup.Start -eq "Start Windows runner ($InstanceId)" -and $cleanup.Trim -eq "Trim logs ($InstanceId)") "Legacy cleanup names another instance: $($cleanup.Start) / $($cleanup.Trim)"
-        Assert (-not $cleanup.Combined) 'A named instance would clean up the combined legacy task of the unnamed install.'
+}
+function Invoke-Installer {
+    param([string] $Clone, [switch] $Upgrade, [switch] $NoRunnerFiles, [switch] $Marker, [hashtable] $Scheduler = @{ Tasks = @{} })
+    $scriptsDir = Join-Path $Clone 'scripts'
+    $root = $Clone
+    $schedulerPlan = $Scheduler
+    $trace = [Collections.Generic.List[string]]::new()
+    $direct = @{ Started = [Collections.Generic.List[object]]::new() }
+    $windows = Join-Path $Clone 'windows'
+    if (Test-Path -LiteralPath $windows) { Remove-Item -LiteralPath $windows -Recurse -Force }
+    New-Item -ItemType Directory -Path (Join-Path $windows '_tool\dotnet') -Force | Out-Null
+    if (-not $NoRunnerFiles) {
+        Set-Content -LiteralPath (Join-Path $windows 'config.cmd') -Value ''
+        Set-Content -LiteralPath (Join-Path $windows '_tool\dotnet\dotnet.exe') -Value ''
+    }
+    if ($Marker) { Set-Content -LiteralPath (Join-Path $windows 'legacy-migration.json') -Value '{"schema":1,"kind":"upgraded","completedUtc":"2026-01-01T00:00:00Z"}' }
+    if ($Upgrade) { Set-Content -LiteralPath (Join-Path $windows '.runner') -Value '{"agentName":"before"}' }
+    $failure = $null
+    $output = @()
+    try { $output = @(. $full) } catch { $failure = $_.Exception.Message }
+    [pscustomobject]@{
+        Output = @($output | ForEach-Object { "$_" }); Failure = $failure; Trace = $trace; Started = $direct.Started
+        Marker = (Test-Path -LiteralPath $LegacyMigrationFile); MarkerFile = $LegacyMigrationFile
+        Pwsh = $Pwsh; Supervisor = $Supervisor; Windows = $WindowsRunner; Config = $Config
+        StartTask = $LegacyWindowsTaskName; TrimTask = $LegacyLogTrimTaskName
+        Runner = (Join-Path $windows '.runner')
+    }
+}
+function Test-DirectStart([string] $Clone) {
+    $instanceId = (Invoke-Settings -Clone $Clone).Config.windows.instanceId
+    # An upgrade with this clone's own startup tasks present: they are removed and verified, then the install registers and starts.
+    $owned = @{}
+    $probe = Invoke-Installer -Clone $Clone -Upgrade -Scheduler @{ Tasks = @{} }
+    Assert (-not $probe.Failure) "Probe install failed: $($probe.Failure)"
+    $owned[$probe.StartTask] = $probe.Supervisor
+    $owned[$probe.TrimTask] = (Join-Path $Clone 'scripts\Trim-RunnerLogs.ps1')
+    $run = Invoke-Installer -Clone $Clone -Upgrade -Scheduler @{ Tasks = $owned }
+    Assert (-not $run.Failure) "Upgrade install failed: $($run.Failure)"
+    Assert ($run.Started.Count -eq 1) "Expected exactly one supervisor launch, got $($run.Started.Count)."
+    $launch = $run.Started[0]
+    Assert ($launch.FilePath -eq $run.Pwsh -and $launch.WindowStyle -eq 'Hidden') 'The supervisor is not launched as a hidden pwsh.'
+    Assert ($launch.ArgumentList[-2] -eq '-File' -and $launch.ArgumentList[-1] -eq ('"' + $run.Supervisor + '"')) "Launch targets the wrong supervisor: $($launch.ArgumentList -join ' ')"
+    Assert ($run.Supervisor.StartsWith($Clone, [StringComparison]::OrdinalIgnoreCase) -and $launch.WorkingDirectory -eq $run.Windows -and $run.Windows.StartsWith($Clone, [StringComparison]::OrdinalIgnoreCase)) 'Launch targets another clone.'
+    Assert (@($run.Trace | Where-Object { $_ -eq 'trim' }).Count -eq 1) 'The installer did not run housekeeping once.'
+    Assert ($run.Marker) 'The completed migration was not recorded.'
+    Assert (($run.Output -join "`n") -match 'is online with labels') 'The install did not finish with the online report.'
+    Assert (($run.Output -join "`n") -match 'Supervisor started \(pid 987700\)') "The supervisor start was not reported: $($run.Output -join ' | ')"
+    $looked = @($run.Trace | Where-Object { $_ -like 'get:*' } | ForEach-Object { $_.Substring(4) } | Select-Object -Unique)
+    if ($instanceId) {
+        Assert ($run.StartTask -eq "Start Windows runner ($instanceId)" -and $run.TrimTask -eq "Trim logs ($instanceId)") "Legacy cleanup names another instance: $($run.StartTask) / $($run.TrimTask)"
+        Assert ($looked -notcontains 'Start runners') 'A named instance looked for the combined legacy task of the unnamed install.'
     }
     else {
-        Assert ($cleanup.Start -eq 'Start Windows runner' -and $cleanup.Trim -eq 'Trim logs' -and $cleanup.Combined) 'Legacy cleanup names changed for the unnamed install.'
+        Assert ($run.StartTask -eq 'Start Windows runner' -and $run.TrimTask -eq 'Trim logs' -and $looked -contains 'Start runners') 'Legacy cleanup names changed for the unnamed install.'
     }
+    foreach ($name in $run.StartTask, $run.TrimTask) {
+        Assert ($run.Trace -contains "remove:$name") "The owned legacy task '$name' was not removed."
+    }
+    Assert ($run.Trace.IndexOf("remove:$($run.StartTask)") -lt $run.Trace.IndexOf('plan') -and $run.Trace.IndexOf("remove:$($run.StartTask)") -lt $run.Trace.IndexOf('start')) 'The legacy task was removed after the install changed something.'
+}
+# Fix 1: a startup entry that cannot be removed or inspected stops the install before any change. Fix 2: a fresh or completed
+# install never asks the scheduler, and another clone's task does not block.
+function Test-InstallerMigration([string] $Clone) {
+    Invoke-Settings -Clone $Clone | Out-Null
+    $probe = Invoke-Installer -Clone $Clone -Scheduler @{ Tasks = @{} }
+    $own = @{ $probe.StartTask = $probe.Supervisor }
+    $changes = 'archive', 'github', 'local-registration', 'plan', 'register', 'confirm', 'stop', 'start', 'trim'
+    foreach ($case in @(
+            @{ Name = 'removal failure'; Plan = @{ Tasks = $own; RemoveError = 'Access is denied.' }; Pattern = 'Could not remove the legacy task.*Access is denied' }
+            @{ Name = 'inspection failure'; Plan = @{ Tasks = $own; InspectError = 'The Task Scheduler service is not running.' }; Pattern = 'Could not look for the legacy task.*not running' })) {
+        $run = Invoke-Installer -Clone $Clone -Upgrade -NoRunnerFiles -Scheduler $case.Plan
+        Assert ($run.Failure -match $case.Pattern -and $run.Failure -match 'taskschd\.msc' -and $run.Failure -match 'no migration is recorded') "The $($case.Name) did not fail the install with the fix: $($run.Failure)"
+        $touched = @($run.Trace | Where-Object { $_ -in $changes })
+        Assert ($touched.Count -eq 0) "The $($case.Name) still changed things first: $($touched -join ', ')"
+        Assert ($run.Started.Count -eq 0) "The $($case.Name) still started the supervisor."
+        Assert (-not $run.Marker) "The $($case.Name) recorded the migration."
+        Assert (-not ($run.Output -match 'online|Supervisor') ) "The $($case.Name) printed success output: $($run.Output -join ' | ')"
+        Assert ((Get-Content -Raw -LiteralPath $run.Runner) -match 'before') 'The failed install changed the registration files.'
+    }
+    # Fixed scheduler, same clone: the install completes and records it.
+    $fixed = Invoke-Installer -Clone $Clone -Upgrade -Scheduler @{ Tasks = $own }
+    Assert (-not $fixed.Failure -and $fixed.Marker -and $fixed.Started.Count -eq 1) "The rerun after the fix did not complete: $($fixed.Failure)"
+    # Another clone's task of the same name is kept and does not block.
+    $foreign = Invoke-Installer -Clone $Clone -Upgrade -Scheduler @{ Tasks = @{ $probe.StartTask = 'C:\other-clone\scripts\Run-WindowsRunner.ps1' } }
+    Assert (-not $foreign.Failure -and $foreign.Marker) "A foreign same-name task blocked the install: $($foreign.Failure)"
+    Assert ($foreign.Trace -notcontains "remove:$($probe.StartTask)") 'Another clone''s task was removed.'
+    Assert ((Get-Content -Raw -LiteralPath $foreign.MarkerFile) -match 'belongs to another clone') 'The kept foreign task was not recorded.'
+    # Fresh and already-migrated installs: a scheduler that fails on any access proves it is not asked.
+    $tripwire = @{ Tasks = $own; InspectError = 'TRIPWIRE: the scheduler was asked.'; RemoveError = 'TRIPWIRE: the scheduler was asked.' }
+    $fresh = Invoke-Installer -Clone $Clone -Scheduler $tripwire
+    Assert (-not $fresh.Failure -and $fresh.Marker) "A fresh install failed: $($fresh.Failure)"
+    Assert (@($fresh.Trace | Where-Object { $_ -match '^(get|remove):' }).Count -eq 0) "A fresh install asked the scheduler: $(($fresh.Trace | Where-Object { $_ -match '^(get|remove):' }) -join ', ')"
+    $repeat = Invoke-Installer -Clone $Clone -Upgrade -Marker -Scheduler $tripwire
+    Assert (-not $repeat.Failure -and $repeat.Started.Count -eq 1) "Repeating a completed migration failed: $($repeat.Failure)"
+    Assert (@($repeat.Trace | Where-Object { $_ -match '^(get|remove):' }).Count -eq 0) 'Repeating a completed migration asked the scheduler.'
+    $control = Invoke-Installer -Clone $Clone -Upgrade -Scheduler $tripwire
+    Assert ($control.Failure -match 'Could not look for the legacy task') "Control: an upgrade without a record should have asked the failing scheduler: $($control.Failure)"
 }
 try {
     $aClone = New-Fixture 'a'
@@ -162,7 +278,10 @@ try {
     Test-DirectStart $aClone
     Test-DirectStart $bClone
     Test-DirectStart $legacyClone
-    Write-Output 'PASS: named and unnamed installs start their own supervisor directly and scope the legacy cleanup to their instance (launch and cleanup mocked; nothing registered).'
+    Write-Output 'PASS: named and unnamed installs migrate their own legacy entries first, then start their own supervisor directly (launch and scheduler faked; nothing registered).'
+    Test-InstallerMigration $aClone
+    Test-InstallerMigration $legacyClone
+    Write-Output 'PASS: an unremovable or uninspectable legacy entry fails the install before any change and without success output; fresh and repeated installs never ask the scheduler; another clone''s task is kept.'
     $mutex = [Threading.Mutex]::new($false, $a.Mutex)
     Assert ($mutex.WaitOne(0)) 'Could not acquire first instance mutex.'
     try {

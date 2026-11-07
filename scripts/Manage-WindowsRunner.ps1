@@ -58,7 +58,11 @@ switch ($Action) {
         }
         exit [int](-not $state.Healthy)
     }
-    'Start' { Write-Output (Start-WindowsRunner) }
+    'Start' {
+        # Start-WindowsRunner returns only once the supervisor confirmed it initialized; otherwise it throws.
+        try { Write-Output (Start-WindowsRunner) }
+        catch { [Console]::Error.WriteLine("Start failed: $($_.Exception.Message)"); exit 1 }
+    }
     'Stop' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop'
         Write-Outcome $result
@@ -68,7 +72,8 @@ switch ($Action) {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'restart'
         Write-Outcome $result
         if ($result.Outcome -in 'timeout', 'failed') { exit 1 }
-        Write-Output (Start-WindowsRunner)
+        try { Write-Output (Start-WindowsRunner) }
+        catch { [Console]::Error.WriteLine("Restart stopped the supervisor but the new one did not start: $($_.Exception.Message)"); exit 1 }
     }
     'Maintenance' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Hold -Reason 'maintenance'

@@ -66,6 +66,8 @@ if ($Config.windows.instanceId) { $WindowsMutexName += ".$($Config.windows.insta
 # supervisor itself, with backoff. A supervisor that is found dead by its successor this many times in a row is reported as one
 # that keeps dying.
 $SupervisorRepeatedDeaths = 3
+# How long Start-WindowsRunner waits for a launched supervisor to write its initialization status before it fails.
+$SupervisorStartTimeoutSeconds = [int]$Config.lifecycle.startTimeoutSeconds
 
 # Names this tooling once registered with Windows to start the supervisor at sign-in and trim logs. They exist only so
 # Remove-LegacyStartupTasks (LegacyCleanup.ps1) can remove what an earlier version left; nothing registers them any more.
@@ -77,6 +79,16 @@ $LegacyLogonTaskName = 'Start runners'
 if ($Config.windows.instanceId) {
     $LegacyWindowsTaskName += " ($($Config.windows.instanceId))"
     $LegacyLogTrimTaskName += " ($($Config.windows.instanceId))"
+}
+# Written once, by LegacyCleanup.ps1, when this instance's legacy startup entries are verified gone (or never existed). Setup
+# verification reads this file; it never asks Task Scheduler.
+$LegacyMigrationFile = Join-Path $WindowsRunner 'legacy-migration.json'
+
+# The completed legacy-migration record of this instance; $null when absent, unreadable or incomplete. A file read only.
+function Get-LegacyMigration {
+    if (-not (Test-Path -LiteralPath $LegacyMigrationFile)) { return }
+    try { $record = Get-Content -Raw -LiteralPath $LegacyMigrationFile | ConvertFrom-Json } catch { return }
+    if ($record.schema -eq 1 -and $record.kind -and $record.completedUtc) { $record }
 }
 
 # supervisor.json as an object; $null when it is absent or unreadable.

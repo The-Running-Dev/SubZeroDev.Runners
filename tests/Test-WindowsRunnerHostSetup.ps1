@@ -99,6 +99,66 @@ $options.Count = 1
 Invoke-WindowsRunnerHostSetup @options
 Assert ($flow.Smoke.Count -eq 0) 'Setup dispatched a smoke test without a requested repository.'
 
+# A failing per-instance install (for example an earlier version's startup entry that cannot be removed or verified gone, or a
+# supervisor that did not initialize) stops host setup at that instance: later instances, verification, BuildAgent and the smoke
+# test never run, no success is reported, and the worker process exits non-zero. The real Install-RunnerSetupInstance runs a
+# throwaway installer that throws the real migration failure text; everything that would reach GitHub or the host is a recorder.
+. $functions
+$failure = Join-Path ([IO.Path]::GetTempPath()) ('host-setup-fail-' + [guid]::NewGuid().ToString('N'))
+try {
+    $migrationFailure = "An earlier version's startup entry for instance win01 could not be removed or verified gone, so the install stopped before any registration change; nothing was started or stopped and no migration is recorded:`n - \SubZeroDev.Runners\Start Windows runner (win01): access denied`nRemove the task in Task Scheduler (taskschd.msc), or repair the Task Scheduler service, then rerun Install-WindowsRunner.ps1 (or scripts\Remove-LegacyTasks.ps1)."
+    foreach ($id in 'win01', 'win02') {
+        $scriptsDir = Join-Path $failure "root\$id\scripts"
+        New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null
+        $body = if ($id -eq 'win01') { "throw @'`n$migrationFailure`n'@" } else { "Add-Content -LiteralPath '$failure\calls.txt' 'installer-win02'" }
+        Set-Content -LiteralPath (Join-Path $scriptsDir 'Install-WindowsRunner.ps1') "param([string] `$InstanceId, [string] `$GitHubUrl, [string[]] `$ExtraLabels)`n$body"
+    }
+    $calls = Join-Path $failure 'calls.txt'
+    # In-process: the throw reaches the caller of Invoke-WindowsRunnerHostSetup.
+    $recorded = [Collections.Generic.List[string]]::new()
+    # Installed with Set-Item (not function statements) so each function is still defined once in this file.
+    Set-Item -Path Function:Confirm-RunnerSetupAuthentication -Value { param($Scope, $NonInteractive, $WithSmoke) }
+    Set-Item -Path Function:Sync-RunnerSetupInstance -Value { param($Clone, $InstanceId, $SourceCommit, $GitHubUrl) }
+    Set-Item -Path Function:Get-RunnerSetupEvidence -Value { param($Clone, $InstanceId) $recorded.Add("evidence:$InstanceId"); [pscustomobject]@{ Name = 'n' } }
+    Set-Item -Path Function:Confirm-RunnerSetupHost -Value { param($Instances, $Scope) $recorded.Add('verified') }
+    Set-Item -Path Function:Install-RunnerSetupBuildAgent -Value { param($Clone, $InstallRoot) $recorded.Add('buildagent'); 0 }
+    Set-Item -Path Function:Invoke-RunnerSetupSmoke -Value { param($Repository, $Label, $SourceClone, $ExpectedRunnerNames) $recorded.Add('smoke') }
+    $failOptions = @{ Count = 2; InstallRoot = (Join-Path $failure 'root'); GitHubUrl = 'https://github.com/AbsoluteZeroDev'; ExtraLabels = @(); SourceCommit = ('a' * 40); SmokeRepository = 'AbsoluteZeroDev/RunnerSmoke'; NonInteractive = $true }
+    $thrown = $null; $output = $null
+    try { $output = Invoke-WindowsRunnerHostSetup @failOptions *>&1 | Out-String } catch { $thrown = $_.Exception.Message }
+    Assert ($thrown -match 'could not be removed or verified gone') "A failing installer did not fail host setup: $thrown"
+    Assert ($thrown -match 'taskschd\.msc') 'The actionable fix was lost on the way out of host setup.'
+    Assert ($recorded.Count -eq 0) "Host setup continued after a failed install: $($recorded -join ', ')"
+    Assert (-not (Test-Path -LiteralPath $calls)) 'Host setup went on to install the next instance after a failure.'
+    Assert ("$output" -notmatch 'Setup complete') 'Host setup reported completion after a failed install.'
+
+    # Real worker process: nothing but the host and GitHub operations is replaced; the process must exit non-zero with the text.
+    $workerDir = Join-Path $failure 'worker\scripts'
+    New-Item -ItemType Directory -Path $workerDir -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo 'scripts\Configure-WindowsRunners.ps1') -Destination $workerDir
+    @(
+        ". '$functions'"
+        'function Confirm-RunnerSetupAuthentication { param($Scope, $NonInteractive, $WithSmoke) }'
+        'function Sync-RunnerSetupInstance { param($Clone, $InstanceId, $SourceCommit, $GitHubUrl) }'
+        "function Get-RunnerSetupEvidence { param(`$Clone, `$InstanceId) Add-Content -LiteralPath '$calls' 'evidence'; [pscustomobject]@{ Name = 'n' } }"
+        "function Confirm-RunnerSetupHost { param(`$Instances, `$Scope) Add-Content -LiteralPath '$calls' 'verified' }"
+        "function Install-RunnerSetupBuildAgent { param(`$Clone, `$InstallRoot) Add-Content -LiteralPath '$calls' 'buildagent'; 0 }"
+        "function Invoke-RunnerSetupSmoke { param(`$Repository, `$Label, `$SourceClone, `$ExpectedRunnerNames) Add-Content -LiteralPath '$calls' 'smoke' }"
+    ) | Set-Content -LiteralPath (Join-Path $workerDir 'WindowsRunnerSetup.ps1')
+    $optionsFile = Join-Path $failure 'options.json'
+    $failOptions | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $optionsFile
+    $workerOutput = & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $workerDir 'Configure-WindowsRunners.ps1') -OptionsPath $optionsFile 2>&1 | Out-String
+    $workerExit = $LASTEXITCODE
+    Assert ($workerExit -ne 0) "The worker exited $workerExit after a failed install. Output:`n$workerOutput"
+    Assert ($workerOutput -match 'could not be removed or verified gone' -and $workerOutput -match 'taskschd\.msc') "The worker lost the failure text:`n$workerOutput"
+    Assert ($workerOutput -notmatch 'Setup complete') 'The worker reported completion after a failed install.'
+    $workerCalls = if (Test-Path -LiteralPath $calls) { Get-Content -Raw -LiteralPath $calls }
+    Assert (-not $workerCalls) "The worker went on after the failure: $workerCalls"
+    foreach ($name in 'Confirm-RunnerSetupAuthentication', 'Sync-RunnerSetupInstance', 'Get-RunnerSetupEvidence', 'Confirm-RunnerSetupHost', 'Install-RunnerSetupBuildAgent', 'Invoke-RunnerSetupSmoke') { Remove-Item "Function:$name" -ErrorAction SilentlyContinue }
+} finally {
+    Remove-Item -LiteralPath $failure -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # Verify online state, remote/local ID equality, isolation and adding labels to existing registrations.
 . $functions
 $evidence = @(
@@ -197,4 +257,5 @@ try {
 }
 
 Write-Output 'PASS: authentication, deterministic host orchestration, target/smoke boundaries, pair labels, registration identity/online checks and isolation (external operations mocked).'
+Write-Output 'PASS: a failed per-instance install (legacy startup entry not removable, supervisor not initialized) stops host setup and the worker process exits non-zero with the fix, before verification, BuildAgent, smoke or any success output.'
 Write-Output 'PASS: dirty/divergent/mismatched clone rejection and automatic smoke dispatch/correlation/evidence checking without overwriting existing workflows (GitHub operations mocked).'

@@ -408,13 +408,42 @@ Test-Case 'a failed stop stops re-registration before it changes anything' {
 # --- fake process start -------------------------------------------------------------------------------------------------
 # Start-Process is replaced at script scope, so no case here can launch a real supervisor. Order is the sequence of start, kill
 # and stop calls across the fakes; Started records every launch.
-function New-FakeSpawn { @{ Order = @(); Started = @() } }
+#
+# What the launched "supervisor" does is $spawn.Mode, as the evidence it leaves (the process table and supervisor.json):
+#   ok        alive, wrote its own initialization status          orphan   as ok, state waiting-for-orphan beside an existing listener
+#   never     alive, never wrote a status                         stale    alive; supervisor.json is its pid but from an earlier start
+#   other-pid alive; supervisor.json belongs to another pid       exit23   exited with code 23 before it initialized
+#   adopt     exited 0 (mutex held); another initialized supervisor (pid 987653) of the instance is running
+function New-FakeSpawn { @{ Order = @(); Started = @(); Mode = 'ok' } }
 $spawn = New-FakeSpawn
 function Start-Process {
     [CmdletBinding()] param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch] $PassThru)
     $spawn.Order += 'start-process'
     $spawn.Started += , [pscustomobject]@{ FilePath = $FilePath; ArgumentList = @($ArgumentList); WorkingDirectory = $WorkingDirectory; WindowStyle = "$WindowStyle"; MaintenanceAtStart = (Test-Path -LiteralPath $MaintenanceFile) }
-    if ($PassThru) { [pscustomobject]@{ Id = 987700 } }
+    if (-not $PassThru) { return }
+    $now = [DateTime]::UtcNow.ToString('o'); $hourAgo = [DateTime]::UtcNow.AddHours(-1).ToString('o')
+    $process = [pscustomobject]@{ Id = 987700 }
+    switch ($spawn.Mode) {
+        'ok' { $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; Set-SupervisorStatusValues @{ state = 'starting'; pid = 987700; startedUtc = $now } }
+        'orphan' {
+            $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; $win.Listeners = @([pscustomobject]@{ ProcessId = 987654 })
+            Set-SupervisorStatusValues @{ state = 'waiting-for-orphan'; pid = 987700; startedUtc = $now }
+        }
+        'never' { $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 } }
+        'stale' { $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; Set-SupervisorStatusValues @{ state = 'running'; pid = 987700; startedUtc = $hourAgo } }
+        'other-pid' { $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; Set-SupervisorStatusValues @{ state = 'running'; pid = 987653; startedUtc = $now } }
+        'exit23' {
+            $win.Supervisor = $null
+            $process | Add-Member -NotePropertyName HasExited -NotePropertyValue $true
+            $process | Add-Member -NotePropertyName ExitCode -NotePropertyValue 23
+        }
+        'adopt' {
+            $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; Set-SupervisorStatusValues @{ state = 'running'; pid = 987653; startedUtc = $hourAgo }
+            $process | Add-Member -NotePropertyName HasExited -NotePropertyValue $true
+            $process | Add-Member -NotePropertyName ExitCode -NotePropertyValue 0
+        }
+    }
+    $process
 }
 # --- Windows stop -------------------------------------------------------------------------------------------------------
 # Fake pids are not valid Windows pids (not multiples of 4), so nothing real is ever addressed.
@@ -532,9 +561,12 @@ Test-Case 'Start: no supervisor running launches exactly one hidden supervisor p
 Test-Case 'Start: a supervisor that is already running is left alone' {
     . Use-WindowsFixture
     $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }
+    Set-SupervisorStatusValues @{ state = 'running'; pid = 987653; startedUtc = [DateTime]::UtcNow.AddHours(-1).ToString('o') }
     $how = Start-WindowsRunner
     Assert ($how -eq 'already running (pid 987653)') "Unexpected result: $how"
     Assert (-not $spawn.Order -and -not $win.Kills -and -not $win.Stops) "Something was started or stopped: $($spawn.Order -join ',')"
+    $again = Start-WindowsRunner
+    Assert ($again -eq $how -and -not $spawn.Order) "A second Start did not return the same verified instance: $again / $($spawn.Order -join ',')"
 }
 
 Test-Case 'Start: maintenance has ended, and the labels are back, by the time the supervisor is launched' {
@@ -551,9 +583,56 @@ Test-Case 'Start: maintenance has ended, and the labels are back, by the time th
     Assert (-not (Test-Path -LiteralPath $MaintenanceFile)) 'The hold was not ended by Start.'
 }
 
+# Start reports success only on evidence from the supervisor of this instance: its process, plus its own fresh initialization status.
+Test-Case 'Start: a supervisor that exits before it initializes fails Start with its exit code' {
+    . Use-WindowsFixture
+    $spawn.Mode = 'exit23'
+    Assert-Throws { Start-WindowsRunner -TimeoutSeconds 5 } 'exited with code 23 before it initialized' 'A supervisor that exited with 23 was reported as started.'
+}
+
+Test-Case 'Start: a supervisor that is alive but never initializes fails after the bounded wait' {
+    . Use-WindowsFixture
+    $spawn.Mode = 'never'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    Assert-Throws { Start-WindowsRunner -TimeoutSeconds 2 } 'did not report that it initialized within 2 seconds \(no supervisor.json\)' 'A supervisor that never initialized was reported as started.'
+    Assert ($clock.Elapsed.TotalSeconds -lt 10) "The wait was not bounded: $($clock.Elapsed.TotalSeconds) s."
+}
+
+Test-Case 'Start: a stale status file, another instance''s pid, a pid file alone or an online orphan listener is not confirmation' {
+    foreach ($mode in 'stale', 'other-pid') {
+        . Use-WindowsFixture
+        $spawn.Mode = $mode
+        Assert-Throws { Start-WindowsRunner -TimeoutSeconds 1 } 'did not report that it initialized' "Mode $mode was accepted as an initialized supervisor."
+    }
+    # A leftover supervisor.json of a dead supervisor and a listener that GitHub would show online: nothing launched can confirm.
+    . Use-WindowsFixture
+    $spawn.Mode = 'never'; $win.Listeners = @([pscustomobject]@{ ProcessId = 987654 })
+    Set-SupervisorStatusValues @{ state = 'running'; pid = 987653; startedUtc = [DateTime]::UtcNow.AddHours(-2).ToString('o') }
+    Assert-Throws { Start-WindowsRunner -TimeoutSeconds 1 } 'did not report that it initialized' 'A stale status and an existing listener were accepted.'
+    # The pid file of a running process without status of its own is not enough for "already running" either.
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }
+    Assert-Throws { Start-WindowsRunner -TimeoutSeconds 1 } 'did not report that it initialized' 'A running process with no status was reported as already running.'
+    Assert (-not $spawn.Order) 'A second supervisor was launched next to the one that is running.'
+}
+
+Test-Case 'Start: a supervisor that waits for an orphaned listener is reported as that, and no second listener is started' {
+    . Use-WindowsFixture
+    $spawn.Mode = 'orphan'
+    $how = Start-WindowsRunner
+    Assert ($how -match '^started \(pid 987700\) - waiting for the existing listener \(pid 987654\) to exit; no second listener is started$') "Unexpected result: $how"
+    Assert (@($spawn.Started).Count -eq 1 -and @($win.Listeners).Count -eq 1) 'Start added a listener or a supervisor.'
+}
+
+Test-Case 'Start: a launch that loses the mutex to an initialized supervisor of this instance reports that one' {
+    . Use-WindowsFixture
+    $spawn.Mode = 'adopt'
+    $how = Start-WindowsRunner
+    Assert ($how -eq 'already running (pid 987653)') "Unexpected result: $how"
+}
+
 Test-Case 'No script outside the legacy cleanup registers, starts or inspects scheduled tasks, and the config has no startup or trim-time setting' {
-    $allowed = 'LegacyCleanup.ps1', 'WindowsRunnerSetup.ps1'
-    $hits = Get-ChildItem -LiteralPath (Join-Path $repo 'scripts') -Filter '*.ps1' | Where-Object { $_.Name -notin $allowed } |
+    $hits = Get-ChildItem -LiteralPath (Join-Path $repo 'scripts') -Filter '*.ps1' | Where-Object { $_.Name -ne 'LegacyCleanup.ps1' } |
         Where-Object { (Get-Content -Raw -LiteralPath $_.FullName) -match 'ScheduledTask|schtasks|CurrentVersion.Run' } | ForEach-Object { $_.Name }
     Assert (-not $hits) "Scheduler references remain in: $($hits -join ', ')"
     Assert (-not (Test-Path -LiteralPath (Join-Path $repo 'scripts\Set-WindowsStartup.ps1')) -and -not (Test-Path -LiteralPath (Join-Path $repo 'scripts\Register-LogTrimTask.ps1'))) 'A scheduler registration script is still present.'
@@ -805,6 +884,154 @@ Test-Case 'Remove-LegacyTasks.ps1 in a new clone removes nothing and exits 0' {
     Assert ($run.Output -match 'No legacy startup tasks to remove\.' -or $run.Output -match 'Left the ') "Neither 'nothing to remove' nor a kept line was printed.`n$($run.Output)"
 }
 
+# --- legacy migration: the install-time decision (no real Task Scheduler, no real registry) --------------------------------------
+# Invoke-LegacyMigration runs against a throwaway $WindowsRunner and a fake scheduler injected into Remove-LegacyStartupTasks.
+# A test body runs in its own scope, so the local $WindowsRunner / $LegacyMigrationFile / Remove-LegacyStartupTasks below are what
+# the real functions see and nothing outside the case is touched.
+function New-MigrationCase([switch] $Upgrade) {
+    $windows = Join-Path (New-CaseDirectory) 'windows'
+    New-Item -ItemType Directory -Path $windows | Out-Null
+    if ($Upgrade) { Set-Content -LiteralPath (Join-Path $windows '.runner') -Value '{"agentId":7}' }
+    [pscustomobject]@{ Windows = $windows; Marker = (Join-Path $windows 'legacy-migration.json'); Runner = (Join-Path $windows '.runner'); Script = 'C:\clone-under-test\scripts\Run-WindowsRunner.ps1' }
+}
+# Task name -> the script its action runs. Every get/remove is logged in Calls.
+function New-FakeScheduler {
+    param([hashtable] $Tasks = @{}, [string] $InspectError, [string] $RemoveError, [switch] $RemoveDoesNothing)
+    $calls = [Collections.Generic.List[string]]::new()
+    $get = {
+        param($Path, $Name)
+        $calls.Add("get:$Name")
+        if ($InspectError) { throw $InspectError }
+        if ($Tasks.ContainsKey($Name)) { return [pscustomobject]@{ Actions = @([pscustomobject]@{ Arguments = "-NoProfile -File `"$($Tasks[$Name])`"" }) } }
+        throw "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$Name'."
+    }.GetNewClosure()
+    $remove = {
+        param($Path, $Name)
+        $calls.Add("remove:$Name")
+        if ($RemoveError) { throw $RemoveError }
+        if (-not $RemoveDoesNothing) { $Tasks.Remove($Name) }
+    }.GetNewClosure()
+    [pscustomobject]@{ Get = $get; Remove = $remove; Calls = $calls; Tasks = $Tasks }
+}
+# Dot-sourced by a case: Remove-LegacyStartupTasks calls the real implementation against $scheduler and one owned task name.
+$UseFakeScheduler = {
+    $originalCleanup = ${function:Remove-LegacyStartupTasks}
+    function Remove-LegacyStartupTasks {
+        & $originalCleanup -Tasks @(@{ Name = 'Mine'; Script = $case.Script }) -RunKey "HKCU:\Software\SubZeroDev.Runners.Test-absent-$([guid]::NewGuid().ToString('N'))" -RunValueName 'Mine' -GetTask $scheduler.Get -RemoveTask $scheduler.Remove
+    }
+}
+function Get-MigrationFailure([scriptblock] $Action) {
+    try { & $Action | Out-Null } catch { return $_.Exception.Message }
+}
+
+Test-Case 'Legacy migration: an owned task that cannot be removed fails the install step, records nothing and changes no registration' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler -Tasks @{ Mine = $case.Script } -RemoveError 'Access is denied.'
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $before = Get-Content -Raw -LiteralPath $case.Runner
+    $failure = Get-MigrationFailure { Invoke-LegacyMigration }
+    Assert ($failure) 'Nothing was thrown for a task that cannot be removed.'
+    Assert ($failure -match 'could not be removed or verified gone') "Not the migration failure: $failure"
+    Assert ($failure -match 'Could not remove the legacy task' -and $failure -match 'Access is denied') "The cause is not in the error: $failure"
+    Assert ($failure -match 'taskschd\.msc' -and $failure -match 'rerun Install-WindowsRunner\.ps1') "The error is not actionable: $failure"
+    Assert ($failure -match 'before any registration change' -and $failure -match 'nothing was started or stopped') "The error does not say nothing changed: $failure"
+    Assert (-not (Test-Path -LiteralPath $case.Marker)) 'A migration record was written for a failed migration.'
+    Assert (-not (Get-LegacyMigration)) 'Get-LegacyMigration reports a migration that did not complete.'
+    Assert ($scheduler.Tasks.ContainsKey('Mine') -and $scheduler.Calls -contains 'remove:Mine') 'The failing removal was not attempted, or the task vanished.'
+    Assert ((Get-Content -Raw -LiteralPath $case.Runner) -eq $before) 'The registration file was modified.'
+}
+
+Test-Case 'Legacy migration: a task that cannot be inspected fails the install step and records nothing' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler -InspectError 'The Task Scheduler service is not running.'
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $failure = Get-MigrationFailure { Invoke-LegacyMigration }
+    Assert ($failure -match 'could not be removed or verified gone' -and $failure -match 'Could not look for the legacy task' -and $failure -match 'service is not running') "Inspection failure was swallowed or unclear: $failure"
+    Assert (-not (Test-Path -LiteralPath $case.Marker)) 'A migration record was written although the task could not be inspected.'
+    Assert (@($scheduler.Calls | Where-Object { $_ -like 'remove:*' }).Count -eq 0) 'A removal was attempted for a task that could not be inspected.'
+}
+
+Test-Case 'Legacy migration: a task still registered after removal fails the install step and records nothing' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler -Tasks @{ Mine = $case.Script } -RemoveDoesNothing
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $failure = Get-MigrationFailure { Invoke-LegacyMigration }
+    Assert ($failure -match 'still registered after it was removed') "A removal that left the task behind was reported as success: $failure"
+    Assert (-not (Test-Path -LiteralPath $case.Marker)) 'A migration record was written although the task is still registered.'
+}
+
+Test-Case 'Legacy migration: an upgrade whose entries are already gone succeeds once, is recorded, and a repeat does nothing' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $first = Invoke-LegacyMigration
+    Assert ($first.Kind -eq 'upgraded' -and $first.Changed) "First run: $($first | ConvertTo-Json -Compress)"
+    $record = Get-LegacyMigration
+    Assert ($record -and $record.kind -eq 'upgraded' -and $record.completedUtc) 'The completed migration is not recorded.'
+    $callsAfterFirst = $scheduler.Calls.Count
+    Assert ($callsAfterFirst -gt 0) 'An upgrade did not look for the legacy task.'
+    $second = Invoke-LegacyMigration
+    Assert (-not $second.Changed -and $second.Kind -eq 'upgraded' -and @($second.Lines).Count -eq 0) "A repeat changed something: $($second | ConvertTo-Json -Compress)"
+    Assert ($scheduler.Calls.Count -eq $callsAfterFirst) 'A repeat of a completed migration touched the scheduler.'
+}
+
+Test-Case 'Legacy migration: an owned task is removed, verified gone and recorded; a repeat makes no destructive call' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler -Tasks @{ Mine = $case.Script }
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $first = Invoke-LegacyMigration
+    Assert ($first.Changed -and (@($first.Lines) -join ' ') -match 'Removed the legacy task') "The removal is not reported: $($first | ConvertTo-Json -Compress)"
+    Assert (-not $scheduler.Tasks.ContainsKey('Mine')) 'The owned task is still registered.'
+    Assert ((Get-LegacyMigration).removed.Count -eq 1) 'The removal is not in the record.'
+    $removes = @($scheduler.Calls | Where-Object { $_ -like 'remove:*' }).Count
+    $callsAfterFirst = $scheduler.Calls.Count
+    $second = Invoke-LegacyMigration
+    Assert (-not $second.Changed) 'A repeat reported a change.'
+    Assert ($scheduler.Calls.Count -eq $callsAfterFirst -and $removes -eq 1) 'A repeat touched the scheduler.'
+}
+
+Test-Case 'Legacy migration: a fresh install is recorded without looking at the scheduler at all' {
+    $case = New-MigrationCase
+    $scheduler = New-FakeScheduler -InspectError 'The scheduler must not be asked on a fresh install.'
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $result = Invoke-LegacyMigration
+    Assert ($result.Kind -eq 'fresh' -and $result.Changed) "Fresh: $($result | ConvertTo-Json -Compress)"
+    Assert ($scheduler.Calls.Count -eq 0) "A fresh install asked the scheduler: $($scheduler.Calls -join ', ')"
+    Assert ((Get-LegacyMigration).kind -eq 'fresh') 'A fresh install is not recorded.'
+}
+
+Test-Case 'Legacy migration: another clone''s task with the same name is kept, does not block, and the migration is recorded' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler -Tasks @{ Mine = 'C:\another-clone\scripts\Run-WindowsRunner.ps1' }
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $result = Invoke-LegacyMigration
+    Assert ($result.Changed -and $result.Kind -eq 'upgraded') "The other clone's task blocked the migration: $($result | ConvertTo-Json -Compress)"
+    Assert ($scheduler.Tasks.ContainsKey('Mine') -and @($scheduler.Calls | Where-Object { $_ -like 'remove:*' }).Count -eq 0) 'The other clone''s task was removed.'
+    Assert ((@($result.Lines) -join ' ') -match 'another clone') 'The kept task is not reported.'
+    Assert ((Get-LegacyMigration).kept.Count -eq 1) 'The kept task is not in the record.'
+}
+
+Test-Case 'Legacy migration: an incomplete or unreadable record does not count as complete' {
+    $case = New-MigrationCase -Upgrade
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    foreach ($content in '{}', '{"schema":1,"kind":"upgraded"}', '{"schema":2,"kind":"upgraded","completedUtc":"2026-01-01T00:00:00Z"}', 'not json') {
+        Set-Content -LiteralPath $case.Marker -Value $content
+        Assert (-not (Get-LegacyMigration)) "Counted as complete: $content"
+    }
+    $scheduler = New-FakeScheduler
+    . $UseFakeScheduler
+    Set-Content -LiteralPath $case.Marker -Value '{}'
+    $result = Invoke-LegacyMigration
+    Assert ($result.Changed -and (Get-LegacyMigration).kind -eq 'upgraded') 'An incomplete record was not replaced by a verified migration.'
+}
+
 # A clone whose supervisor cannot be killed: supervisor.json says it was running, Get-SupervisorProcess and Invoke-TaskKill are
 # replaced (functions appended to the clone's own copy of Lifecycle.ps1) by a supervisor with a fake pid that taskkill refuses to
 # end. Nothing here addresses a real process.
@@ -931,6 +1158,184 @@ Test-Case 'Real supervisor: a killed supervisor is replaced by an explicit Start
         foreach ($process in $started) { if (-not $process.HasExited) { Microsoft.PowerShell.Management\Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } }
         foreach ($listener in & $getListeners) { Microsoft.PowerShell.Management\Stop-Process -Id $listener.ProcessId -Force -ErrorAction SilentlyContinue }
     }
+}
+
+# --- Start confirms initialization: the real entry points against a stand-in supervisor ------------------------------------
+# The clone's Run-WindowsRunner.ps1 is replaced by a stub, so the real Start-WindowsRunner launches a real hidden process of a
+# clone of its own (throwaway instance id) and has to decide, from that process and its supervisor.json, whether it started.
+function Set-StubSupervisor($Fixture, [string[]] $Lines, [int] $TimeoutSeconds) {
+    Set-Content -LiteralPath (Join-Path $Fixture.Clone 'scripts\Run-WindowsRunner.ps1') -Value $Lines
+    New-Item -ItemType Directory -Force -Path (Join-Path $Fixture.Clone 'windows') | Out-Null
+    if ($TimeoutSeconds) {
+        $localPath = Join-Path $Fixture.Clone 'runners.local.json'
+        $local = Get-Content -Raw -LiteralPath $localPath | ConvertFrom-Json -AsHashtable
+        $local.lifecycle = @{ pollSeconds = 1; startTimeoutSeconds = $TimeoutSeconds }
+        $local | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $localPath
+    }
+}
+# Runs an entry point in a child with output to files (a stub that outlives it cannot hold a pipe of this test open) and
+# returns when it exits, or kills it after $Seconds.
+function Invoke-BoundedEntryPoint($Fixture, [string] $Script, [string[]] $Arguments, [int] $Seconds = 60) {
+    $stdout = Join-Path $Fixture.Clone ('out-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.txt'); $stderr = "$stdout.err"
+    $oldPath = $env:PATH; $oldGh = $env:FAKE_GH_DIR
+    try {
+        $env:PATH = "$($Fixture.Shim);$oldPath"; $env:FAKE_GH_DIR = $Fixture.GhState
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $process = Microsoft.PowerShell.Management\Start-Process -FilePath $pwshPath -ArgumentList (@('-NoLogo', '-NoProfile', '-File', (Join-Path $Fixture.Clone "scripts\$Script")) + $Arguments) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+        $finished = $process.WaitForExit($Seconds * 1000)
+        if (-not $finished) { Microsoft.PowerShell.Management\Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        $text = (@((Get-Content -Raw -LiteralPath $stdout -ErrorAction SilentlyContinue), (Get-Content -Raw -LiteralPath $stderr -ErrorAction SilentlyContinue)) | Where-Object { $_ }) -join "`n"
+        [pscustomobject]@{ ExitCode = $(if ($finished) { $process.ExitCode } else { $null }); Finished = $finished; Seconds = $watch.Elapsed.TotalSeconds; Output = $text }
+    }
+    finally { $env:PATH = $oldPath; $env:FAKE_GH_DIR = $oldGh }
+}
+function Stop-StubSupervisors($Fixture) {
+    $path = Join-Path $Fixture.Clone 'scripts\Run-WindowsRunner.ps1'
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($path) })) {
+        Microsoft.PowerShell.Management\Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
+function Use-StartRunnersShims($Fixture) {
+    # Docker answers every call with success, nothing starts Docker Desktop, and no toast is shown: the stub records it.
+    Set-Content -LiteralPath (Join-Path $Fixture.Shim 'docker.cmd') -Value @('@echo off', 'exit /b 0')
+    Set-Content -LiteralPath (Join-Path $Fixture.Clone 'scripts\Show-Notification.ps1') -Value @(
+        'param([string] $Title, [string] $Message, [string] $Open)'
+        'Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) ''notified.txt'') -Value "$Title | $Message"')
+    Set-Content -LiteralPath (Join-Path $Fixture.Clone 'scripts\Set-DropboxIgnored.ps1') -Value '# not under test'
+}
+
+Test-Case 'Start: a supervisor that exits 23 before it initializes fails Start and Restart with the exit code, and nothing is started' {
+    $fixture = New-EntryPointFixture
+    Set-StubSupervisor $fixture @('exit 23')
+    $start = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Start')
+    Assert ($start.Finished -and $start.ExitCode -ne 0) "Start exited $($start.ExitCode) although the supervisor exited 23.`n$($start.Output)"
+    Assert ($start.Output -match 'exited with code 23 before it initialized') "The exit code is not in the diagnostics.`n$($start.Output)"
+    Assert ($start.Output -notmatch 'started \(pid') "Start reported a started supervisor.`n$($start.Output)"
+    # -Force: the fixture has no registration to withdraw admission for, and a drain would refuse.
+    $restart = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Restart', '-Force')
+    Assert ($restart.Finished -and $restart.ExitCode -ne 0) "Restart exited $($restart.ExitCode) although the new supervisor exited 23.`n$($restart.Output)"
+    Assert ($restart.Output -match 'exited with code 23 before it initialized') "Restart did not name the exit code.`n$($restart.Output)"
+    Assert (-not (Test-Path -LiteralPath (Join-Path $fixture.Clone 'windows\supervisor.json'))) 'A supervisor.json exists that no supervisor wrote.'
+}
+
+Test-Case 'Start-Runners.ps1: a supervisor that exits 23 fails the run (exit 1, toast, log) after the Linux containers were still started' {
+    $fixture = New-EntryPointFixture
+    Set-StubSupervisor $fixture @('exit 23')
+    Use-StartRunnersShims $fixture
+    $run = Invoke-BoundedEntryPoint $fixture 'Start-Runners.ps1' @()
+    Assert ($run.Finished -and $run.ExitCode -eq 1) "Start-Runners.ps1 exited $($run.ExitCode).`n$($run.Output)"
+    $notified = Get-Content -Raw -LiteralPath (Join-Path $fixture.Clone 'notified.txt') -ErrorAction SilentlyContinue
+    Assert ($notified -match 'Windows runner did not start: .*exited with code 23') "The toast did not carry the failure: $notified"
+    $logs = Get-ChildItem -LiteralPath (Join-Path $fixture.Clone 'windows\_diag') -Filter 'Startup_*.log' | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }
+    Assert (($logs -join "`n") -match 'Linux containers .* started' -and ($logs -join "`n") -match 'FAILED: .*exited with code 23') "The Linux start and the Windows failure are not both in the log: $logs"
+}
+
+Test-Case 'Start: a supervisor that stays alive but never initializes fails within the bound, naming the wait, and is not killed' {
+    $fixture = New-EntryPointFixture
+    # Like the real supervisor, the stub writes its pid file first and then never gets as far as supervisor.json.
+    Set-StubSupervisor $fixture @('Set-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) ''windows\supervisor.pid'') -Value $PID', 'Start-Sleep -Seconds 600') 3
+    try {
+        $start = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Start') 90
+        Assert ($start.Finished -and $start.ExitCode -ne 0) "Start did not fail (finished: $($start.Finished), exit $($start.ExitCode)).`n$($start.Output)"
+        Assert ($start.Seconds -lt 60) "Start took $($start.Seconds) s with a 3 s bound."
+        Assert ($start.Output -match 'did not report that it initialized within 3 seconds') "The timeout is not reported.`n$($start.Output)"
+        Assert ($start.Output -notmatch 'started \(pid') "Start reported a started supervisor.`n$($start.Output)"
+        # No supervisor.json was ever written, so the stub is alive but unconfirmed; a second Start does not start another process.
+        $before = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains((Join-Path $fixture.Clone 'scripts\Run-WindowsRunner.ps1')) }).Count
+        Assert ($before -eq 1) "Expected the one unconfirmed stub, found $before."
+        $again = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Start') 90
+        $after = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains((Join-Path $fixture.Clone 'scripts\Run-WindowsRunner.ps1')) }).Count
+        Assert ($again.ExitCode -ne 0 -and $after -eq 1) "A second Start exited $($again.ExitCode) and there are $after stubs.`n$($again.Output)"
+    }
+    finally { Stop-StubSupervisors $fixture }
+}
+
+Test-Case 'Start: a stale supervisor.json of an earlier pid does not confirm a new supervisor that never initializes' {
+    $fixture = New-EntryPointFixture
+    Set-StubSupervisor $fixture @('Start-Sleep -Seconds 600') 3
+    @{ state = 'running'; pid = 2147483000; startedUtc = [DateTime]::UtcNow.AddHours(-1).ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $fixture.Clone 'windows\supervisor.json')
+    try {
+        $start = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Start') 90
+        Assert ($start.Finished -and $start.ExitCode -ne 0 -and $start.Output -match 'did not report that it initialized') "A stale supervisor.json confirmed the start.`n$($start.Output)"
+    }
+    finally { Stop-StubSupervisors $fixture }
+}
+
+# --- no Task Scheduler in any normal path: a sentinel for every access, in real child processes -----------------------------
+# A fake ScheduledTasks module comes first on PSModulePath (every cmdlet logs and throws) and a schtasks shim first on PATH, so
+# any call, module-qualified or not, trips the sentinel. A negative control proves the sentinel sees a call.
+Test-Case 'No scheduler access: fresh migration, setup evidence, Start (healthy), second Start, Status and Stop never touch ScheduledTasks or schtasks' {
+    $fixture = New-EntryPointFixture
+    $sentinelDir = New-CaseDirectory
+    $log = Join-Path $sentinelDir 'scheduler-calls.log'
+    $moduleDir = Join-Path $sentinelDir 'modules\ScheduledTasks'
+    New-Item -ItemType Directory -Path $moduleDir | Out-Null
+    $names = 'Get-ScheduledTask', 'Get-ScheduledTaskInfo', 'Register-ScheduledTask', 'Unregister-ScheduledTask', 'Set-ScheduledTask', 'Start-ScheduledTask', 'Stop-ScheduledTask', 'Enable-ScheduledTask', 'Disable-ScheduledTask', 'New-ScheduledTaskAction', 'New-ScheduledTaskTrigger', 'New-ScheduledTaskSettingsSet', 'New-ScheduledTaskPrincipal'
+    $module = foreach ($name in $names) { "function $name { Add-Content -LiteralPath `$env:SCHEDULER_SENTINEL_LOG -Value '$name'; throw 'scheduler sentinel: $name was called' }" }
+    Set-Content -LiteralPath (Join-Path $moduleDir 'ScheduledTasks.psm1') -Value (@($module) + "Export-ModuleMember -Function $($names -join ', ')")
+    Set-Content -LiteralPath (Join-Path $fixture.Shim 'schtasks.cmd') -Value @('@echo off', 'echo schtasks %* >> "%SCHEDULER_SENTINEL_LOG%"', 'exit /b 1')
+    # Healthy stand-in supervisor: pid file, then a live supervisor.json, as the real one writes them.
+    Set-StubSupervisor $fixture @(
+        '$dir = Join-Path (Split-Path $PSScriptRoot -Parent) ''windows'''
+        'Set-Content -LiteralPath (Join-Path $dir ''supervisor.pid'') -Value $PID'
+        '@{ state = ''running''; pid = $PID; startedUtc = [DateTime]::UtcNow.ToString(''o'') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $dir ''supervisor.json'')'
+        'Start-Sleep -Seconds 600')
+    Set-Content -LiteralPath (Join-Path $fixture.Clone 'scripts\Driver.ps1') -Value @(
+        'param([string] $Mode)'
+        '$ErrorActionPreference = ''Stop'''
+        '$scripts = $PSScriptRoot'
+        '. (Join-Path $scripts ''Common.ps1''); . (Join-Path $scripts ''Registration.ps1''); . (Join-Path $scripts ''Lifecycle.ps1''); . (Join-Path $scripts ''LegacyCleanup.ps1''); . (Join-Path $scripts ''WindowsRunnerSetup.ps1'')'
+        'switch ($Mode) {'
+        '    ''control'' { ScheduledTasks\Get-ScheduledTask -TaskName ''x'' }'
+        '    ''migrate'' { $m = Invoke-LegacyMigration; "migration $($m.Kind) changed=$($m.Changed)" }'
+        '    ''evidence'' {'
+        '        [pscustomobject]@{ agentName = $Config.windows.name; agentId = 5 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WindowsRunner ''.runner'')'
+        '        try { Get-RunnerSetupEvidence -Clone (Split-Path $scripts -Parent) -InstanceId $Config.windows.instanceId | Out-Null; ''evidence returned'' } catch { "evidence failed: $($_.Exception.Message)" }'
+        '    }'
+        '}')
+    $oldModules = $env:PSModulePath; $oldLog = $env:SCHEDULER_SENTINEL_LOG; $oldPath = $env:PATH
+    try {
+        $env:PSModulePath = "$(Join-Path $sentinelDir 'modules')$([IO.Path]::PathSeparator)$oldModules"; $env:SCHEDULER_SENTINEL_LOG = $log
+        $env:PATH = "$($fixture.Shim);$oldPath"
+        $control = Invoke-BoundedEntryPoint $fixture 'Driver.ps1' @('-Mode', 'control')
+        Assert ($control.ExitCode -ne 0 -and (Test-Path -LiteralPath $log) -and (Get-Content -Raw -LiteralPath $log) -match 'Get-ScheduledTask') "The sentinel did not see a ScheduledTasks call (negative control): exit $($control.ExitCode).`n$($control.Output)"
+        Remove-Item -LiteralPath $log
+        $migrate = Invoke-BoundedEntryPoint $fixture 'Driver.ps1' @('-Mode', 'migrate')
+        Assert ($migrate.ExitCode -eq 0 -and $migrate.Output -match 'migration fresh changed=True') "A fresh migration failed without a scheduler.`n$($migrate.Output)"
+        $repeat = Invoke-BoundedEntryPoint $fixture 'Driver.ps1' @('-Mode', 'migrate')
+        Assert ($repeat.ExitCode -eq 0 -and $repeat.Output -match 'migration fresh changed=False') "A repeated migration was not a no-op.`n$($repeat.Output)"
+        $evidence = Invoke-BoundedEntryPoint $fixture 'Driver.ps1' @('-Mode', 'evidence')
+        Assert ($evidence.Output -match 'evidence failed: Supervisor is not running for ') "Setup evidence did not get past the migration record to the supervisor check.`n$($evidence.Output)"
+        $start = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Start')
+        Assert ($start.ExitCode -eq 0 -and $start.Output -match 'started \(pid (\d+)\)') "A healthy supervisor did not start.`n$($start.Output)"
+        $pidStarted = $Matches[1]
+        $second = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Start')
+        Assert ($second.ExitCode -eq 0 -and $second.Output -match "already running \(pid $pidStarted\)") "A second Start did not return the verified existing supervisor.`n$($second.Output)"
+        $evidenceRunning = Invoke-BoundedEntryPoint $fixture 'Driver.ps1' @('-Mode', 'evidence')
+        Assert ($evidenceRunning.Output -notmatch 'scheduler sentinel' -and $evidenceRunning.Output -match 'evidence failed: Private \.NET SDK is missing') "Setup evidence did not reach the SDK check with a running supervisor.`n$($evidenceRunning.Output)"
+        $status = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Status')
+        Assert ($status.Output -match "Supervisor\s+.*$pidStarted") "Status did not show the supervisor.`n$($status.Output)"
+        $stop = Invoke-BoundedEntryPoint $fixture 'Manage-WindowsRunner.ps1' @('-Action', 'Stop', '-Force')
+        Assert ($stop.ExitCode -eq 0) "Stop exited $($stop.ExitCode).`n$($stop.Output)"
+        $calls = if (Test-Path -LiteralPath $log) { Get-Content -Raw -LiteralPath $log } else { '' }
+        Assert (-not $calls) "The scheduler was called by a normal path: $calls"
+    }
+    finally {
+        $env:PSModulePath = $oldModules; $env:SCHEDULER_SENTINEL_LOG = $oldLog; $env:PATH = $oldPath
+        Stop-StubSupervisors $fixture
+    }
+}
+
+Test-Case 'Setup evidence: an unrecorded legacy migration is refused with the fix, without asking the scheduler' {
+    $fixture = New-EntryPointFixture
+    Set-StubSupervisor $fixture @('exit 0')
+    Set-Content -LiteralPath (Join-Path $fixture.Clone 'scripts\Driver.ps1') -Value @(
+        '$ErrorActionPreference = ''Stop'''
+        '. (Join-Path $PSScriptRoot ''Common.ps1''); . (Join-Path $PSScriptRoot ''WindowsRunnerSetup.ps1'')'
+        '[pscustomobject]@{ agentName = $Config.windows.name; agentId = 5 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WindowsRunner ''.runner'')'
+        'try { Get-RunnerSetupEvidence -Clone (Split-Path $PSScriptRoot -Parent) -InstanceId $Config.windows.instanceId | Out-Null; ''evidence returned'' } catch { "evidence failed: $($_.Exception.Message)" }')
+    $run = Invoke-BoundedEntryPoint $fixture 'Driver.ps1' @()
+    Assert ($run.Output -match 'evidence failed: The legacy startup migration of .* is not recorded as complete .*rerun scripts\\Install-WindowsRunner\.ps1') "No migration record was not refused with the fix.`n$($run.Output)"
 }
 
 Test-Case 'The real legacy scheduled tasks of this machine were not changed by this run' {

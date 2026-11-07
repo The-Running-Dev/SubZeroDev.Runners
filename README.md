@@ -26,7 +26,7 @@ workspace, a non-numeric `lifecycle`/`housekeeping` value. Each runner gets `git
 | --- | --- |
 | `runnerVersion` | The one Actions runner version for Windows and Linux. Archives are downloaded from the release and checked against its published SHA-256 (`scripts\RunnerArchive.ps1`); the Linux image build receives the same version and hash |
 | `buildAgent` | The pinned `BuildAgent.Tool` (`tool.version`, installed once per host in `tool.directory`), the net8.0 runtime it runs on (`dotnetRuntime`), the image by digest (`image`, passed to every build as `BUILD_AGENT_IMAGE`), the Docker connection (`docker.host`, `null` = Docker Desktop's default), per-instance build workspaces (`paths`), cache retention (`cache`) and the optional updater (`updater.version`, see below) |
-| `lifecycle` | Drain deadline, supervisor restart delay, backoff and the quick-exit threshold |
+| `lifecycle` | Drain deadline, supervisor restart delay, backoff, the quick-exit threshold and `startTimeoutSeconds` (how long `Start` waits for the supervisor to initialize, default 60) |
 | `logs`, `housekeeping` | Log age and size caps, the daily trim time, cleanup retries, the free-disk warning level |
 
 Each runner takes one job at a time, so one Windows and one Linux job can run together.
@@ -100,8 +100,8 @@ setup options. See [the Windows runbook](docs/windows-two-runners.md) for detail
 | `Invoke-BuildAgent.ps1 -Type <type> [-Source] [-CopyOutputTo] [-Dry]` | What a workflow step calls to build with Docker-BuildAgent: `build-agent build <type>` (the types it defines) with the pinned tool and image, in this instance's own workspace. `-Dry` prints the invocation. See [BuildAgent builds](#buildagent-builds) |
 | `Get-BuildAgentStatus.ps1 [-Json]` | One line each for tool, runtime, mapping, Docker daemon (Linux containers), image and updater; exit 0 when builds can run |
 | `Install-BuildAgent.ps1` | Provisions or verifies the host-level pieces (runtime, tool, Docker daemon, image). Exit 0 ready, 1 failed, 2 you must act first. Run by setup; safe to run alone |
-| `Remove-LegacyTasks.ps1` | One-time cleanup of what earlier versions registered with Windows: this clone's `\SubZeroDev.Runners\Start Windows runner`, `Trim logs`, `Start runners` tasks (instance suffix included) and the `SubZeroDev.Runners` Run entry. A task is removed only when its action names this clone's script; another instance's or clone's tasks are reported and kept. Removing a task does not stop a supervisor it started. Nothing registers these any more, so a second run does nothing. `Install-WindowsRunner.ps1` runs it too |
-| `Install-WindowsRunner.ps1 [-InstanceId] [-Name] [-ExtraLabels] [-GitHubUrl] [-WorkFolder] [-Replace]` | Sets up the Windows runner alone on another machine (no Docker Desktop, no Linux runner), from a clone outside Dropbox, as a non-elevated user: writes `runners.local.json`, downloads the runner and checks its published SHA-256, installs the private .NET 10 SDK, registers it under a per-machine name (default `subzerodev.runner.windows.<computer>`) with the shared labels plus `-ExtraLabels`, and starts the supervisor directly (no scheduled task: nothing starts it at sign-in or after a restart). Refuses a name already registered elsewhere unless `-Replace`. Runs the one-time legacy-task cleanup. On such a machine use `Manage-WindowsRunner.ps1 -Action Start\|Stop\|Status`; the scripts that also drive Docker do not apply there |
+| `Remove-LegacyTasks.ps1` | One-time cleanup of what earlier versions registered with Windows: this clone's `\SubZeroDev.Runners\Start Windows runner`, `Trim logs`, `Start runners` tasks (instance suffix included) and the `SubZeroDev.Runners` Run entry. A task is removed only when its action names this clone's script; another instance's or clone's tasks are reported and kept. Removing a task does not stop a supervisor it started. It succeeds only after a second look finds the entries gone; an entry that cannot be inspected or removed is an error (exit 1, with the fix) and nothing is recorded. A success is recorded in `windows\legacy-migration.json`. This script and `LegacyCleanup.ps1` are the only code that talks to Task Scheduler |
+| `Install-WindowsRunner.ps1 [-InstanceId] [-Name] [-ExtraLabels] [-GitHubUrl] [-WorkFolder] [-Replace]` | Sets up the Windows runner alone on another machine (no Docker Desktop, no Linux runner), from a clone outside Dropbox, as a non-elevated user: writes `runners.local.json`, downloads the runner and checks its published SHA-256, installs the private .NET 10 SDK, registers it under a per-machine name (default `subzerodev.runner.windows.<computer>`) with the shared labels plus `-ExtraLabels`, and starts the supervisor directly and waits until it reports that it initialized (no scheduled task: nothing starts it at sign-in or after a restart). Refuses a name already registered elsewhere unless `-Replace`. Runs the one-time legacy-task cleanup first, before any download, registration change or process stop; if an earlier version's startup entry of this clone cannot be removed or verified gone, the install fails with nothing changed (see below). On such a machine use `Manage-WindowsRunner.ps1 -Action Start\|Stop\|Status`; the scripts that also drive Docker do not apply there |
 | `New-LinuxRunner.ps1 [-Build] [-Update] [-TimeoutMinutes] [-Force]` | Recreates the Docker sidecar (when `linux.docker.mode` is `sidecar`; removes it otherwise) and the container from `runners.json` (`-Build` rebuilds the image first, on `linux.baseImage`, with the verified runner archive) and keeps the registration's work folder in step. A running container is replaced only after the runner has been drained (same deadline and `-Force` semantics as above). `-Update` hands the container replacement to BuildAgent's updater; see [Linux updates](#linux-updates) |
 | `Set-DropboxIgnored.ps1` | Marks everything matched by `dropbox-ignore.txt` with `com.dropbox.ignored`. Idempotent |
 | `Trim-RunnerLogs.ps1` | Bounded housekeeping, each part independent: `_diag` files older than `logs.retentionDays` and beyond `logs.maxMB` (the newest Runner/Worker/Console log of each runner is kept), per-instance BuildAgent caches older than `buildAgent.cache.retentionDays` or beyond `buildAgent.cache.maxGB`, and a warning when a drive falls below `housekeeping.minFreeGB`. Never touches registration files or credentials; a locked file is retried a bounded number of times, then reported |
@@ -148,7 +148,7 @@ missing, the record stays and the report says so.
 **The Windows supervisor is started directly and nothing restarts it.** There is no scheduled task, Run entry, service or
 watchdog. `Manage-WindowsRunner.ps1 -Action Start` (also `Start-Runners.ps1`, `Install-WindowsRunner.ps1` and the end of a
 maintenance hold) launches `Run-WindowsRunner.ps1` as a detached, hidden `pwsh`, ends any maintenance hold first, and starts
-nothing when the supervisor is already running (it prints `already running (pid N)`). The supervisor is recognised by its
+nothing when the supervisor is already running (it prints `already running (pid N)`). `Start` reports success only after the supervisor of this clone has written fresh initialization status (`supervisor.json` for its own pid, state not `starting`) within `lifecycle.startTimeoutSeconds`: a process that merely exists, a stale pid or status file, or an online listener left by an earlier supervisor does not count. If it exits first (the message carries its exit code), reports an initialization failure, or does not initialize in time, `Start` fails (exit 1; `Restart`, `Start-Runners.ps1`, the installer and host setup fail the same way, and `Start-Runners.ps1` still starts the Linux containers first). A supervisor that is alive but did not initialize is left running, not killed. The supervisor is recognised by its
 `supervisor.pid` and a command line ending in this clone's quoted script path. What the supervisor does is unchanged: it
 relaunches `run.cmd` when the listener exits, with the doubling delay and quick-exit toast described above.
 
@@ -160,9 +160,13 @@ long run in between, `repeatedDeaths` says so and that nothing restarts it autom
 
 **Upgrading from the scheduled-task design.** Earlier versions registered `Start Windows runner`, `Trim logs` and
 `Start runners` tasks under `\SubZeroDev.Runners\` and a `SubZeroDev.Runners` Run entry. `Remove-LegacyTasks.ps1` (also run by
-`Install-WindowsRunner.ps1`) removes this clone's, once and idempotently, and leaves any task whose action names another
-clone's script. Removing a task does not stop a supervisor it started; that one keeps running until you stop it. Setup
-verification refuses to report success while one of this clone's legacy tasks remains.
+`Install-WindowsRunner.ps1`, before anything else changes) removes this clone's, once and idempotently, and leaves any task whose
+action names another clone's script. A clone that was never set up before is recorded as migrated without asking Task
+Scheduler. If this clone's entry cannot be inspected, removed or confirmed gone, the install stops with a nonzero exit and the
+fix (remove the task in Task Scheduler, or repair the service, then rerun) before any registration change, process stop or
+download, and records nothing; host setup stops there too and reports no success. Removing a task does not stop a supervisor
+it started; that one keeps running until you stop it. Setup verification requires the recorded migration
+(`windows\legacy-migration.json`), not a Task Scheduler query.
 
 **A stop is only reported successful when nothing is left running.** `Stop`, `Restart`, `Maintenance` and the registration
 changes of `Install-WindowsRunner.ps1` end the supervisor with `taskkill`, then check the process table. A `taskkill` that
@@ -245,7 +249,7 @@ Reruns retain the saved instance ID, runner name and workspace unless explicitly
 Default workspaces are `%TEMP%\szr\win01` and `%TEMP%\szr\win02`.
 Custom absolute `-WorkFolder` values must differ. An earlier version registered
 `Start Windows runner (win01)` and `Trim logs (win01)` under `\SubZeroDev.Runners\`; the installer removes
-those of its own instance once (see `Remove-LegacyTasks.ps1`) and never another instance's.
+those of its own instance once, first (see `Remove-LegacyTasks.ps1`; a failure stops the install) and never another instance's.
 
 Both retain `subzerodev-windows`, so existing eligible jobs can run concurrently, up to two.
 Use `subzerodev-windows-large` to target only this machine. There are no per-runner CPU/RAM
@@ -254,7 +258,7 @@ Two is a starting concurrency setting; available RAM alone does not determine ca
 
 Nothing starts the runners automatically: no scheduled task, no Run entry, no service, no watchdog. After a restart, or
 when `Status` shows the supervisor down, run `Manage-WindowsRunner.ps1 -Action Start` in each clone (it starts the
-supervisor detached and hidden). Nothing here enables automatic sign-in or restarts the PC. Use the Windows-only
+supervisor detached and hidden, and confirms it initialized). Nothing here enables automatic sign-in or restarts the PC. Use the Windows-only
 installer/supervisor; the combined start/stop/register scripts also manage Linux and Docker.
 
 ## Using the runners from a repository
