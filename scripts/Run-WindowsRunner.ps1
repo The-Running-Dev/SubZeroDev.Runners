@@ -31,12 +31,13 @@ try {
 
     $lifecycle = $Config.lifecycle
     # A predecessor that left a status other than 'stopped' died without cleaning up (it was killed, crashed, or the session ended):
-    # this start is its recovery. Record it, keep the counts across restarts, and say so when it keeps happening.
+    # this start is its recovery (an explicit Start; nothing restarts a dead supervisor on its own). Record it, keep the counts across
+    # starts, and say so when it keeps happening.
     $recovery = Get-SupervisorRecovery (Get-SupervisorStatus)
     $status = @{ state = 'starting'; pid = $PID; startedUtc = [DateTime]::UtcNow.ToString('o'); restarts = 0; consecutiveQuickExits = 0; lastExitCode = $null; lastExitUtc = $null; nextRetryUtc = $null } + $recovery
     Write-SupervisorStatus @{}
     if ($recovery.consecutiveRecoveries -ge 2) {
-        Show-Notification 'SubZeroDev Windows runner supervisor keeps dying' "Found dead and restarted $($recovery.consecutiveRecoveries) times in a row; the startup task is configured for $SupervisorRestartCount restarts. $($recovery.lastRecoveryNote)" $SupervisorStatusFile
+        Show-Notification 'SubZeroDev Windows runner supervisor keeps dying' "Found dead $($recovery.consecutiveRecoveries) times in a row and started again by hand. Nothing restarts it automatically. $($recovery.lastRecoveryNote)" $SupervisorStatusFile
     }
     $quickExits = 0
     while ($true) {
@@ -67,7 +68,7 @@ try {
         for ($i = 1; $i -lt $quickExits -and $delay -lt $lifecycle.backoffMaxSeconds; $i++) { $delay *= 2 }
         $delay = [Math]::Min($delay, $lifecycle.backoffMaxSeconds)
         # A run that lasted is a healthy supervisor: the streak of supervisor recoveries ends.
-        if (-not $quick) { $status.consecutiveRecoveries = 0; $status.retriesExhausted = $null }
+        if (-not $quick) { $status.consecutiveRecoveries = 0; $status.repeatedDeaths = $null }
         Write-SupervisorStatus @{
             state = if ($quickExits) { 'backoff' } else { 'starting' }; restarts = $status.restarts + 1; consecutiveQuickExits = $quickExits
             lastExitCode = $exitCode; lastExitUtc = [DateTime]::UtcNow.ToString('o'); nextRetryUtc = [DateTime]::UtcNow.AddSeconds($delay).ToString('o')

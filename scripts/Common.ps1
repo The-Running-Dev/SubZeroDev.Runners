@@ -33,7 +33,7 @@ function Find-DockerDesktopExe {
     if (Test-Path -LiteralPath $candidate) { return $candidate }
 }
 
-# PowerShell 7 for scheduled tasks and child scripts: the running one when this is pwsh, else PATH, else the MSI location.
+# PowerShell 7 for the supervisor and child scripts: the running one when this is pwsh, else PATH, else the MSI location.
 function Find-PwshExe {
     if ($PSVersionTable.PSEdition -eq 'Core') { return [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
     $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -58,36 +58,25 @@ $SupervisorPidFile = Join-Path $WindowsRunner 'supervisor.pid'
 # Written by the supervisor: what it is doing now. Written by Manage-WindowsRunner: whether it may start the listener.
 $SupervisorStatusFile = Join-Path $WindowsRunner 'supervisor.json'
 $MaintenanceFile = Join-Path $WindowsRunner 'maintenance.json'
-$StartupValueName = 'SubZeroDev.Runners'
-$TaskPath = '\SubZeroDev.Runners\'
 $WindowsMutexName = 'Local\SubZeroDev.Runners.Windows'
-$WindowsTaskName = 'Start Windows runner'
-$LogTrimTaskName = 'Trim logs'
-# Named instances live in separate clones, with their own tasks and supervisor.
+# Named instances live in separate clones, with their own supervisor and mutex.
+if ($Config.windows.instanceId) { $WindowsMutexName += ".$($Config.windows.instanceId)" }
+
+# Nothing restarts a dead supervisor: no scheduled task, sign-in entry or watchdog. Its child (run.cmd) is restarted by the
+# supervisor itself, with backoff. A supervisor that is found dead by its successor this many times in a row is reported as one
+# that keeps dying.
+$SupervisorRepeatedDeaths = 3
+
+# Names this tooling once registered with Windows to start the supervisor at sign-in and trim logs. They exist only so
+# Remove-LegacyStartupTasks (LegacyCleanup.ps1) can remove what an earlier version left; nothing registers them any more.
+$LegacyTaskPath = '\SubZeroDev.Runners\'
+$LegacyStartupValueName = 'SubZeroDev.Runners'
+$LegacyWindowsTaskName = 'Start Windows runner'
+$LegacyLogTrimTaskName = 'Trim logs'
+$LegacyLogonTaskName = 'Start runners'
 if ($Config.windows.instanceId) {
-    $WindowsMutexName += ".$($Config.windows.instanceId)"
-    $WindowsTaskName += " ($($Config.windows.instanceId))"
-    $LogTrimTaskName += " ($($Config.windows.instanceId))"
-}
-
-# Supervisor recovery: the supervisor's task is CONFIGURED to be relaunched by Task Scheduler when the supervisor dies (a result
-# other than 0), at most this many times and this far apart. That is a configuration, not a verified behaviour: on the host
-# where it was tried (Windows 11 build 26200, throwaway tasks, same settings) a killed or crashed process was never relaunched
-# within 3 minutes (docs/windows-two-runners.md has the evidence), so nothing here relies on it. A clean exit (0, the
-# duplicate-exclusion mutex was held) and a stop through Stop-ScheduledTask are not failures and are not retried.
-$SupervisorRestartCount = 5
-$SupervisorRestartInterval = New-TimeSpan -Minutes 1
-# After a supervisor died without a clean stop, a Task Scheduler retry may still be pending for this long (Task Scheduler does
-# not show a pending retry: the task just reads Ready). A stop that finds the supervisor already gone waits this long, with the
-# task disabled, to see whether anything brings it back.
-$SupervisorRecoveryWait = $SupervisorRestartInterval + (New-TimeSpan -Seconds 15)
-
-# $true when $Task runs this clone's supervisor, with the working directory and the bounded restart-on-failure.
-function Test-WindowsSupervisorTask($Task) {
-    $action = @($Task.Actions)[0]
-    $settings = $Task.Settings
-    [bool]($action -and $action.Execute -eq $Pwsh -and "$($action.Arguments)".Contains('"' + $Supervisor + '"') -and $action.WorkingDirectory -eq $WindowsRunner -and
-        $settings.RestartCount -eq $SupervisorRestartCount -and $settings.RestartInterval -and [Xml.XmlConvert]::ToTimeSpan("$($settings.RestartInterval)") -eq $SupervisorRestartInterval)
+    $LegacyWindowsTaskName += " ($($Config.windows.instanceId))"
+    $LegacyLogTrimTaskName += " ($($Config.windows.instanceId))"
 }
 
 # supervisor.json as an object; $null when it is absent or unreadable.
@@ -96,7 +85,7 @@ function Get-SupervisorStatus {
     try { Get-Content -Raw -LiteralPath $SupervisorStatusFile | ConvertFrom-Json } catch { }
 }
 
-# Merges $Values into supervisor.json (whoever writes it: the supervisor, a stop, a start that could not register its task).
+# Merges $Values into supervisor.json (whoever writes it: the supervisor, or a stop that marks it stopped).
 function Set-SupervisorStatusValues([hashtable] $Values) {
     $merged = [ordered]@{}
     $current = Get-SupervisorStatus
@@ -114,18 +103,16 @@ function Get-SupervisorRecovery($Previous) {
     $count = { param($value) if ($null -ne $value) { [int]$value } else { 0 } }
     $recovery = @{
         recoveries = (& $count $Previous.recoveries); consecutiveRecoveries = (& $count $Previous.consecutiveRecoveries)
-        lastRecoveryUtc = $Previous.lastRecoveryUtc; lastRecoveryNote = $Previous.lastRecoveryNote; recoveryFailure = $Previous.recoveryFailure
-        retriesExhausted = $Previous.retriesExhausted
+        lastRecoveryUtc = $Previous.lastRecoveryUtc; lastRecoveryNote = $Previous.lastRecoveryNote
+        repeatedDeaths = $Previous.repeatedDeaths
     }
     if ($Previous -and $Previous.state -and $Previous.state -ne 'stopped') {
         $recovery.recoveries++
         $recovery.consecutiveRecoveries++
         $recovery.lastRecoveryUtc = [DateTime]::UtcNow.ToString('o')
         $recovery.lastRecoveryNote = "The previous supervisor (pid $($Previous.pid), last state $($Previous.state)) ended without stopping."
-        # The task is configured for $SupervisorRestartCount restarts: this was the last, so if this supervisor dies too, nothing is
-        # configured to restart it.
-        if ($recovery.consecutiveRecoveries -ge $SupervisorRestartCount) {
-            $recovery.retriesExhausted = "$([DateTime]::UtcNow.ToString('o')): the supervisor has been found dead and restarted $($recovery.consecutiveRecoveries) times in a row; the startup task is configured for $SupervisorRestartCount restarts, so if this supervisor dies, start it with Manage-WindowsRunner.ps1 -Action Start."
+        if ($recovery.consecutiveRecoveries -ge $SupervisorRepeatedDeaths) {
+            $recovery.repeatedDeaths = "$([DateTime]::UtcNow.ToString('o')): the supervisor has been found dead $($recovery.consecutiveRecoveries) times in a row. Nothing restarts it automatically; if it dies again, start it with Manage-WindowsRunner.ps1 -Action Start."
         }
     }
     $recovery
@@ -169,9 +156,4 @@ function Show-Notification([string] $Title, [string] $Message, [string] $Open) {
     if ($Open) { $arguments += '-Open', $Open }
     # Toasts need the WinRT projection, which only Windows PowerShell 5.1 has.
     & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @arguments
-}
-
-# A hidden, profile-free pwsh command line for a script in this folder.
-function Get-HiddenPwshCommand([string] $Script) {
-    "`"$Pwsh`" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $PSScriptRoot $Script)`""
 }

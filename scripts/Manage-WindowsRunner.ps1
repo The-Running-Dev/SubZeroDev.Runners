@@ -1,13 +1,16 @@
 #Requires -Version 7.2
 # Per-instance control of the Windows runner, for Windows-only and combined installs alike. Run it from the instance's clone
-# (each instance has its own clone, supervisor, task and registration).
+# (each instance has its own clone, supervisor and registration).
+#
+# Nothing starts the supervisor at sign-in and nothing restarts it if it dies: Start is the only way it starts. If Status
+# reports it down, run Start. The supervisor restarts the runner process itself, with backoff; that part is automatic.
 #
 #   Status       one line each for supervisor, listener, job and GitHub. Exit 0 only when all are healthy.
 #   Start        end maintenance and start the supervisor.
 #   Stop         drain (stop taking jobs, wait for the running job), then stop. A job that outlasts -TimeoutMinutes is kept:
 #                nothing is stopped and the report says what is still running. -Force stops at once and cancels the job.
 #   Restart      Stop, then Start.
-#   Maintenance  drain and stop, then stay stopped (the sign-in task idles) until Start.
+#   Maintenance  drain and stop, then stay stopped until Start.
 #
 # Draining withdraws the runner's custom labels at GitHub while it waits, and restores them afterwards. A job that targets
 # only the default labels (self-hosted, Windows, X64) is not held back; the workflows for these runners use the subzerodev-* labels.
@@ -47,9 +50,8 @@ switch ($Action) {
                 Job         = $state.Job
                 GitHub      = $state.GitHub
                 Maintenance = if ($state.Maintenance) { "$($state.Maintenance.phase) since $($state.Maintenance.sinceUtc) ($($state.Maintenance.reason))" } else { 'off' }
-                StartupTask = $state.StartupTask
                 LastExit    = if ($detail -and $null -ne $detail.lastExitCode) { "code $($detail.lastExitCode) at $($detail.lastExitUtc); $($detail.consecutiveQuickExits) quick exits; next retry $($detail.nextRetryUtc)" } else { 'none' }
-                Recovery    = if ($recovery.Recoveries) { "supervisor restarted $($recovery.Recoveries) times ($($recovery.ConsecutiveRecoveries) in a row), last at $($recovery.LastRecoveryUtc)" } else { 'supervisor never needed recovery' }
+                Recovery    = if ($recovery.Recoveries) { "supervisor found dead and started again by hand $($recovery.Recoveries) times ($($recovery.ConsecutiveRecoveries) in a row), last at $($recovery.LastRecoveryUtc)" } else { 'supervisor never found dead' }
             }
             foreach ($line in $recovery.Summary) { $rows["Warning$((++$warnings))"] = $line }
             $rows.GetEnumerator() | ForEach-Object { '{0,-12} {1}' -f $_.Key, $_.Value }
@@ -72,6 +74,6 @@ switch ($Action) {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Hold -Reason 'maintenance'
         Write-Outcome $result
         if ($result.Outcome -in 'timeout', 'failed') { exit 1 }
-        Write-Output 'Held in maintenance: the runner stays stopped, including after sign-in, until: Manage-WindowsRunner.ps1 -Action Start'
+        Write-Output 'Held in maintenance: the runner stays stopped until: Manage-WindowsRunner.ps1 -Action Start'
     }
 }

@@ -98,13 +98,9 @@ function Get-RunnerSetupEvidence {
     . (Join-Path $Clone 'scripts\Common.ps1')
     $registration = Get-Content -Raw -LiteralPath (Join-Path $WindowsRunner '.runner') | ConvertFrom-Json
     if ($Config.windows.instanceId -ne $InstanceId -or $registration.agentName -ne $Config.windows.name) { throw "Registration identity mismatch for $InstanceId." }
-    $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop
-    if ($task.Actions.Execute -ne $Pwsh -or -not $task.Actions.Arguments.Contains('"' + $Supervisor + '"') -or $task.Actions.WorkingDirectory -ne $WindowsRunner) { throw "Wrong startup action for $InstanceId." }
-    if (-not (Test-WindowsSupervisorTask $task)) { throw "The startup task for $InstanceId does not restart the supervisor on failure ($SupervisorRestartCount restarts, $([int]$SupervisorRestartInterval.TotalMinutes) minute apart)." }
-    if ($task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Limited' -or $task.Settings.MultipleInstances -ne 'IgnoreNew' -or $task.Settings.ExecutionTimeLimit -ne 'PT0S') { throw "Unsafe startup task settings for $InstanceId." }
-    if ($Config.logs.trimAt) {
-        $trim = Get-ScheduledTask -TaskPath $TaskPath -TaskName $LogTrimTaskName -ErrorAction Stop
-        if (-not $trim.Actions.Arguments.Contains((Join-Path $Clone 'scripts\Trim-RunnerLogs.ps1'))) { throw "Wrong trim task for $InstanceId." }
+    # Nothing may start the supervisor behind the operator's back: no task from an earlier version is left for this instance.
+    foreach ($legacyName in $LegacyWindowsTaskName, $LegacyLogTrimTaskName) {
+        if (ScheduledTasks\Get-ScheduledTask -TaskPath $LegacyTaskPath -TaskName $legacyName -ErrorAction SilentlyContinue) { throw "A legacy scheduled task $LegacyTaskPath$legacyName remains for $InstanceId; run scripts\Remove-LegacyTasks.ps1." }
     }
     $supervisorProcess = Get-SupervisorProcess
     if (-not $supervisorProcess) { throw "Supervisor is not running for $InstanceId." }
@@ -200,7 +196,7 @@ function Confirm-RunnerSetupHost {
         }
     }
     $Instances | Select-Object Instance, Name, AgentId, Workspace, SupervisorPid | Format-Table -AutoSize | Out-Host
-    Write-Host 'Verified on this host: registrations online, unique identities/workspaces/processes, startup tasks and labels.'
+    Write-Host 'Verified on this host: registrations online, unique identities/workspaces/processes, no legacy startup tasks and labels.'
 }
 
 # Provisions or verifies the host-level BuildAgent integration from an instance's clone, in its own PowerShell so the clone's
@@ -260,7 +256,7 @@ function Invoke-WindowsRunnerHostSetup {
         Write-Host 'Actual concurrent-job execution has not been tested. Add -SmokeRepository OWNER/REPO to run and verify it automatically.'
     }
     switch ($buildAgentExit) {
-        0 { Write-Host "Setup complete: $Count runner(s). Automatic startup occurs when this Windows user signs in." }
+        0 { Write-Host "Setup complete: $Count runner(s). The supervisors are running now. Nothing starts them at sign-in or restarts them if they die: run Manage-WindowsRunner.ps1 -Action Start in each clone." }
         2 { Write-Host "Runners are set up ($Count), but BuildAgent needs your action first (listed above). Rerun the same command afterwards; finished steps are skipped." -ForegroundColor Yellow }
         default { Write-Warning "Runners are set up ($Count), but the BuildAgent integration failed (exit $buildAgentExit); see the messages above. The runners are not affected." }
     }

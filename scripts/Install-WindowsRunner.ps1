@@ -1,7 +1,9 @@
 #Requires -Version 7.2
 # Sets up the Windows runner, and only the Windows runner, on another machine: writes runners.local.json, downloads
 # and verifies the Actions runner, installs the private .NET SDK, registers the runner with GitHub under its own
-# name and the shared labels, and starts it now and at every sign-in. No Docker Desktop and no Linux runner.
+# name and the shared labels, and starts it now. No Docker Desktop and no Linux runner. Nothing starts it at sign-in and
+# nothing restarts the supervisor if it dies: Manage-WindowsRunner.ps1 -Action Start starts it again. A sign-in task or Run
+# entry left by an earlier version is removed once (this clone's only).
 # Run it from a git clone of this repository outside Dropbox, in a normal (not elevated) PowerShell 7 window,
 # signed in to Windows as the user the jobs should run as. Safe to rerun.
 param(
@@ -13,7 +15,7 @@ param(
     [string] $WorkFolder = '%TEMP%\szr',
     # Take over a runner already registered under -Name elsewhere; that machine stops receiving jobs.
     [switch] $Replace,
-    # One clone per instance. Gives each instance its own name, workspace, mutex and tasks.
+    # One clone per instance. Gives each instance its own name, workspace and mutex.
     [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')]
     [string] $InstanceId
 )
@@ -107,13 +109,7 @@ $plan = Get-RegistrationPlan `
     -HasCredentials (Test-Path -LiteralPath (Join-Path $WindowsRunner '.credentials')) -Replace:$Replace
 foreach ($reason in $plan.Reasons) { Write-Output "Registration: $reason" }
 $beforeChange = {
-    if (-not (Get-SupervisorProcess) -and -not (Get-WindowsRunnerListeners)) {
-        # Nothing is running, but Task Scheduler may be about to restart a supervisor that just died: make sure it cannot
-        # (this is quick when nothing is pending), or leave the registration alone.
-        $stopped = Stop-WindowsRunnerProcesses
-        if (-not $stopped.Stopped) { throw "Registration not changed: Task Scheduler recovery of the supervisor could not be ruled out. $(@($stopped.Failures) -join ' ')" }
-        return
-    }
+    if (-not (Get-SupervisorProcess) -and -not (Get-WindowsRunnerListeners)) { return }
     if ($registration -and $plan.LinkedId) {
         # Wait for a running job rather than cancel it, and leave the registration alone if it outlasts the deadline.
         $stopped = Stop-WindowsRunner -Reason 'registration change'
@@ -133,13 +129,16 @@ switch ($applied.Result) {
 }
 $problems = @(Confirm-RunnerRegistration -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder)
 if ($problems) { throw "The registration does not match the configuration:`n - $($problems -join "`n - ")" }
-# Start at sign-in: the supervisor itself, not Start-Runners.ps1, which also needs Docker Desktop and the Linux container.
-if (-not $InstanceId) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName 'Start runners' -Confirm:$false -ErrorAction SilentlyContinue }
-# The task is the supervisor's own process, so Task Scheduler restarts the supervisor if it dies (bounded; see Common.ps1).
-Register-WindowsSupervisorTask
-& (Join-Path $PSScriptRoot 'Register-LogTrimTask.ps1')
+# One-time removal of what earlier versions registered with Windows (this clone's tasks and Run entry only).
+. "$PSScriptRoot\LegacyCleanup.ps1"
+$cleanup = Remove-LegacyStartupTasks
+foreach ($line in @($cleanup.Removed) + @($cleanup.Kept)) { Write-Output $line }
+foreach ($line in $cleanup.Failed) { Write-Warning $line }
+# Housekeeping is not scheduled any more; a failure here must not fail the install.
+try { & (Join-Path $PSScriptRoot 'Trim-RunnerLogs.ps1') | ForEach-Object { Write-Output $_ } }
+catch { Write-Warning "Log trim failed: $($_.Exception.Message)" }
 
-if (-not (Get-SupervisorProcess)) { Start-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName }
+if (-not (Get-SupervisorProcess)) { Start-WindowsRunner | ForEach-Object { Write-Output "Supervisor $_." } }
 for ($attempt = 0; $attempt -lt 24 -and ($status = Get-RunnerStatus) -ne 'online'; $attempt++) { Start-Sleep -Seconds 5 }
 if ($status -ne 'online') { throw "$Name is $status after 2 minutes; see the newest Console_*.log in $(Join-Path $WindowsRunner '_diag')." }
 Write-Output "$Name is online with labels self-hosted, Windows, X64, $labels."

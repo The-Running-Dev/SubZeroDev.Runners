@@ -64,22 +64,17 @@ function Get-GitHubRunnerState([string] $RunnerDirectory) {
     catch { [pscustomobject]@{ Known = $false; Detail = $_.Exception.Message } }
 }
 
-# What became of the supervisor itself, from its own record and Task Scheduler's. Down = not running although it did not stop
-# on purpose (a stop through this tooling marks supervisor.json 'stopped').
-function Get-SupervisorRecoveryReport([bool] $Running, $Status, $Task) {
-    $info = if ($Task) { Get-ScheduledTaskInfo -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction SilentlyContinue }
+# What became of the supervisor itself, from its own record. Down = not running although it did not stop on purpose (a stop
+# through this tooling marks supervisor.json 'stopped'). Nothing restarts a dead supervisor: it stays down until an explicit Start.
+function Get-SupervisorRecoveryReport([bool] $Running, $Status) {
     $down = [bool](-not $Running -and $Status -and $Status.state -and $Status.state -ne 'stopped')
-    $configured = [bool]($Task -and (Test-WindowsSupervisorTask $Task))
     $summary = @(
-        if ($down) { "The supervisor is not running and did not stop on purpose. The startup task is configured to restart it up to $SupervisorRestartCount times, $([int]$SupervisorRestartInterval.TotalMinutes) minute apart, but that restart is not verified for a killed or crashed supervisor, so do not rely on it (task last result $($info.LastTaskResult) at $($info.LastRunTime)); start it: Manage-WindowsRunner.ps1 -Action Start." }
-        if (-not $configured) { 'The startup task is not configured to restart the supervisor if it dies (not registered, or registered before supervisor recovery existed): Manage-WindowsRunner.ps1 -Action Start registers it.' }
-        if ($Status.recoveryFailure) { [string]$Status.recoveryFailure }
-        if ($Status.retriesExhausted) { [string]$Status.retriesExhausted }
+        if ($down) { 'The supervisor is not running and did not stop on purpose. Nothing restarts it automatically; start it: Manage-WindowsRunner.ps1 -Action Start.' }
+        if ($Status.repeatedDeaths) { [string]$Status.repeatedDeaths }
     )
     [pscustomobject]@{
         Recoveries = if ($Status.recoveries) { [int]$Status.recoveries } else { 0 }; ConsecutiveRecoveries = if ($Status.consecutiveRecoveries) { [int]$Status.consecutiveRecoveries } else { 0 }
         LastRecoveryUtc = $Status.lastRecoveryUtc; LastRecoveryNote = $Status.lastRecoveryNote
-        RestartsConfigured = $configured; TaskLastResult = $info.LastTaskResult; TaskLastRunTime = $info.LastRunTime
         Down = $down; Summary = @($summary)
     }
 }
@@ -87,15 +82,14 @@ function Get-SupervisorRecoveryReport([bool] $Running, $Status, $Task) {
 # One object that tells supervisor, listener and GitHub apart.
 function Get-WindowsRunnerState {
     # Not $supervisor: variable names are case-insensitive and a function sees its callers' variables, so a local of that name
-    # would hide $Supervisor (the script's path) from Get-SupervisorProcess and Test-WindowsSupervisorTask.
+    # would hide $Supervisor (the script's path) from Get-SupervisorProcess.
     $supervisorProcess = Get-SupervisorProcess
     $listeners = Get-WindowsRunnerListeners
     $workers = Get-WindowsRunnerWorkers
     $github = Get-GitHubRunnerState $WindowsRunner
     $status = Get-SupervisorStatus
-    $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction SilentlyContinue
     [pscustomobject]@{
-        SupervisorRecovery = Get-SupervisorRecoveryReport ([bool]$supervisorProcess) $status $task
+        SupervisorRecovery = Get-SupervisorRecoveryReport ([bool]$supervisorProcess) $status
         Instance          = if ($Config.windows.instanceId) { $Config.windows.instanceId } else { 'default' }
         Supervisor        = if ($supervisorProcess) { "running (pid $($supervisorProcess.ProcessId))" } else { 'stopped' }
         SupervisorState   = if ($supervisorProcess -and $status) { $status.state } else { $null }
@@ -104,11 +98,9 @@ function Get-WindowsRunnerState {
         Job               = if ($workers) { "running (worker pid $(($workers | ForEach-Object ProcessId) -join ','))" } else { 'idle' }
         GitHub            = if ($github.Known -and $github.Present) { "$($github.Status)$(if ($github.Busy) { ', busy' })" } elseif ($github.Known) { 'not registered at GitHub' } else { "unknown ($($github.Detail))" }
         Maintenance       = Get-MaintenanceState
-        StartupTask       = if ($task) { "$($task.State)" } else { 'not registered' }
         Healthy           = [bool]($supervisorProcess -and $listeners -and $github.Known -and $github.Present -and $github.Status -eq 'online' -and -not (Get-MaintenanceState))
     }
 }
-
 # --- admission ---------------------------------------------------------------------------------------------------
 
 # Who would be drained and which custom labels it has now, after checking that GitHub's runner is this clone's registration.
@@ -255,18 +247,14 @@ function Get-WindowsRunnerSurvivors {
 }
 
 # Stops supervisor, listener and worker, then asks again what is left. Stopped is true only when that second look found
-# nothing AND Task Scheduler cannot bring the supervisor back (Stop-WindowsSupervisorTask); a command's own exit status is only
-# a detail. A look that fails is an unverified stop. The supervisor's pid file is removed, and supervisor.json marked
-# 'stopped', only on success: a supervisor that may still be restarted must leave its record as a crash.
+# nothing; a command's own exit status is only a detail. A look that fails is an unverified stop. The supervisor's pid file is
+# removed, and supervisor.json marked 'stopped', only on success: a supervisor that may still be alive must leave its record as is.
+# Nothing else can restart the supervisor, so its absence is the whole condition.
 function Stop-WindowsRunnerProcesses {
     param([int] $WaitSeconds = [Math]::Min(10, [int]$Config.lifecycle.stopTimeoutSeconds))
     $details = @()
     $left = @()
     try {
-        # Through the task first, and whether or not the supervisor is still running (it may already be gone, with a retry
-        # pending). A task that Task Scheduler itself stopped is not a failure, so it is not restarted; a supervisor killed
-        # behind its back would be (see $SupervisorRestartCount).
-        $task = Stop-WindowsSupervisorTask -SupervisorRunning ([bool](Get-SupervisorProcess))
         $supervisorProcess = Get-SupervisorProcess
         if ($supervisorProcess) {
             $kill = Invoke-TaskKill $supervisorProcess.ProcessId
@@ -288,141 +276,19 @@ function Stop-WindowsRunnerProcesses {
     }
     if ($left) {
         $ids = ($left | ForEach-Object { $_.ProcessId }) -join ', '
-        return [pscustomobject]@{ Stopped = $false; Failures = @($task.Failures + $details + "Still running after the stop: pid $ids."); Remaining = $left }
-    }
-    # The processes are gone; is the task's own instance still (or again) running, or recovery still armed?
-    $again = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction SilentlyContinue
-    if ($task.Ok -and $again -and "$($again.State)" -eq 'Running' -and "$(@($again.Actions)[0].Arguments)".Contains('"' + $Supervisor + '"')) {
-        $task.Ok = $false
-        $task.Failures = @("The supervisor's scheduled task is running again after the stop (Task Scheduler started a new instance).")
-    }
-    if (-not $task.Ok) {
-        return [pscustomobject]@{ Stopped = $false; Failures = @($task.Failures); Remaining = @() }
+        return [pscustomobject]@{ Stopped = $false; Failures = @($details + "Still running after the stop: pid $ids."); Remaining = $left }
     }
     Remove-Item -LiteralPath $SupervisorPidFile -ErrorAction SilentlyContinue
     # Killed on purpose, so its successor must not read the stale 'running' status as a crash.
     try { if (Test-Path -LiteralPath $SupervisorStatusFile) { Set-SupervisorStatusValues @{ state = 'stopped'; pid = $null } } } catch { }
     [pscustomobject]@{ Stopped = $true; Failures = @(); Remaining = @() }
 }
-
-# --- supervisor task ---------------------------------------------------------------------------------------------------
-
-# The supervisor as a scheduled task of this instance: started at sign-in, no time limit (it never exits on its own), one copy
-# at a time (and the mutex), and restarted by Task Scheduler when it dies - bounded by $SupervisorRestartCount.
-function Register-WindowsSupervisorTask {
-    $user = "$env:USERDOMAIN\$env:USERNAME"
-    $action = New-ScheduledTaskAction -Execute $Pwsh -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Supervisor`"" -WorkingDirectory $WindowsRunner
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $trigger.Delay = 'PT30S'
-    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount $SupervisorRestartCount -RestartInterval $SupervisorRestartInterval
-    Register-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the SubZeroDev Windows runner supervisor at sign-in and restarts it if it dies.' -Force | Out-Null
-}
-
-# True when the last run of the supervisor task ended in a way Task Scheduler may retry: it failed (not 0, not a stop through
-# Task Scheduler, not "never run"), and nothing records that the supervisor was stopped on purpose since. Task Scheduler does
-# not expose a pending retry, so this is the closest observable, and it errs towards "pending". $Info is $null when the task's
-# history could not be read, which is also "cannot rule it out".
-function Test-SchedulerRecoveryMayBePending($Info, $Status) {
-    if ($Status -and $Status.state -eq 'stopped') { return $false }
-    if (-not $Info) { return $true }
-    # 0 success, 267009 running, 267011 never run, 267014 terminated through Task Scheduler.
-    [int64]$Info.LastTaskResult -notin 0, 267009, 267011, 267014
-}
-
-# Makes sure Task Scheduler cannot undo an intentional stop of this instance's supervisor, for a task that runs this clone's
-# supervisor and is configured to restart it. Returns Ok (recovery cannot bring the supervisor back) and Failures; the caller
-# kills what is left and still reports a stop only when Ok. Three cases:
-#  - the task is running: stop it through Task Scheduler (a stop it made itself is not a failure, so it is not retried) and
-#    confirm it is no longer running. If that fails, Ok is false and the task is disabled so nothing can restart the supervisor
-#    behind the maintenance record (Start-WindowsRunner enables it again).
-#  - the supervisor is already gone and its last run failed (the retry-delay window): a retry may be pending although the task
-#    reads Ready. The task is disabled and watched for $SupervisorRecoveryWait; Ok only if nothing came back, then it is enabled.
-#  - otherwise nothing in Task Scheduler is armed.
-function Stop-WindowsSupervisorTask {
-    param([bool] $SupervisorRunning)
-    $result = [pscustomobject]@{ Ok = $true; Failures = @(); Note = '' }
-    $taskArguments = '"' + $Supervisor + '"'
-    try { $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop }
-    catch {
-        if ($_.FullyQualifiedErrorId -match 'NotFound' -or $_.Exception.Message -match 'No MSFT_ScheduledTask objects found') { return $result }
-        $result.Ok = $false
-        $result.Failures = @("Could not read the supervisor's scheduled task, so a Task Scheduler restart of the supervisor cannot be ruled out: $($_.Exception.Message)")
-        return $result
-    }
-    if (-not $task -or -not "$(@($task.Actions)[0].Arguments)".Contains($taskArguments)) { return $result }
-    $recoverable = [int]$task.Settings.RestartCount -gt 0
-    $state = "$($task.State)"
-    if ($state -eq 'Disabled') { return $result }
-
-    # Disables the task after a failure; says whether that held. The text is part of the failure shown to the operator.
-    $disarm = {
-        param([string] $Problem)
-        try { Disable-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop | Out-Null; "$Problem The task was disabled so Task Scheduler cannot restart the supervisor; Manage-WindowsRunner.ps1 -Action Start enables it again." }
-        catch { "$Problem The task could not be disabled either ($($_.Exception.Message)), so Task Scheduler may restart the supervisor; it idles while maintenance is on." }
-    }
-
-    if ($state -in 'Running', 'Queued') {
-        $stopError = $null
-        try { Stop-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop }
-        catch { $stopError = $_.Exception.Message }
-        if (-not $stopError) {
-            for ($attempt = 0; $attempt -lt 25; $attempt++) {
-                $now = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction SilentlyContinue
-                if (-not $now -or "$($now.State)" -notin 'Running', 'Queued') { break }
-                Start-Sleep -Milliseconds 200
-            }
-            if ($now -and "$($now.State)" -in 'Running', 'Queued') { $stopError = "the task was still $($now.State) 5 seconds after Stop-ScheduledTask" }
-        }
-        if ($stopError -and $recoverable) {
-            $result.Ok = $false
-            $result.Failures = @(& $disarm "Task Scheduler could not stop the supervisor's task ($stopError), so it may restart a supervisor that is killed behind its back.")
-        }
-        return $result
-    }
-
-    if ($recoverable -and -not $SupervisorRunning) {
-        $info = Get-ScheduledTaskInfo -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction SilentlyContinue
-        if (-not (Test-SchedulerRecoveryMayBePending $info (Get-SupervisorStatus))) { return $result }
-        $window = [int][Math]::Ceiling($SupervisorRecoveryWait.TotalSeconds)
-        try { Disable-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop | Out-Null }
-        catch {
-            $result.Ok = $false
-            $result.Failures = @("The supervisor is not running and its last run failed, so Task Scheduler may still restart it within $window seconds, and the task could not be disabled to prevent that: $($_.Exception.Message)")
-            return $result
-        }
-        $deadline = [DateTime]::UtcNow.AddSeconds($window)
-        $back = $null
-        while ([DateTime]::UtcNow -lt $deadline -and -not $back) {
-            $back = Get-SupervisorProcess
-            if (-not $back) {
-                $now = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction SilentlyContinue
-                if ($now -and "$($now.State)" -eq 'Running') { $back = $now }
-            }
-            if (-not $back) { Start-Sleep -Seconds 1 }
-        }
-        if ($back) {
-            $result.Ok = $false
-            $result.Failures = @("The supervisor was not running, but it came back within $window seconds although its task was disabled: Task Scheduler recovery cannot be ruled out. The task stays disabled; Manage-WindowsRunner.ps1 -Action Start enables it again.")
-            return $result
-        }
-        try { Enable-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop | Out-Null }
-        catch {
-            $result.Ok = $false
-            $result.Failures = @("Nothing restarted the supervisor within $window seconds, but its task could not be enabled again: $($_.Exception.Message) Manage-WindowsRunner.ps1 -Action Start enables it.")
-            return $result
-        }
-        $result.Note = "The supervisor was already gone; nothing restarted it within $window seconds."
-    }
-    $result
-}
-
 function New-StopFailure($Result, [string[]] $Failures, $Cancelled) {
     [pscustomobject]@{ Outcome = 'failed'; Admission = $Result.Admission; Retained = $null; Failures = @($Failures); Cancelled = $Cancelled }
 }
 
-# Stops this instance's runner after draining it. -Hold keeps maintenance on afterwards, so the startup task idles
-# until Start-WindowsRunner. Returns Outcome idle | forced | timeout | failed, plus Retained on timeout and Failures on failed.
+# Stops this instance's runner after draining it. -Hold keeps maintenance on afterwards, so a supervisor that is started
+# idles until Start-WindowsRunner removes the flag. Returns Outcome idle | forced | timeout | failed, plus Retained on timeout and Failures on failed.
 # 'failed': a process survived the stop, the stop could not be verified, or the labels could not be confirmed back. Maintenance
 # is kept (phase 'stop-failed' with the reason) and admission is not reopened for a runner that did not stop.
 function Stop-WindowsRunner {
@@ -448,54 +314,18 @@ function Stop-WindowsRunner {
     $result | Add-Member -NotePropertyName Cancelled -NotePropertyValue $cancelled -PassThru
 }
 
-# Ends maintenance, brings the supervisor's scheduled task to the current definition, and starts the supervisor (through its
-# task when registered, so it has the task's identity). A supervisor that is already running is never started twice or
-# interrupted, but its task is reconciled all the same: the supervisor of an installation that predates supervisor recovery is
-# running under the old task, and only this makes the task current.
+# Ends maintenance and starts the supervisor as a detached, hidden process of this user. A supervisor that is already running
+# is never started twice or interrupted (its mutex would also refuse a second one). Nothing starts it at sign-in and nothing
+# restarts it if it dies: this is the only way it starts. A supervisor found dead without a clean stop is recorded by the next
+# supervisor (Get-SupervisorRecovery), so starting it by hand keeps that history.
 function Start-WindowsRunner {
     Exit-RunnerMaintenance $MaintenanceFile $WindowsRunner | Out-Null
     $running = Get-SupervisorProcess
-    $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction SilentlyContinue
-    $how = 'started through its scheduled task'
-    if (-not $running) {
-        # Started by hand although the supervisor had died and nothing brought it back (the task's restarts are used up, not
-        # configured, or not carried out). Keep that on record; the next supervisor carries it forward.
-        $report = Get-SupervisorRecoveryReport $false (Get-SupervisorStatus) $task
-        if ($report.Down) {
-            try { Set-SupervisorStatusValues @{ retriesExhausted = "$([DateTime]::UtcNow.ToString('o')): found down without a clean stop and started by hand (task last result $($report.TaskLastResult) at $($report.TaskLastRunTime))." } } catch { }
-        }
-    }
-    # A missing task, or one from before supervisor recovery existed, is (re)registered so the supervisor is the task's own
-    # process and Task Scheduler is configured to restart it. A detached copy would not be supervised by anything. Updating a
-    # task leaves its running instance alone. A task disabled by a failed stop is enabled again.
-    $current = $task -and (Test-WindowsSupervisorTask $task)
-    $disabled = $task -and "$($task.State)" -eq 'Disabled'
-    if (-not $current -or $disabled) {
-        try {
-            if (-not $current) { Register-WindowsSupervisorTask }
-            else { Enable-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop | Out-Null }
-            $how = if (-not $task) { 'started through its scheduled task (registered now)' } elseif (-not $current) { 'started through its scheduled task (updated to restart the supervisor on failure)' } else { 'started through its scheduled task (enabled again)' }
-        }
-        catch {
-            $problem = "The supervisor's scheduled task could not be $(if ($current) { 'enabled' } else { 'registered or updated' }), so nothing is configured to restart the supervisor if it dies: $($_.Exception.Message)"
-            try { Set-SupervisorStatusValues @{ recoveryFailure = $problem } } catch { }
-            if ($running) { return "already running (pid $($running.ProcessId)); NOT protected: $problem" }
-            if ($task -and -not $disabled) { Start-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName; return 'started through its old scheduled task (not restarted on failure: registration failed)' }
-            Start-Process $Pwsh -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$Supervisor`"") -WorkingDirectory $WindowsRunner -WindowStyle Hidden
-            return 'started directly, UNSUPERVISED (no scheduled task could be registered)'
-        }
-    }
-    try { if ((Get-SupervisorStatus).recoveryFailure) { Set-SupervisorStatusValues @{ recoveryFailure = $null } } } catch { }
-    if ($running) {
-        if ($current -and -not $disabled) { return "already running (pid $($running.ProcessId))" }
-        # The task is current now, but this supervisor was started under the task as it was before; whether that instance
-        # follows the new restart settings is not established, so it is not reported as protected.
-        return "already running (pid $($running.ProcessId)); its scheduled task was $(if ($disabled -and $current) { 'enabled again' } else { 'updated to restart the supervisor on failure' }), but this supervisor was started before that and is not confirmed protected until it is restarted: Manage-WindowsRunner.ps1 -Action Stop, then -Action Start, when no job is running."
-    }
-    Start-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName
-    $how
+    if ($running) { return "already running (pid $($running.ProcessId))" }
+    # The command line ends with the quoted script path: Get-SupervisorProcess recognises the supervisor by that.
+    $process = Start-Process $Pwsh -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$Supervisor`"") -WorkingDirectory $WindowsRunner -WindowStyle Hidden -PassThru
+    "started (pid $($process.Id))"
 }
-
 # --- Linux runner commands ---------------------------------------------------------------------------------------
 
 function Get-LinuxMaintenanceFile { Join-Path $LinuxRunner 'maintenance.json' }
