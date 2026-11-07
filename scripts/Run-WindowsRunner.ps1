@@ -30,13 +30,27 @@ try {
     Set-Location $WindowsRunner
 
     $lifecycle = $Config.lifecycle
-    $status = @{ state = 'starting'; pid = $PID; startedUtc = [DateTime]::UtcNow.ToString('o'); restarts = 0; consecutiveQuickExits = 0; lastExitCode = $null; lastExitUtc = $null; nextRetryUtc = $null }
+    # A predecessor that left a status other than 'stopped' died without cleaning up (it was killed, crashed, or the session ended):
+    # this start is its recovery (an explicit Start; nothing restarts a dead supervisor on its own). Record it, keep the counts across
+    # starts, and say so when it keeps happening.
+    $recovery = Get-SupervisorRecovery (Get-SupervisorStatus)
+    $status = @{ state = 'starting'; pid = $PID; startedUtc = [DateTime]::UtcNow.ToString('o'); restarts = 0; consecutiveQuickExits = 0; lastExitCode = $null; lastExitUtc = $null; nextRetryUtc = $null } + $recovery
     Write-SupervisorStatus @{}
+    if ($recovery.consecutiveRecoveries -ge 2) {
+        Show-Notification 'SubZeroDev Windows runner supervisor keeps dying' "Found dead $($recovery.consecutiveRecoveries) times in a row and started again by hand. Nothing restarts it automatically. $($recovery.lastRecoveryNote)" $SupervisorStatusFile
+    }
     $quickExits = 0
     while ($true) {
         # Maintenance: nothing may start a listener until Start-WindowsRunner removes the flag.
         if (Test-Path -LiteralPath $MaintenanceFile) {
             Write-SupervisorStatus @{ state = 'maintenance'; nextRetryUtc = $null }
+            Start-Sleep -Seconds $lifecycle.pollSeconds
+            continue
+        }
+        # A listener already running here belongs to a supervisor that died (our mutex rules out a live one). Launching run.cmd
+        # beside it would register two listeners for one runner, and killing it could cancel a job: wait until it is gone.
+        if (@(Get-WindowsRunnerListeners).Count) {
+            Write-SupervisorStatus @{ state = 'waiting-for-orphan'; nextRetryUtc = $null }
             Start-Sleep -Seconds $lifecycle.pollSeconds
             continue
         }
@@ -53,6 +67,8 @@ try {
         $delay = $lifecycle.restartDelaySeconds
         for ($i = 1; $i -lt $quickExits -and $delay -lt $lifecycle.backoffMaxSeconds; $i++) { $delay *= 2 }
         $delay = [Math]::Min($delay, $lifecycle.backoffMaxSeconds)
+        # A run that lasted is a healthy supervisor: the streak of supervisor recoveries ends.
+        if (-not $quick) { $status.consecutiveRecoveries = 0; $status.repeatedDeaths = $null }
         Write-SupervisorStatus @{
             state = if ($quickExits) { 'backoff' } else { 'starting' }; restarts = $status.restarts + 1; consecutiveQuickExits = $quickExits
             lastExitCode = $exitCode; lastExitUtc = [DateTime]::UtcNow.ToString('o'); nextRetryUtc = [DateTime]::UtcNow.AddSeconds($delay).ToString('o')

@@ -1,7 +1,9 @@
 #Requires -Version 7.2
 # Sets up the Windows runner, and only the Windows runner, on another machine: writes runners.local.json, downloads
 # and verifies the Actions runner, installs the private .NET SDK, registers the runner with GitHub under its own
-# name and the shared labels, and starts it now and at every sign-in. No Docker Desktop and no Linux runner.
+# name and the shared labels, and starts it now. No Docker Desktop and no Linux runner. Nothing starts it at sign-in and
+# nothing restarts the supervisor if it dies: Manage-WindowsRunner.ps1 -Action Start starts it again. A sign-in task or Run
+# entry left by an earlier version is removed once (this clone's only).
 # Run it from a git clone of this repository outside Dropbox, in a normal (not elevated) PowerShell 7 window,
 # signed in to Windows as the user the jobs should run as. Safe to rerun.
 param(
@@ -13,7 +15,7 @@ param(
     [string] $WorkFolder = '%TEMP%\szr',
     # Take over a runner already registered under -Name elsewhere; that machine stops receiving jobs.
     [switch] $Replace,
-    # One clone per instance. Gives each instance its own name, workspace, mutex and tasks.
+    # One clone per instance. Gives each instance its own name, workspace and mutex.
     [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')]
     [string] $InstanceId
 )
@@ -112,8 +114,12 @@ $beforeChange = {
         # Wait for a running job rather than cancel it, and leave the registration alone if it outlasts the deadline.
         $stopped = Stop-WindowsRunner -Reason 'registration change'
         if ($stopped.Outcome -eq 'timeout') { throw "Registration not changed. $($stopped.Retained)" }
+        if ($stopped.Outcome -eq 'failed') { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
     }
-    else { Stop-WindowsRunnerProcesses }
+    else {
+        $stopped = Stop-WindowsRunnerProcesses
+        if (-not $stopped.Stopped) { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
+    }
 }
 $applied = Invoke-RunnerRegistration -Plan $plan -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Replace:$Replace -BeforeChange $beforeChange
 switch ($applied.Result) {
@@ -123,19 +129,16 @@ switch ($applied.Result) {
 }
 $problems = @(Confirm-RunnerRegistration -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder)
 if ($problems) { throw "The registration does not match the configuration:`n - $($problems -join "`n - ")" }
-# Start at sign-in: the supervisor itself, not Start-Runners.ps1, which also needs Docker Desktop and the Linux container.
-if (-not $InstanceId) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName 'Start runners' -Confirm:$false -ErrorAction SilentlyContinue }
-$user = "$env:USERDOMAIN\$env:USERNAME"
-$action = New-ScheduledTaskAction -Execute $Pwsh -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Supervisor`"" -WorkingDirectory $WindowsRunner
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-$trigger.Delay = 'PT30S'
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-# The supervisor never exits on its own, so no time limit; it also holds a mutex against a second copy.
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the SubZeroDev Windows runner supervisor at sign-in.' -Force | Out-Null
-& (Join-Path $PSScriptRoot 'Register-LogTrimTask.ps1')
+# One-time removal of what earlier versions registered with Windows (this clone's tasks and Run entry only).
+. "$PSScriptRoot\LegacyCleanup.ps1"
+$cleanup = Remove-LegacyStartupTasks
+foreach ($line in @($cleanup.Removed) + @($cleanup.Kept)) { Write-Output $line }
+foreach ($line in $cleanup.Failed) { Write-Warning $line }
+# Housekeeping is not scheduled any more; a failure here must not fail the install.
+try { & (Join-Path $PSScriptRoot 'Trim-RunnerLogs.ps1') | ForEach-Object { Write-Output $_ } }
+catch { Write-Warning "Log trim failed: $($_.Exception.Message)" }
 
-if (-not (Get-SupervisorProcess)) { Start-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName }
+if (-not (Get-SupervisorProcess)) { Start-WindowsRunner | ForEach-Object { Write-Output "Supervisor $_." } }
 for ($attempt = 0; $attempt -lt 24 -and ($status = Get-RunnerStatus) -ne 'online'; $attempt++) { Start-Sleep -Seconds 5 }
 if ($status -ne 'online') { throw "$Name is $status after 2 minutes; see the newest Console_*.log in $(Join-Path $WindowsRunner '_diag')." }
 Write-Output "$Name is online with labels self-hosted, Windows, X64, $labels."

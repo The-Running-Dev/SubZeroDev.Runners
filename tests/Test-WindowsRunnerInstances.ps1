@@ -32,7 +32,17 @@ $installer = Get-Content -Raw (Join-Path $repo 'scripts\Install-WindowsRunner.ps
 $start = $installer.IndexOf('$localPath =')
 $end = $installer.IndexOf('$parts =')
 $setup = [scriptblock]::Create($installerParameters + "`n" + $installer.Substring($start, $end - $start).Replace('$PSScriptRoot\Common.ps1', '$root\scripts\Common.ps1'))
-$startup = [scriptblock]::Create($installer.Substring($installer.IndexOf('# Start at sign-in:')).Replace('$PSScriptRoot', "(Join-Path `$Clone 'scripts')"))
+# The installer's tail: legacy cleanup, housekeeping, direct supervisor start, online wait. Nothing is registered with Windows.
+$tailMarker = '# One-time removal of what earlier versions registered'
+if ($installer.IndexOf($tailMarker) -lt 0) { throw 'The installer tail marker is gone; update this test.' }
+$tailText = $installer.Substring($installer.IndexOf($tailMarker))
+foreach ($forbidden in 'Register-ScheduledTask', 'Set-WindowsStartup', 'Register-LogTrimTask', 'Start-ScheduledTask') {
+    if ($installer.Contains($forbidden)) { throw "The installer still mentions $forbidden." }
+}
+# LegacyCleanup.ps1 is not loaded (the test fakes Remove-LegacyStartupTasks) and the real housekeeping must not run: it trims caches.
+$tailText = $tailText.Replace('. "$PSScriptRoot\LegacyCleanup.ps1"', '').Replace("& (Join-Path `$PSScriptRoot 'Trim-RunnerLogs.ps1')", '$direct.Trimmed.Add($WindowsRunner)')
+if ($tailText.Contains('Trim-RunnerLogs.ps1') -or $tailText.Contains('LegacyCleanup.ps1')) { throw 'The installer tail changed; update the test replacements.' }
+$startup = [scriptblock]::Create($tailText)
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('runner-instances-' + [guid]::NewGuid().ToString('N'))
 function Assert($Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
@@ -51,36 +61,44 @@ function Invoke-Settings {
     $arguments = @{}
     foreach ($key in $PSBoundParameters.Keys) { if ($key -ne 'Clone') { $arguments[$key] = $PSBoundParameters[$key] } }
     . $setup @arguments
-    [pscustomobject]@{ Config = $Config; Mutex = $WindowsMutexName; StartTask = $WindowsTaskName; TrimTask = $LogTrimTaskName; Runner = $WindowsRunner }
+    [pscustomobject]@{ Config = $Config; Mutex = $WindowsMutexName; LegacyStartTask = $LegacyWindowsTaskName; LegacyTrimTask = $LegacyLogTrimTaskName; Runner = $WindowsRunner }
 }
-function Test-TaskPlan([string] $Clone) {
+function Test-DirectStart([string] $Clone) {
     . (Join-Path $Clone 'scripts\Common.ps1')
+    . (Join-Path $Clone 'scripts\Registration.ps1')
+    . (Join-Path $Clone 'scripts\Lifecycle.ps1')
     $InstanceId = $Config.windows.instanceId
     $Name = $Config.windows.name
-    $taskCapture = @{ Records = [Collections.Generic.List[object]]::new(); Removed = [Collections.Generic.List[string]]::new(); Started = [Collections.Generic.List[string]]::new() }
-    # Construct real Windows task actions/triggers/settings, but intercept registration and starts.
-    # This verifies the actual installer tail and trim script without changing the CI host's tasks.
-    function Register-ScheduledTask {
-        param($TaskPath, $TaskName, $Action, $Trigger, $Principal, $Settings, $Description, [switch] $Force)
-        $taskCapture.Records.Add([pscustomobject]@{ Path = $TaskPath; Name = $TaskName; Action = $Action; Trigger = $Trigger; Principal = $Principal; Settings = $Settings })
+    $direct = @{ Started = [Collections.Generic.List[object]]::new(); Trimmed = [Collections.Generic.List[string]]::new(); Cleanups = [Collections.Generic.List[object]]::new() }
+    # Run the real installer tail and the real Start-WindowsRunner, with the process launch and the cleanup intercepted. Nothing
+    # is registered with Windows, no process is started, and no real task or Run entry is looked at.
+    function Start-Process {
+        param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch] $PassThru)
+        $direct.Started.Add([pscustomobject]@{ FilePath = $FilePath; ArgumentList = @($ArgumentList); WorkingDirectory = $WorkingDirectory; WindowStyle = $WindowStyle })
+        [pscustomobject]@{ Id = 987700 }
     }
-    function Unregister-ScheduledTask { param($TaskPath, $TaskName, $Confirm, $ErrorAction) $taskCapture.Removed.Add($TaskName) }
-    function Start-ScheduledTask { param($TaskPath, $TaskName) $taskCapture.Started.Add($TaskName) }
+    function Remove-LegacyStartupTasks {
+        # Called with no arguments by the installer: what it would target is decided by the names in this scope.
+        $direct.Cleanups.Add([pscustomobject]@{ Start = $LegacyWindowsTaskName; Trim = $LegacyLogTrimTaskName; Script = $Supervisor; Combined = (-not $Config.windows.instanceId) })
+        [pscustomobject]@{ Removed = @(); Kept = @(); Failed = @() }
+    }
     function Get-SupervisorProcess { $null }
     function Get-RunnerStatus { 'online' }
     . $startup | Out-Null
-    Assert ($taskCapture.Records.Count -eq 2) 'Expected startup and trim task plans.'
-    $startTask, $trimTask = $taskCapture.Records
-    Assert ($startTask.Name -eq $WindowsTaskName -and $trimTask.Name -eq $LogTrimTaskName) 'Task plan used another instance identity.'
-    Assert ($startTask.Path -eq '\SubZeroDev.Runners\' -and $trimTask.Path -eq $startTask.Path) 'Task path changed.'
-    Assert ($startTask.Action.Execute -eq $Pwsh -and $startTask.Action.Arguments.Contains('"' + $Supervisor + '"')) 'Startup action targets the wrong supervisor.'
-    Assert ($startTask.Action.WorkingDirectory -eq $WindowsRunner) 'Startup working directory targets another clone.'
-    Assert ($startTask.Trigger.Delay -eq 'PT30S' -and $startTask.Principal.LogonType -eq 'Interactive' -and $startTask.Principal.RunLevel -eq 'Limited') 'Sign-in principal or trigger changed.'
-    Assert ($startTask.Settings.MultipleInstances -eq 'IgnoreNew' -and $startTask.Settings.ExecutionTimeLimit -eq 'PT0S') 'Supervisor task lifetime or duplicate policy changed.'
-    Assert ($trimTask.Action.Arguments.Contains((Join-Path $Clone 'scripts\Trim-RunnerLogs.ps1'))) 'Trim action targets another clone.'
-    Assert ($taskCapture.Started.Count -eq 1 -and $taskCapture.Started[0] -eq $WindowsTaskName) 'Wrong startup task started.'
-    if ($InstanceId) { Assert ($taskCapture.Removed.Count -eq 0) 'Named setup removed a legacy startup task.' }
-    else { Assert ($taskCapture.Removed.Count -eq 1 -and $taskCapture.Removed[0] -eq 'Start runners') 'Legacy combined startup migration changed.' }
+    Assert ($direct.Started.Count -eq 1) "Expected exactly one supervisor launch, got $($direct.Started.Count)."
+    $launch = $direct.Started[0]
+    Assert ($launch.FilePath -eq $Pwsh -and $launch.WindowStyle -eq 'Hidden') 'The supervisor is not launched as a hidden pwsh.'
+    Assert ($launch.ArgumentList[-2] -eq '-File' -and $launch.ArgumentList[-1] -eq ('"' + $Supervisor + '"')) "Launch targets the wrong supervisor: $($launch.ArgumentList -join ' ')"
+    Assert ($Supervisor.StartsWith($Clone, [StringComparison]::OrdinalIgnoreCase) -and $launch.WorkingDirectory -eq $WindowsRunner -and $WindowsRunner.StartsWith($Clone, [StringComparison]::OrdinalIgnoreCase)) 'Launch targets another clone.'
+    Assert ($direct.Cleanups.Count -eq 1 -and $direct.Trimmed.Count -eq 1) 'The installer tail did not run the one-time cleanup and the housekeeping once each.'
+    $cleanup = $direct.Cleanups[0]
+    if ($InstanceId) {
+        Assert ($cleanup.Start -eq "Start Windows runner ($InstanceId)" -and $cleanup.Trim -eq "Trim logs ($InstanceId)") "Legacy cleanup names another instance: $($cleanup.Start) / $($cleanup.Trim)"
+        Assert (-not $cleanup.Combined) 'A named instance would clean up the combined legacy task of the unnamed install.'
+    }
+    else {
+        Assert ($cleanup.Start -eq 'Start Windows runner' -and $cleanup.Trim -eq 'Trim logs' -and $cleanup.Combined) 'Legacy cleanup names changed for the unnamed install.'
+    }
 }
 try {
     $aClone = New-Fixture 'a'
@@ -93,12 +111,12 @@ try {
     Assert ($a.Config.windows.workFolder -ne $b.Config.windows.workFolder) 'Workspaces collide.'
     Assert ($a.Runner -ne $b.Runner) 'Runner installations collide.'
     Assert ($a.Mutex -ne $b.Mutex) 'Supervisor mutexes collide.'
-    Assert ($a.StartTask -ne $b.StartTask) 'Startup tasks collide.'
-    Assert ($a.TrimTask -ne $b.TrimTask) 'Log trim tasks collide.'
+    Assert ($a.LegacyStartTask -ne $b.LegacyStartTask) 'Legacy startup task names collide.'
+    Assert ($a.LegacyTrimTask -ne $b.LegacyTrimTask) 'Legacy log trim task names collide.'
     Assert ($a.Config.windows.labels -contains 'subzerodev-windows') 'Shared workflow label was lost.'
     Assert ($a.Config.windows.labels -contains 'subzerodev-windows-large') 'Extra label was lost.'
     Assert ($legacy.Mutex -eq 'Local\SubZeroDev.Runners.Windows') 'Legacy mutex changed.'
-    Assert ($legacy.StartTask -eq 'Start Windows runner' -and $legacy.TrimTask -eq 'Trim logs') 'Legacy task names changed.'
+    Assert ($legacy.LegacyStartTask -eq 'Start Windows runner' -and $legacy.LegacyTrimTask -eq 'Trim logs') 'Legacy task names changed.'
     Assert ($legacy.Config.windows.workFolder -eq '%TEMP%\szr') 'Legacy workspace changed.'
     Assert ($a.Config.windows.name -eq "subzerodev.runner.windows.$($env:COMPUTERNAME.ToLowerInvariant()).win01") 'Unexpected default runner name.'
     Assert ($a.Config.windows.workFolder -eq '%TEMP%\szr\win01') 'Unexpected default instance workspace.'
@@ -141,10 +159,10 @@ try {
     try { Invoke-Settings -Clone $invalidClone | Out-Null } catch { $rejected = $true }
     Assert $rejected 'Invalid saved instance ID accepted.'
     Assert ((Get-Content -Raw (Join-Path $invalidClone 'runners.local.json')) -eq $before) 'Invalid saved ID changed settings.'
-    Test-TaskPlan $aClone
-    Test-TaskPlan $bClone
-    Test-TaskPlan $legacyClone
-    Write-Output 'PASS: named and legacy startup/trim task plans, interactive sign-in and duplicate-start policy (registration/start mocked).'
+    Test-DirectStart $aClone
+    Test-DirectStart $bClone
+    Test-DirectStart $legacyClone
+    Write-Output 'PASS: named and unnamed installs start their own supervisor directly and scope the legacy cleanup to their instance (launch and cleanup mocked; nothing registered).'
     $mutex = [Threading.Mutex]::new($false, $a.Mutex)
     Assert ($mutex.WaitOne(0)) 'Could not acquire first instance mutex.'
     try {

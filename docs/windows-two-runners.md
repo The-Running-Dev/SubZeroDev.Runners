@@ -19,7 +19,7 @@ The bootstrap permits scripts/modules for its current PowerShell process only; i
 the machine's or user's persistent execution policy, and enforced organization policy still applies.
 
 Defaults: two instances (`win01`, `win02`) in `%LOCALAPPDATA%\SubZeroDev\Runners`, registered to
-`AbsoluteZeroDev`, with sign-in tasks. The `_setup` directory is a reserved controller checkout;
+`AbsoluteZeroDev`; each supervisor is started directly (nothing starts it again after a restart). The `_setup` directory is a reserved controller checkout;
 each instance has its own clone. All clones use one resolved source commit for that run. Package
 installs requiring a reboot stop setup and ask you to rerun after the reboot; setup never reboots for you.
 Use a unique Windows computer name per host; setup refuses existing runner-name conflicts rather than
@@ -29,7 +29,7 @@ taking another machine's registration.
 # Existing C:\Actions layout / 128 GB host:
 & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) -InstallRoot C:\Actions -ExtraLabels subzerodev-windows-large -SmokeRepository AbsoluteZeroDev/RunnerSmoke
 
-# Another machine: four instances, automatic registration/startup checks:
+# Another machine: four instances, automatic registration and supervisor checks:
 & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) -Count 4
 ```
 
@@ -92,11 +92,11 @@ Linux container.
   jobs on different instances do not interfere. Two jobs on the same instance wait for each other (one runner takes one
   job at a time anyway).
 - **Caches are per instance, not shared.** The first build on each instance is cold. `buildAgent.cache.retentionDays`/`maxGB`
-  bound them (applied by the daily log trim). A shared host cache would need a second mount, which BuildAgent does not offer;
+  bound them (applied by `Trim-RunnerLogs.ps1`, which `Start-Runners.ps1` and `Install-WindowsRunner.ps1` run; nothing schedules it). A shared host cache would need a second mount, which BuildAgent does not offer;
   `buildAgent.paths.extraMounts` is therefore required to be empty.
 - Paths that cannot be mounted safely are refused before the build starts: UNC paths, folders inside Dropbox, folders that
   overlap a runner clone, paths containing a comma, an output directory outside the workspace.
-- A scheduled task that needs the tool uses the full path from `buildAgent.tool.directory`, not PATH.
+- Anything that runs outside a job and needs the tool uses the full path from `buildAgent.tool.directory`, not PATH.
 
 BuildAgent's exit status is passed through unchanged, with its documented meaning printed on failure.
 
@@ -107,13 +107,35 @@ Run these from the instance's clone as the runner's user (`Manage-WindowsRunner.
 | Action | Does |
 | --- | --- |
 | `Status` | One line each for the supervisor (state, PID, restarts, last exit, next retry), the listener process, the running job, and the GitHub registration (online, busy, labels). Exits non-zero unless all are healthy; `-Json` for tools |
-| `Start` | Ends maintenance and starts the supervisor if none runs |
+| `Start` | Ends maintenance and starts the supervisor (detached, hidden) if none runs; prints `started (pid N)` or `already running (pid N)` |
 | `Stop` | Drains, then stops the supervisor and runner. Registration stays |
 | `Restart` | `Stop`, then `Start` |
-| `Maintenance` | Drains and stops, and keeps the sign-in task from starting anything until `Start` |
+| `Maintenance` | Drains and stops, and keeps the supervisor idle (`maintenance.json`) until `Start` |
 
 The supervisor restarts a runner that exits, with a growing delay when it exits quickly (30 s, doubling to 10 min), shows one
 toast per failure streak and leaves the evidence in `supervisor.json` and the per-launch `_diag\Console_*-utc.log`.
+
+There is no scheduled task, Run entry, service or watchdog: the supervisor runs only because `Start` (or `Start-Runners.ps1`,
+or the installer) launched it. If it dies, or the PC restarts, it stays down: `Status` exits 1 while it is down without having
+been stopped, the `Recovery` row says so, and the fix is `Manage-WindowsRunner.ps1 -Action Start`. Automatic supervisor
+recovery is not promised. When a supervisor does start over a dead predecessor it keeps the one-per-instance mutex, does not
+start `run.cmd` while `maintenance.json` exists, and waits (`waiting-for-orphan`) while a listener left by the dead supervisor
+still runs, so one listener results. Each recovery is recorded in `supervisor.json` and shown by `Status`; a second in a row raises a toast, and after 3 in a row
+without a long run between them, `repeatedDeaths` says so.
+
+**Legacy tasks.** Earlier versions registered `Start Windows runner`, `Trim logs` and `Start runners` under
+`\SubZeroDev.Runners\`, plus a `SubZeroDev.Runners` Run entry. `scripts\Remove-LegacyTasks.ps1` (also run by
+`Install-WindowsRunner.ps1`) removes this clone's once and does nothing on a second run. A task is removed only when its name
+carries this instance's suffix and its action names this clone's script; other instances' and clones' tasks are reported and
+kept. Removing a task does not end a supervisor it started. Host verification refuses to pass while one remains.
+
+A stop is reported successful only when nothing is left running. `Stop`, `Restart`, `Maintenance` and the registration changes
+in `Install-WindowsRunner.ps1` end the supervisor with `taskkill` and then check the process table. A `taskkill` that fails, or
+a supervisor, listener or worker still running afterwards, is a failed stop: exit 1, maintenance kept with the reason
+(`stop-failed`), labels not restored and, for installation, the registration left unchanged.
+A stop that fails (a process or container still running, or a state that cannot be read) exits 1, keeps maintenance with the
+reason and does not put the labels back; the original labels are saved in `maintenance.json` before they are withdrawn, so an
+interrupted drain can be undone by `Start`.
 
 **Drain, deadline and force.** `Stop`, `Restart` and `Maintenance` first withdraw the runner's custom labels at GitHub so it is
 offered no new job (admission control), then wait for the running job up to `lifecycle.drainTimeoutMinutes`
@@ -134,7 +156,13 @@ withdrawing the labels fails, no stop is attempted. A workflow that targets only
 | Two instances, distinct identity and workspace | `Test-WindowsRunnerInstances.ps1`, `Test-RunnerIntegration.ps1` | Setup with `-SmokeRepository` on the host |
 | BuildAgent build | Invocation, mapping and refusal cases; no daemon | **Not collected**: a real build of the owner's project on Docker Desktop |
 | Concurrent jobs | Smoke evidence checker with synthetic results | `-SmokeRepository` run on the host |
-| Task-driven recovery (supervisor restart, scheduled task) | Backoff and state logic only | **Not collected** |
+| Supervisor takeover (one listener, maintenance holds, orphan wait) | `Test-LifecycleRecovery.ps1`: the real supervisor script in a child process against a stand-in listener | Same test; no Task Scheduler involved |
+| Start launches one supervisor; a second Start finds it | `Test-LifecycleRecovery.ps1`: fake `Start-Process` (arguments, working directory, hidden, maintenance ended first, already running); real `Manage-WindowsRunner.ps1 -Action Start` twice against the real supervisor | Same test: a real `Start` launched the replacement of a killed supervisor, the second `Start` reported its pid and started nothing |
+| Dead supervisor is reported down and started by hand | `Test-LifecycleRecovery.ps1`: recovery bookkeeping, `Status` exit 1 and the `Recovery` row, real killed supervisor then explicit `Start` | Same test. Nothing restarts it, by design |
+| Intentional stop stays stopped | `Test-LifecycleRecovery.ps1`: verified `taskkill` then process-table check; stop failure, supervisor, listener and worker still running | Real supervisor and listener stand-in in the same test |
+| Failed stop keeps maintenance and exits 1 | `Test-LifecycleRecovery.ps1`: entry points in child processes with a fake `gh` and `docker` and a supervisor `taskkill` refuses to end (`Manage` Stop/Restart/Maintenance, `Stop-Runners.ps1`: exit 1) | **Not collected** against a real Docker daemon |
+| Legacy tasks are removed once, only this clone's | `Test-LifecycleRecovery.ps1`: real Task Scheduler and registry, in a throwaway task folder and Run key per case (this clone's removed, another clone's and unlisted kept, second run does nothing, a supervisor the task started keeps running); `Test-WindowsRunnerInstances.ps1`: instance-suffixed names | Same tests; the real tasks of this host are fingerprinted before and after and unchanged |
+| Task Scheduler restarts a killed or crashed supervisor (historical) | Simulated only, no longer applicable | **Collected, negative, and the reason the scheduler was dropped** (Windows 11 build 26200, 2026-11-07, throwaway tasks under `\SubZeroDev.Runners.Probe\`, restart 3-5 x 1 min): after `taskkill /T /F`, `Stop-Process`, `exit 0`, `exit 1`, `exit 3` and `throw`, the task launched once and was not restarted within 3 minutes. Kept as history; no scheduler infrastructure is built on it |
 | Config change reaches the registration | Registration plan cases (name, target, work folder, labels) | **Not collected** against GitHub |
 | Active-job drain, timeout and force | Mocked GitHub and processes in `Test-RunnerIntegration.ps1` | **Not collected** with a live job |
 | Linux updater success, unhealthy restore, refusal | Command construction and exit-code mapping only | **Blocked**: needs a published `BuildAgent.Tool` containing Docker-BuildAgent PR #136 |
@@ -168,7 +196,7 @@ GitHub CLI environment authentication: <https://cli.github.com/manual/gh_help_en
 
 ## Manual setup and inspection
 
-These commands configure two independent clones on the 128 GB Windows machine. Run the installer as the normal Windows user whose account will execute jobs. Startup is at that user's sign-in, not at boot: after a restart nothing runs until that user signs in, and nothing here sets up automatic sign-in. Both jobs share the host's CPU, memory, installed tools and ports; there are no per-runner resource limits.
+These commands configure two independent clones on the 128 GB Windows machine. Run the installer as the normal Windows user whose account will execute jobs. Nothing starts the supervisors automatically: the installer starts them, and after a restart or a sign-out nothing runs until you run `Manage-WindowsRunner.ps1 -Action Start` in each clone. Both jobs share the host's CPU, memory, installed tools and ports; there are no per-runner resource limits.
 
 ## Prerequisites
 
@@ -235,12 +263,11 @@ Expected identities (`<computer>` is lowercase `COMPUTERNAME`):
 | Runner name | `subzerodev.runner.windows.<computer>.win01` | `subzerodev.runner.windows.<computer>.win02` |
 | Default workspace | `%TEMP%\szr\win01` | `%TEMP%\szr\win02` |
 | Mutex | `Local\SubZeroDev.Runners.Windows.win01` | `Local\SubZeroDev.Runners.Windows.win02` |
-| Sign-in task | `Start Windows runner (win01)` | `Start Windows runner (win02)` |
-| Daily task | `Trim logs (win01)` | `Trim logs (win02)` |
+| Supervisor | `C:\Actions\win01\windows\supervisor.pid` | `C:\Actions\win02\windows\supervisor.pid` |
 
-Tasks live under `\SubZeroDev.Runners\`. Both retain `subzerodev-windows` and add `subzerodev-windows-large`. Each clone has separate binaries, registration, SDK, NuGet cache, logs and PID file. Reruns retain saved identity, scope and labels when those arguments are omitted. Existing unnamed installations keep their original mutex and task names.
+There are no scheduled tasks; any `Start Windows runner (...)` or `Trim logs (...)` task left by an earlier version is removed by the installer. Both retain `subzerodev-windows` and add `subzerodev-windows-large`. Each clone has separate binaries, registration, SDK, NuGet cache, logs and PID file. Reruns retain saved identity, scope and labels when those arguments are omitted. Existing unnamed installations keep their original mutex name.
 
-## Verify registration and scheduled tasks on the host
+## Verify registration and supervisors on the host
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -248,18 +275,15 @@ $local = @(foreach ($id in 'win01', 'win02') {
     $clone = Join-Path 'C:\Actions' $id
     $config = Get-Content -Raw "$clone\runners.local.json" | ConvertFrom-Json
     $registration = Get-Content -Raw "$clone\windows\.runner" | ConvertFrom-Json
-    $task = Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -TaskName "Start Windows runner ($id)"
-    $trim = Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -TaskName "Trim logs ($id)"
     $supervisor = Join-Path $clone 'scripts\Run-WindowsRunner.ps1'
-    if ($task.Actions.Arguments -notlike "*$supervisor*" -or $task.Actions.WorkingDirectory -ne "$clone\windows") { throw "Wrong startup action for $id." }
-    if ($task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Limited') { throw "Wrong task principal for $id." }
-    if ($task.Settings.MultipleInstances -ne 'IgnoreNew' -or $task.Settings.ExecutionTimeLimit -ne 'PT0S') { throw "Wrong task lifetime settings for $id." }
+    $legacy = @(Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -ErrorAction SilentlyContinue |
+        Where-Object { $_.TaskName -in "Start Windows runner ($id)", "Trim logs ($id)" })
+    if ($legacy) { throw "Legacy scheduled task still registered for $id; run $clone\scripts\Remove-LegacyTasks.ps1." }
     $supervisorPid = [int](Get-Content "$clone\windows\supervisor.pid")
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$supervisorPid"
     if (-not $process -or $process.CommandLine -notlike "*$supervisor*") { throw "Supervisor not running for $id." }
     if ($config.windows.instanceId -ne $id -or $registration.agentName -ne $config.windows.name) { throw "Wrong registration for $id." }
-    Get-ScheduledTaskInfo -TaskPath $task.TaskPath -TaskName $task.TaskName | Format-List LastRunTime, LastTaskResult
-    [pscustomobject]@{ Instance = $id; Name = $registration.agentName; AgentId = $registration.agentId; Workspace = [Environment]::ExpandEnvironmentVariables($config.windows.workFolder); SupervisorPid = $supervisorPid; StartTask = $task.State; TrimTask = $trim.State }
+    [pscustomobject]@{ Instance = $id; Name = $registration.agentName; AgentId = $registration.agentId; Workspace = [Environment]::ExpandEnvironmentVariables($config.windows.workFolder); SupervisorPid = $supervisorPid }
 })
 $local | Format-Table -AutoSize
 foreach ($field in 'Name', 'AgentId', 'Workspace', 'SupervisorPid') {
@@ -279,7 +303,7 @@ foreach ($runner in $remote) {
 $remote | Select-Object id, name, status, busy | Format-Table
 ```
 
-A running supervisor task normally reports `Running`; its `LastTaskResult` may be `267009` (`0x41301`, still running). Check the process and GitHub status, rather than treating that value as failure. Sign out and back in, then repeat the checks to verify the real sign-in trigger. The CI harness constructs task definitions but mocks registration/start; it does not prove task installation on this machine.
+`Manage-WindowsRunner.ps1 -Action Status` in each clone gives the same view and exits 1 when the supervisor is down. After a restart or sign-out the supervisors are down until `Manage-WindowsRunner.ps1 -Action Start` is run; that is expected, not a fault. The CI harness mocks process launch and registration; it does not prove registration on this machine.
 
 ## Safe concurrent-job smoke test
 
