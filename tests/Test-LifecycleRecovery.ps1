@@ -406,11 +406,27 @@ Test-Case 'a failed stop stops re-registration before it changes anything' {
 function New-FakeScheduler {
     @{
         Task = $null; Order = @(); Direct = @(); Registered = 0; RegisterFails = $null; StopThrows = $null
+        DisableFails = $null; EnableFails = $null; AfterDisable = $null; AfterKill = $null; GetThrows = $null
         Info = [pscustomobject]@{ LastTaskResult = 267009; LastRunTime = [DateTime]::new(2026, 1, 2, 3, 4, 5) }
     }
 }
 $sched = New-FakeScheduler
-function Get-ScheduledTask { [CmdletBinding()] param($TaskPath, $TaskName) $sched.Task }
+# A watch for a pending Task Scheduler retry lasts this long (75 s in production); the fakes answer at once.
+$SupervisorRecoveryWait = New-TimeSpan -Seconds 1
+function Get-ScheduledTask { [CmdletBinding()] param($TaskPath, $TaskName) if ($sched.GetThrows) { throw $sched.GetThrows }; $sched.Task }
+function Disable-ScheduledTask {
+    [CmdletBinding()] param($TaskPath, $TaskName)
+    $sched.Order += 'disable-task'
+    if ($sched.DisableFails) { throw $sched.DisableFails }
+    if ($sched.Task) { $sched.Task.State = 'Disabled' }
+    if ($sched.AfterDisable) { & $sched.AfterDisable }
+}
+function Enable-ScheduledTask {
+    [CmdletBinding()] param($TaskPath, $TaskName)
+    $sched.Order += 'enable-task'
+    if ($sched.EnableFails) { throw $sched.EnableFails }
+    if ($sched.Task) { $sched.Task.State = 'Ready' }
+}
 function Get-ScheduledTaskInfo { [CmdletBinding()] param($TaskPath, $TaskName) $sched.Info }
 function Start-ScheduledTask { [CmdletBinding()] param($TaskPath, $TaskName) $sched.Order += 'start-task' }
 function Stop-ScheduledTask {
@@ -432,7 +448,7 @@ function Start-Process {
     $sched.Direct += , [pscustomobject]@{ FilePath = $FilePath; ArgumentList = @($ArgumentList); WorkingDirectory = $WorkingDirectory }
 }
 # Abort before any case runs unless every one of them is the fake, as seen from inside a lifecycle function.
-foreach ($name in 'Get-ScheduledTask', 'Get-ScheduledTaskInfo', 'Start-ScheduledTask', 'Stop-ScheduledTask', 'Register-ScheduledTask', 'Start-Process') {
+foreach ($name in 'Get-ScheduledTask', 'Get-ScheduledTaskInfo', 'Start-ScheduledTask', 'Stop-ScheduledTask', 'Disable-ScheduledTask', 'Enable-ScheduledTask', 'Register-ScheduledTask', 'Start-Process') {
     # The lifecycle functions were dot-sourced into this scope, so they resolve a name exactly as this line does.
     $resolved = Get-Command $name
     if ($resolved.CommandType -ne 'Function' -or $resolved.ScriptBlock.File -ne $PSCommandPath) {
@@ -462,6 +478,9 @@ function Invoke-TaskKill([int] $ProcessId) {
     $sched.Order += 'taskkill'
     if ($win.TaskKillFails) { return [pscustomobject]@{ ExitCode = 1; Output = 'ERROR: The process could not be terminated. Access is denied.' } }
     $win.Supervisor = $null; $win.Listeners = @(); $win.Workers = @()
+    # Task Scheduler reads a task Ready once its process is gone; AfterKill models what it does next (a restart, say).
+    if ($sched.Task -and "$($sched.Task.State)" -eq 'Running') { $sched.Task.State = 'Ready' }
+    if ($sched.AfterKill) { & $sched.AfterKill }
     [pscustomobject]@{ ExitCode = $(if ($win.TaskKillGone) { 128 } else { 0 }); Output = '' }
 }
 function Stop-Process {
@@ -587,11 +606,49 @@ Test-Case 'Start: a current task is started as it is' {
     Assert ($how -eq 'started through its scheduled task' -and ($sched.Order -join ',') -eq 'start-task') "Unexpected result '$how' / calls $($sched.Order -join ',')"
 }
 
-Test-Case 'Start: a supervisor that is already running is left alone (no second supervisor, no task change)' {
+Test-Case 'Start: a running supervisor under an old task gets the task reconciled, no second supervisor, and is not reported protected' {
     . Use-WindowsFixture
-    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -RestartCount 0
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -RestartCount 0 -State 'Running'
     $how = Start-WindowsRunner
-    Assert ($how -eq 'already running' -and -not $sched.Order) "Unexpected result '$how' / calls $($sched.Order -join ',')"
+    Assert ($how -match '^already running \(pid 987653\)' -and $how -match 'updated to restart the supervisor on failure' -and $how -match 'not confirmed protected until it is restarted' -and $how -match 'Manage-WindowsRunner.ps1 -Action Stop') "The result does not say what happened and what is left: $how"
+    Assert (($sched.Order -join ',') -eq 'register-task') "Unexpected calls (no start-task, no start-process, no kill): $($sched.Order -join ',')"
+    Assert (Test-WindowsSupervisorTask $sched.Task) 'The task was not brought to the current definition.'
+    Assert (-not $sched.Direct -and -not $win.Kills -and -not $win.Stops) 'A second supervisor was started or a process was stopped.'
+}
+
+Test-Case 'Start: a running supervisor under a current task changes nothing' {
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running'
+    $how = Start-WindowsRunner
+    Assert ($how -eq 'already running (pid 987653)' -and -not $sched.Order) "Unexpected result '$how' / calls $($sched.Order -join ',')"
+}
+
+Test-Case 'Start: a running supervisor whose current task was disabled gets the task enabled, not started or registered again' {
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Disabled'
+    $how = Start-WindowsRunner
+    Assert ($how -match 'enabled again' -and $how -match 'not confirmed protected') "Unexpected result: $how"
+    Assert (($sched.Order -join ',') -eq 'enable-task' -and "$($sched.Task.State)" -eq 'Ready') "Unexpected calls: $($sched.Order -join ',')"
+}
+
+Test-Case 'Start: a not-running supervisor with a disabled current task enables it and starts it through the task' {
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject -State 'Disabled'
+    $how = Start-WindowsRunner
+    Assert ($how -eq 'started through its scheduled task (enabled again)' -and ($sched.Order -join ',') -eq 'enable-task,start-task') "Unexpected result '$how' / calls $($sched.Order -join ',')"
+}
+
+Test-Case 'Start: a running supervisor whose task cannot be updated is reported NOT protected, and the failure is recorded' {
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -RestartCount 0 -State 'Running'; $sched.RegisterFails = 'Access is denied.'
+    $how = Start-WindowsRunner
+    Assert ($how -match '^already running \(pid 987653\); NOT protected' -and $how -match 'Access is denied') "The limitation is not reported: $how"
+    Assert (($sched.Order -join ',') -eq 'register-task' -and -not $sched.Direct) "Unexpected calls: $($sched.Order -join ',')"
+    Assert ((Get-SupervisorStatus).recoveryFailure -match 'Access is denied') 'The upgrade failure was not recorded.'
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Disabled'; $sched.EnableFails = 'Access is denied.'
+    $how = Start-WindowsRunner
+    Assert ($how -match 'NOT protected' -and ((Get-SupervisorStatus).recoveryFailure -match 'could not be enabled')) "A task that could not be enabled is not reported: $how"
 }
 
 Test-Case 'Start: a registration that fails with no task starts the supervisor directly, says it is unsupervised and records the failure' {
@@ -644,7 +701,7 @@ Test-Case 'Stop: the running task is stopped through Task Scheduler before the s
     Assert (($sched.Order -join ',') -eq 'stop-task,taskkill') "The order was $($sched.Order -join ',')"
 }
 
-Test-Case 'Stop: another clone''s task, a task that is not running and a task that cannot be stopped do not change the outcome' {
+Test-Case 'Stop: another clone''s task, a disabled task, a task not configured to restart and a running supervisor with a Ready task do not change the outcome' {
     . Use-WindowsFixture
     $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }
     $sched.Task = New-TaskObject -State 'Running' -Arguments '-File "C:\other\clone\scripts\Run-WindowsRunner.ps1"'
@@ -655,9 +712,130 @@ Test-Case 'Stop: another clone''s task, a task that is not running and a task th
     Assert (Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped 'A task that is not running blocked the stop.'
     Assert ($sched.Order -notcontains 'stop-task') 'A task that is not running was stopped.'
     . Use-WindowsFixture
-    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running'; $sched.StopThrows = 'Access is denied'
-    Assert (Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped 'A task that would not stop blocked the stop (the kill must still happen and be verified).'
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Disabled'
+    Assert (Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped 'A disabled task blocked the stop.'
+    Assert (($sched.Order -join ',') -eq 'taskkill') "A disabled task was touched: $($sched.Order -join ',')"
+    # Nothing is armed in Task Scheduler for a task with no restart-on-failure, so it cannot undo the stop: not a failure.
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running' -RestartCount 0; $sched.StopThrows = 'Access is denied'
+    Assert (Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped 'A task with no restart-on-failure that would not stop blocked the stop.'
     Assert (($sched.Order -join ',') -eq 'stop-task,taskkill') "The order was $($sched.Order -join ',')"
+}
+
+# --- supervisor task: a stop that Task Scheduler recovery could undo is a failed stop -------------------------------------
+Test-Case 'Stop: a task that cannot be stopped while the kill succeeds is a FAILED stop that disables the task and keeps the record' {
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running'; $sched.StopThrows = 'Access is denied'
+    Set-SupervisorStatusValues @{ state = 'running'; pid = 987653 }
+    $result = Stop-WindowsRunnerProcesses -WaitSeconds 1
+    $text = @($result.Failures) -join ' '
+    Assert (-not $result.Stopped) "The stop was reported successful although Task Scheduler could not be stopped: $text"
+    Assert ($text -match 'could not stop the supervisor''s task \(Access is denied\)' -and $text -match 'The task was disabled') "The failure text is incomplete: $text"
+    Assert (($sched.Order -join ',') -eq 'stop-task,disable-task,taskkill' -and "$($sched.Task.State)" -eq 'Disabled') "Order $($sched.Order -join ','), task $($sched.Task.State)"
+    Assert ($win.Supervisor -eq $null) 'The supervisor was not killed even though the stop failed (it must still not be left running).'
+    Assert (Test-Path -LiteralPath $SupervisorPidFile) 'The pid file was removed for a stop that failed.'
+    Assert ((Get-SupervisorStatus).state -eq 'running') 'A failed stop marked the supervisor stopped, so the next start would not be a recovery.'
+}
+
+Test-Case 'Stop: a task that cannot be stopped and cannot be disabled either says that Task Scheduler may restart the supervisor' {
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running'; $sched.StopThrows = 'Access is denied'; $sched.DisableFails = 'The service is not available.'
+    $result = Stop-WindowsRunnerProcesses -WaitSeconds 1
+    $text = @($result.Failures) -join ' '
+    Assert (-not $result.Stopped -and $text -match 'could not be disabled either' -and $text -match 'may restart the supervisor') "Unexpected result: $($result.Stopped) $text"
+}
+
+Test-Case 'Stop: the task that Task Scheduler runs again after the stop is a failed stop' {
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running'
+    # Task Scheduler starts a new instance the moment the old one is killed: the task reads Running again, with nothing in the process table yet.
+    $sched.AfterKill = { $sched.Task.State = 'Running' }
+    $result = Stop-WindowsRunnerProcesses -WaitSeconds 1
+    Assert (-not $result.Stopped -and (@($result.Failures) -join ' ') -match 'running again after the stop') "Unexpected result: $($result.Stopped) $(@($result.Failures) -join ' ')"
+    Assert (Test-Path -LiteralPath $SupervisorPidFile) 'The pid file was removed.'
+}
+
+Test-Case 'Stop: a supervisor that is already gone while its last run failed is watched for a pending retry; nothing back is a successful stop' {
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject; $sched.Info = [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow }
+    Set-SupervisorStatusValues @{ state = 'running'; pid = 987653 }
+    $task = Stop-WindowsSupervisorTask -SupervisorRunning $false
+    Assert ($task.Ok -and $task.Note -match 'nothing restarted it within 1 seconds') "Unexpected result: $($task | ConvertTo-Json -Compress)"
+    Assert (($sched.Order -join ',') -eq 'disable-task,enable-task' -and "$($sched.Task.State)" -eq 'Ready') "Order $($sched.Order -join ','), task $($sched.Task.State): the task must be enabled again."
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject; $sched.Info = [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow }
+    Set-SupervisorStatusValues @{ state = 'running'; pid = 987653 }
+    $result = Stop-WindowsRunnerProcesses -WaitSeconds 1
+    Assert ($result.Stopped -and -not (Test-Path -LiteralPath $SupervisorPidFile) -and (Get-SupervisorStatus).state -eq 'stopped') "The verified stop was not completed: $(@($result.Failures) -join ' ')"
+}
+
+Test-Case 'Stop: a supervisor that comes back while its task is disabled is a failed stop and the task stays disabled' {
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject; $sched.Info = [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow }
+    Set-SupervisorStatusValues @{ state = 'running'; pid = 987653 }
+    $sched.AfterDisable = { $win.Supervisor = [pscustomobject]@{ ProcessId = 987660 } }
+    $result = Stop-WindowsRunnerProcesses -WaitSeconds 1
+    $text = @($result.Failures) -join ' '
+    Assert (-not $result.Stopped -and $text -match 'came back within 1 seconds' -and $text -match 'cannot be ruled out') "Unexpected result: $($result.Stopped) $text"
+    Assert (($sched.Order -join ',') -eq 'disable-task,taskkill' -and "$($sched.Task.State)" -eq 'Disabled') "Order $($sched.Order -join ','), task $($sched.Task.State)"
+    Assert (Test-Path -LiteralPath $SupervisorPidFile -PathType Leaf) 'The pid file was removed for a stop that failed.'
+}
+
+Test-Case 'Stop: a supervisor that is gone, a failed last run and a task that cannot be disabled or enabled are failed stops' {
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject; $sched.Info = [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow }; $sched.DisableFails = 'Access is denied'
+    $task = Stop-WindowsSupervisorTask -SupervisorRunning $false
+    Assert (-not $task.Ok -and (@($task.Failures) -join ' ') -match 'could not be disabled to prevent that') "Disable failure: $($task | ConvertTo-Json -Compress)"
+    Assert (-not (Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped) 'A supervisor whose retry could not be ruled out was reported stopped.'
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject; $sched.Info = [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow }; $sched.EnableFails = 'Access is denied'
+    $task = Stop-WindowsSupervisorTask -SupervisorRunning $false
+    Assert (-not $task.Ok -and (@($task.Failures) -join ' ') -match 'could not be enabled again' -and (@($task.Failures) -join ' ') -match 'Manage-WindowsRunner.ps1 -Action Start') "Enable failure: $($task | ConvertTo-Json -Compress)"
+}
+
+Test-Case 'Stop: a gone supervisor is not watched when it was stopped on purpose, when the last run did not fail, or when no restart is configured' {
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject; $sched.Info = [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow }
+    Set-SupervisorStatusValues @{ state = 'stopped' }
+    Assert (Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped 'A supervisor stopped on purpose blocked the stop.'
+    Assert (-not $sched.Order) "A supervisor stopped on purpose was watched: $($sched.Order -join ',')"
+    foreach ($last in 0, 267009, 267011, 267014) {
+        . Use-WindowsFixture
+        $sched.Task = New-TaskObject; $sched.Info = [pscustomobject]@{ LastTaskResult = $last; LastRunTime = [DateTime]::UtcNow }; Set-SupervisorStatusValues @{ state = 'running' }
+        Assert ((Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped -and -not $sched.Order) "Last result $last was watched: $($sched.Order -join ',')"
+    }
+    . Use-WindowsFixture
+    $sched.Task = New-TaskObject -RestartCount 0; $sched.Info = [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow }; Set-SupervisorStatusValues @{ state = 'running' }
+    Assert ((Stop-WindowsRunnerProcesses -WaitSeconds 1).Stopped -and -not $sched.Order) "A task with no restart-on-failure was watched: $($sched.Order -join ',')"
+}
+
+Test-Case 'Stop: a task that cannot be read is a failed stop; a task that does not exist is not' {
+    . Use-WindowsFixture
+    $sched.GetThrows = 'No MSFT_ScheduledTask objects found with property ''TaskName'' equal to ''x''.'
+    Assert (Stop-WindowsSupervisorTask -SupervisorRunning $true).Ok 'An absent task blocked the stop.'
+    $sched.GetThrows = 'The RPC server is unavailable.'
+    $task = Stop-WindowsSupervisorTask -SupervisorRunning $true
+    Assert (-not $task.Ok -and (@($task.Failures) -join ' ') -match 'cannot be ruled out' -and (@($task.Failures) -join ' ') -match 'RPC server') "Unexpected result: $($task | ConvertTo-Json -Compress)"
+}
+
+Test-Case 'Stop: a verified stop through a running task succeeds (Stop-ScheduledTask, then the kill, nothing back)' {
+    . Use-WindowsFixture
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running'
+    Set-SupervisorStatusValues @{ state = 'running'; pid = 987653 }
+    $result = Stop-WindowsRunnerProcesses -WaitSeconds 1
+    Assert ($result.Stopped -and -not $result.Failures) "Unexpected result: $(@($result.Failures) -join ' ')"
+    Assert (($sched.Order -join ',') -eq 'stop-task,taskkill' -and (Get-SupervisorStatus).state -eq 'stopped' -and -not (Test-Path -LiteralPath $SupervisorPidFile)) "Order $($sched.Order -join ',')"
+}
+
+Test-Case 'Stop-WindowsRunner: a scheduler stop that fails keeps maintenance with the reason and keeps admission closed' {
+    . Use-WindowsFixture
+    $dir = $WindowsRunner; $gh = New-FakeGitHub $MaintenanceFile
+    $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; $sched.Task = New-TaskObject -State 'Running'; $sched.StopThrows = 'Access is denied'
+    $result = Stop-WindowsRunner -Force -Reason 'stop'
+    Assert ($result.Outcome -eq 'failed' -and (@($result.Failures) -join ' ') -match 'could not stop the supervisor''s task') "Unexpected outcome $($result.Outcome): $(@($result.Failures) -join ' ')"
+    $record = Get-MaintenanceState $MaintenanceFile
+    Assert ($null -ne $record -and $record.phase -eq 'stop-failed' -and $record.failure -match 'could not stop the supervisor''s task' -and (Join-Sorted $record.savedLabels) -eq 'subzerodev,subzerodev-windows') 'Maintenance or the recovery information was not kept.'
+    Assert ($gh.Adds -eq 0 -and -not $gh.Custom) 'Admission was reopened although Task Scheduler recovery could undo the stop.'
 }
 
 Test-Case 'Stop: a verified stop marks supervisor.json stopped (so the next start is no recovery); a failed stop leaves it alone' {
@@ -691,7 +869,7 @@ Test-Case 'Recovery: a predecessor that did not stop counts, once more each time
 
 Test-Case 'Recovery: the restart that is the last one Task Scheduler makes is recorded as retries exhausted' {
     $recovery = Get-SupervisorRecovery ([pscustomobject]@{ state = 'backoff'; pid = 1; recoveries = 9; consecutiveRecoveries = 4 })
-    Assert ($recovery.consecutiveRecoveries -eq 5 -and $recovery.retriesExhausted -match 'restart 5 of 5 was the last Task Scheduler makes' -and $recovery.retriesExhausted -match 'Manage-WindowsRunner.ps1 -Action Start') "Exhaustion: $($recovery.retriesExhausted)"
+    Assert ($recovery.consecutiveRecoveries -eq 5 -and $recovery.retriesExhausted -match 'configured for 5 restarts' -and $recovery.retriesExhausted -match 'Manage-WindowsRunner.ps1 -Action Start') "Exhaustion: $($recovery.retriesExhausted)"
 }
 
 Test-Case 'Recovery report: down is not running without a clean stop; the summary names what to do' {
@@ -699,13 +877,13 @@ Test-Case 'Recovery report: down is not running without a clean stop; the summar
     $current = New-TaskObject; $old = New-TaskObject -RestartCount 0
     $report = Get-SupervisorRecoveryReport $false ([pscustomobject]@{ state = 'running'; recoveries = 2; consecutiveRecoveries = 2; lastRecoveryUtc = 'x' }) $current
     Assert ($report.Down -and $report.RestartsConfigured -and $report.Recoveries -eq 2 -and $report.TaskLastResult -eq 267009) "Report: $($report | ConvertTo-Json -Compress -Depth 3)"
-    Assert ((@($report.Summary) -join ' ') -match 'not running and did not stop on purpose' -and (@($report.Summary) -join ' ') -match 'Manage-WindowsRunner.ps1 -Action Start') 'The summary does not say the supervisor is down and what to do.'
+    Assert ((@($report.Summary) -join ' ') -match 'not running and did not stop on purpose' -and (@($report.Summary) -join ' ') -match 'not verified for a killed or crashed supervisor' -and (@($report.Summary) -join ' ') -match 'Manage-WindowsRunner.ps1 -Action Start') 'The summary does not say the supervisor is down, that the restart is unverified, and what to do.'
     Assert (-not (Get-SupervisorRecoveryReport $true ([pscustomobject]@{ state = 'running' }) $current).Down) 'A running supervisor was reported down.'
     Assert (-not (Get-SupervisorRecoveryReport $false ([pscustomobject]@{ state = 'stopped' }) $current).Down) 'A supervisor stopped on purpose was reported down.'
     $report = Get-SupervisorRecoveryReport $false ([pscustomobject]@{ state = 'stopped' }) $old
-    Assert (-not $report.RestartsConfigured -and (@($report.Summary) -join ' ') -match 'does not restart the supervisor') 'An old task was not flagged.'
+    Assert (-not $report.RestartsConfigured -and (@($report.Summary) -join ' ') -match 'not configured to restart the supervisor') 'An old task was not flagged.'
     $report = Get-SupervisorRecoveryReport $false $null $null
-    Assert (-not $report.RestartsConfigured -and -not $report.Down -and (@($report.Summary) -join ' ') -match 'does not restart the supervisor') 'A missing task was not flagged.'
+    Assert (-not $report.RestartsConfigured -and -not $report.Down -and (@($report.Summary) -join ' ') -match 'not configured to restart the supervisor') 'A missing task was not flagged.'
     $report = Get-SupervisorRecoveryReport $true ([pscustomobject]@{ state = 'running'; recoveryFailure = 'REGFAIL'; retriesExhausted = 'EXHAUSTED' }) $current
     Assert ((@($report.Summary) -join ' ') -match 'REGFAIL' -and (@($report.Summary) -join ' ') -match 'EXHAUSTED') 'A recorded failure or exhaustion is missing from the summary.'
 }
@@ -808,6 +986,44 @@ Test-Case 'Manage-WindowsRunner.ps1 -Action Status exits 1 and says what to do w
     Assert ($run.ExitCode -eq 1) "Status exited $($run.ExitCode) for a supervisor that is down.`n$($run.Output)"
     Assert ($run.Output -match 'Warning1\s+.*not running and did not stop on purpose' -and $run.Output -match 'Manage-WindowsRunner.ps1 -Action Start') "The status does not name the failure and the fix.`n$($run.Output)"
     Assert ($run.Output -match 'Recovery\s+supervisor restarted 1 times') "The recovery history is missing.`n$($run.Output)"
+}
+
+# A clone whose Task Scheduler cmdlets are replaced (functions appended to its own copy of Lifecycle.ps1) by a recoverable task
+# for this clone's supervisor that cannot be disabled, stopped or enabled, with a supervisor that died without stopping: the
+# retry-delay window, where a restart may be pending and cannot be ruled out. Nothing here addresses a real task.
+function New-UnstoppableSchedulerFixture {
+    $fixture = New-EntryPointFixture
+    $windowsDir = Join-Path $fixture.Clone 'windows'
+    New-Item -ItemType Directory -Path $windowsDir | Out-Null
+    @{ state = 'running'; pid = 2147483000 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $windowsDir 'supervisor.json')
+    Add-Content -LiteralPath (Join-Path $fixture.Clone 'scripts\Lifecycle.ps1') -Value @'
+
+function Get-ScheduledTask { [pscustomobject]@{ State = 'Ready'; Actions = @(New-ScheduledTaskAction -Execute $Pwsh -Argument "-File `"$Supervisor`"" -WorkingDirectory $WindowsRunner); Settings = (New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)) } }
+function Get-ScheduledTaskInfo { [pscustomobject]@{ LastTaskResult = 1; LastRunTime = [DateTime]::UtcNow } }
+function Disable-ScheduledTask { throw 'Access is denied.' }
+function Enable-ScheduledTask { throw 'Access is denied.' }
+function Stop-ScheduledTask { throw 'Access is denied.' }
+'@
+    $fixture | Add-Member -NotePropertyName WindowsDir -NotePropertyValue $windowsDir -PassThru
+}
+
+Test-Case 'Manage-WindowsRunner.ps1 -Action Stop exits 1 and keeps maintenance when Task Scheduler recovery cannot be ruled out' {
+    foreach ($action in @('Stop'), @('Restart'), @('Maintenance')) {
+        $fixture = New-UnstoppableSchedulerFixture
+        $run = Invoke-EntryPoint $fixture 'Manage-WindowsRunner.ps1' (@('-Action') + $action + @('-Force'))
+        Assert ($run.ExitCode -eq 1) "-Action $action exited $($run.ExitCode) although a scheduler restart could undo the stop.`n$($run.Output)"
+        Assert ($run.Output -match 'The runner was not stopped; maintenance is kept' -and $run.Output -match 'could not be disabled to prevent that') "-Action $action did not report the reason.`n$($run.Output)"
+        $record = Get-MaintenanceState (Join-Path $fixture.WindowsDir 'maintenance.json')
+        Assert ($null -ne $record -and $record.phase -eq 'stop-failed' -and $record.failure -match 'could not be disabled to prevent that') "-Action ${action}: maintenance was not kept with the reason: $($record | ConvertTo-Json -Compress)"
+    }
+}
+
+Test-Case 'Stop-Runners.ps1 reports a Windows runner whose scheduler recovery cannot be ruled out as not stopped' {
+    $fixture = New-UnstoppableSchedulerFixture
+    $run = Invoke-EntryPoint $fixture 'Stop-Runners.ps1' @('-Force')
+    Assert ($run.ExitCode -eq 1) "Stop-Runners.ps1 exited $($run.ExitCode).`n$($run.Output)"
+    Assert ($run.Output -match 'Windows runner not stopped, maintenance kept: .*could not be disabled to prevent that') "The Windows failure was not reported.`n$($run.Output)"
+    Assert ((Get-MaintenanceState (Join-Path $fixture.WindowsDir 'maintenance.json')).phase -eq 'stop-failed') 'Maintenance was not kept.'
 }
 
 # The real supervisor script in a child process, against a stand-in runner: run.cmd starts a copy of ping.exe named

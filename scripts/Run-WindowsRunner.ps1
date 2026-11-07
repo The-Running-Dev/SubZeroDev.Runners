@@ -36,7 +36,7 @@ try {
     $status = @{ state = 'starting'; pid = $PID; startedUtc = [DateTime]::UtcNow.ToString('o'); restarts = 0; consecutiveQuickExits = 0; lastExitCode = $null; lastExitUtc = $null; nextRetryUtc = $null } + $recovery
     Write-SupervisorStatus @{}
     if ($recovery.consecutiveRecoveries -ge 2) {
-        Show-Notification 'SubZeroDev Windows runner supervisor keeps dying' "Restarted $($recovery.consecutiveRecoveries) times in a row; Task Scheduler gives up after $SupervisorRestartCount. $($recovery.lastRecoveryNote)" $SupervisorStatusFile
+        Show-Notification 'SubZeroDev Windows runner supervisor keeps dying' "Found dead and restarted $($recovery.consecutiveRecoveries) times in a row; the startup task is configured for $SupervisorRestartCount restarts. $($recovery.lastRecoveryNote)" $SupervisorStatusFile
     }
     $quickExits = 0
     while ($true) {

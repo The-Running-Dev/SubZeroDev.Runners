@@ -146,19 +146,33 @@ checks the record's runner id against the registration, restores any label that 
 at GitHub that all of them are back, and only then removes the file. If the identity does not match, or a label is still
 missing, the record stays and the report says so.
 
-**The Windows supervisor is restarted when it dies.** Besides restarting `run.cmd`, the task
-`\SubZeroDev.Runners\Start Windows runner` lets Task Scheduler relaunch a supervisor that exits with a failure: up to 5 times,
-1 minute apart. Both install paths use it: `Install-WindowsRunner.ps1` (Windows-only) registers it, and `Start-Runners.ps1`
-(combined) starts the supervisor through it (the `Start runners` sign-in task keeps its own 3 retries for the script as a
-whole). `Manage-WindowsRunner.ps1 -Action Start` and `Start-Runners.ps1` register or upgrade the task to that definition;
-if that fails the supervisor is started directly, marked unsupervised, and the failure is recorded. A task with another
-script or directory, or without the restarts, is reported by `Status`. The mutex still allows one supervisor per instance, a supervisor does not start
+**The Windows supervisor's startup task is configured to restart it, but that is not verified to work.** Besides restarting
+`run.cmd`, the task `\SubZeroDev.Runners\Start Windows runner` is registered with Task Scheduler's restart-on-failure
+(5 restarts, 1 minute apart). On the Windows 11 build tested, a throwaway task with that setting was **not** relaunched
+after its process was killed or exited non-zero (see the evidence table in `docs/windows-two-runners.md`), so do not rely on it:
+if `Status` shows the supervisor down without a stop, run `Manage-WindowsRunner.ps1 -Action Start`. Both install paths register
+the task: `Install-WindowsRunner.ps1` (Windows-only), and `Start-Runners.ps1` (combined, which starts the supervisor through it;
+the `Start runners` sign-in task keeps its own 3 retries for the script as a whole). `Manage-WindowsRunner.ps1 -Action Start`
+and `Start-Runners.ps1` register or upgrade the task to that definition; if that fails the supervisor is started directly,
+marked unsupervised, and the failure is recorded. A task with another script or directory, or without the restarts, is
+reported by `Status`.
+
+**Upgrading a running install.** `Start` reconciles the task even when the supervisor is already running: it updates the task
+(or enables it again), starts no second supervisor, and does not interrupt a job. A supervisor that started before the update is
+reported as *not confirmed protected* until it is restarted (`-Action Stop`, then `-Action Start`, when no job is running); a
+failed update is reported as `NOT protected` and recorded in `supervisor.json` (`recoveryFailure`).
+
+**A stop is only reported successful when Task Scheduler cannot undo it.** `Stop`, `Restart`, `Maintenance` and the registration
+changes of `Install-WindowsRunner.ps1` stop the task through Task Scheduler first. If the stop fails and the task is set to
+restart, the task is disabled; if that fails too, or the supervisor is already gone and a restart may be pending, the task is
+disabled and watched for 75 seconds (enabled again if nothing came back). Any case where a restart cannot be ruled out ends
+as a failed stop: exit 1, maintenance kept with the reason (phase `stop-failed`), labels not restored, and a registration
+change refused. Processes disappearing is not enough. The mutex still allows one supervisor per instance, a supervisor does not start
 `run.cmd` while `maintenance.json` exists, and it waits (state `waiting-for-orphan`) while a listener of that instance left
 by a dead supervisor is still running, rather than registering a second one. `supervisor.json` records each recovery
 (`recoveries`, `consecutiveRecoveries`, `lastRecoveryNote`), a registration that failed (`recoveryFailure`) and the point at
 which the restarts are used up (`retriesExhausted`); `Manage-WindowsRunner.ps1 -Action Status` prints them as `Recovery` and
-`Warning` rows and exits 1 while the supervisor is down without having been stopped. A clean exit (a duplicate supervisor)
-and a stop through Task Scheduler are not retried.
+`Warning` rows and exits 1 while the supervisor is down without having been stopped.
 
 ### BuildAgent builds
 

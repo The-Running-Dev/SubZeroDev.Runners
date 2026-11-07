@@ -107,7 +107,13 @@ $plan = Get-RegistrationPlan `
     -HasCredentials (Test-Path -LiteralPath (Join-Path $WindowsRunner '.credentials')) -Replace:$Replace
 foreach ($reason in $plan.Reasons) { Write-Output "Registration: $reason" }
 $beforeChange = {
-    if (-not (Get-SupervisorProcess) -and -not (Get-WindowsRunnerListeners)) { return }
+    if (-not (Get-SupervisorProcess) -and -not (Get-WindowsRunnerListeners)) {
+        # Nothing is running, but Task Scheduler may be about to restart a supervisor that just died: make sure it cannot
+        # (this is quick when nothing is pending), or leave the registration alone.
+        $stopped = Stop-WindowsRunnerProcesses
+        if (-not $stopped.Stopped) { throw "Registration not changed: Task Scheduler recovery of the supervisor could not be ruled out. $(@($stopped.Failures) -join ' ')" }
+        return
+    }
     if ($registration -and $plan.LinkedId) {
         # Wait for a running job rather than cancel it, and leave the registration alone if it outlasts the deadline.
         $stopped = Stop-WindowsRunner -Reason 'registration change'

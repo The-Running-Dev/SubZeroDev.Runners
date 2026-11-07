@@ -70,11 +70,17 @@ if ($Config.windows.instanceId) {
     $LogTrimTaskName += " ($($Config.windows.instanceId))"
 }
 
-# Supervisor recovery: Task Scheduler relaunches the supervisor's task when the supervisor dies (a result other than 0), at
-# most this many times and this far apart, then gives up; Get-WindowsRunnerState then reports it. A clean exit (0, the
+# Supervisor recovery: the supervisor's task is CONFIGURED to be relaunched by Task Scheduler when the supervisor dies (a result
+# other than 0), at most this many times and this far apart. That is a configuration, not a verified behaviour: on the host
+# where it was tried (Windows 11 build 26200, throwaway tasks, same settings) a killed or crashed process was never relaunched
+# within 3 minutes (docs/windows-two-runners.md has the evidence), so nothing here relies on it. A clean exit (0, the
 # duplicate-exclusion mutex was held) and a stop through Stop-ScheduledTask are not failures and are not retried.
 $SupervisorRestartCount = 5
 $SupervisorRestartInterval = New-TimeSpan -Minutes 1
+# After a supervisor died without a clean stop, a Task Scheduler retry may still be pending for this long (Task Scheduler does
+# not show a pending retry: the task just reads Ready). A stop that finds the supervisor already gone waits this long, with the
+# task disabled, to see whether anything brings it back.
+$SupervisorRecoveryWait = $SupervisorRestartInterval + (New-TimeSpan -Seconds 15)
 
 # $true when $Task runs this clone's supervisor, with the working directory and the bounded restart-on-failure.
 function Test-WindowsSupervisorTask($Task) {
@@ -116,9 +122,10 @@ function Get-SupervisorRecovery($Previous) {
         $recovery.consecutiveRecoveries++
         $recovery.lastRecoveryUtc = [DateTime]::UtcNow.ToString('o')
         $recovery.lastRecoveryNote = "The previous supervisor (pid $($Previous.pid), last state $($Previous.state)) ended without stopping."
-        # The restart that just happened was the last one Task Scheduler makes: if this supervisor dies too, nothing restarts it.
+        # The task is configured for $SupervisorRestartCount restarts: this was the last, so if this supervisor dies too, nothing is
+        # configured to restart it.
         if ($recovery.consecutiveRecoveries -ge $SupervisorRestartCount) {
-            $recovery.retriesExhausted = "$([DateTime]::UtcNow.ToString('o')): restart $($recovery.consecutiveRecoveries) of $SupervisorRestartCount was the last Task Scheduler makes; if this supervisor dies, start it with Manage-WindowsRunner.ps1 -Action Start."
+            $recovery.retriesExhausted = "$([DateTime]::UtcNow.ToString('o')): the supervisor has been found dead and restarted $($recovery.consecutiveRecoveries) times in a row; the startup task is configured for $SupervisorRestartCount restarts, so if this supervisor dies, start it with Manage-WindowsRunner.ps1 -Action Start."
         }
     }
     $recovery
