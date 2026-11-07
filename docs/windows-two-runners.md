@@ -43,6 +43,137 @@ Every instance also gets a `subzerodev-host-<computer>` label. Only the first tw
 `subzerodev-pair-<computer>` for the concurrent-job test; this works even on a host with more than two
 runners. The `subzerodev-windows-large` label is opt-in so ordinary VMs do not receive large-host jobs.
 
+## Registration scope and intended repositories
+
+There is no personal-account-wide runner pool. Repository registrations serve exactly one repository,
+including when several repositories have the same personal owner. Organization registrations share slots
+only across repositories owned by that organization and permitted by its runner group. Labels select
+eligible runners; they do not grant access across owners or repositories.
+
+For the current `The-Running-Dev` repositories, use repository scope without transferring anything.
+An organization pool is the reusable end state if the consuming repositories are deliberately moved to
+`AbsoluteZeroDev`; setting `-GitHubUrl` alone does not move them. Transfers need a separate review of
+package access, workflow owner checks, release identities, environments and trusted publishers.
+
+`-TargetRepositories OWNER/REPO[,OWNER/REPO...]` declares the consumers when invoking the bootstrap
+as a PowerShell scriptblock (pass an actual string array). Before configuring any instance, the worker
+checks every declared target is in the requested scope, reads current repository ownership, refuses
+archived/disabled/moved repositories, and verifies that Actions is enabled. Repository scope checks its
+own repository even when this option is omitted. Organization scope without an explicit list warns that
+repository eligibility has not been checked. API failures stop setup rather than implying eligibility.
+The returned `ScopeValidatedRepositories` field records these checks separately from instance evidence.
+
+These are **scope compatibility and Actions-enabled checks**, not proof of runner-group access or
+workflow routing. Group selected-repository/public-repository/workflow policies, `runs-on` labels,
+required toolchains and actual job results still need separate verification. The checks issue GETs only;
+the surrounding setup still authenticates, configures runners and may provision prerequisites as before.
+The current `gh` login flow requests classic `repo` for repository scope or `admin:org` for organization
+scope. Fine-grained tokens need repository Administration write for repository registration, or organization
+Self-hosted runners write for organization registration, plus repository Administration read on declared
+consumers to inspect Actions policy. A smoke workflow additionally needs repository Contents/Workflows
+write and Actions write; the interactive classic-token path requests `repo,workflow` for that operation.
+
+### Current workflow fit (inspected 2026-11-07)
+
+All seven inspected repositories are currently owned by `The-Running-Dev`. Existing workflows use
+GitHub-hosted runners; installing self-hosted runners does not change their routing.
+
+| Repository | Native Windows candidates | Keep elsewhere |
+| --- | --- | --- |
+| [FileManager](https://github.com/The-Running-Dev/SubZeroDev.FileManager/blob/main/.github/workflows/verify.yml) (private) | Ordinary `verify` job, after toolchain qualification | `msi-upgrade-acceptance.yml` explicitly requires disposable GitHub-hosted VMs |
+| [WindowManager](https://github.com/The-Running-Dev/SubZeroDev.WindowManager/blob/main/.github/workflows/ci.yml) (public) | Windows CI/build legs after qualification | Ubuntu leg; review release toolchain/signing requirements separately |
+| [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent/blob/main/.github/workflows/module-tests.yml) (public) | PowerShell module tests | Ubuntu image/build/docs/release jobs |
+| [MemoryKit](https://github.com/The-Running-Dev/SubZeroDev.MemoryKit/blob/main/.github/workflows/ci.yml) (public) | Windows Node 22.18/24 matrix legs | Ubuntu/PostgreSQL service jobs; [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) requires supported hosted runners |
+| [GameEngine](https://github.com/The-Running-Dev/SubZeroDev.GameEngine/blob/main/.github/workflows/ci.yml) (public) | No native Windows job in the inspected workflows | Ubuntu jobs and reusable workflow callers; inspect called templates before rerouting |
+| [Platform](https://github.com/The-Running-Dev/SubZeroDev.Platform/blob/main/.github/workflows/build.yml) (public) | No native Windows job in the inspected workflows | Ubuntu jobs and reusable workflow callers |
+| [Runners](https://github.com/The-Running-Dev/SubZeroDev.Runners/blob/main/.github/workflows/windows-runner-validation.yml) (public) | Windows regression suite after qualification | Keep hosted validation while qualifying new infrastructure |
+
+Public-repository pull requests can execute contributor code. Keep their hosted PR validation until a
+separate trusted-job/isolation policy is in place; runner labels and separate clones are not a security
+boundary. Also, ordinary Windows runners do not support Actions `services:` or job `container:` Linux
+execution; Docker Desktop/BuildAgent steps do not transparently convert Ubuntu workflows.
+
+### Executable setup without changing existing registrations
+
+On a **fresh x64 Windows machine/VM**, in normal Windows PowerShell, the existing bootstrap can
+install the FileManager pair. The guard below refuses existing `win01`/`win02` tasks; do not bypass it
+to repurpose an existing installation. `-SkipBuildAgent` installs native runners without the optional
+Docker/tool/updater integration. This is a setup command to run deliberately, not a read-only check.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$tasks = @(Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -ErrorAction SilentlyContinue |
+    Where-Object { $_.TaskName -in @('Start Windows runner (win01)', 'Start Windows runner (win02)') })
+if ($tasks.Count) { throw 'win01/win02 already exist. Inspect them; this command will not change their registration.' }
+if (Test-Path C:\Actions-FileManager) { throw 'Choose a fresh install directory; inspect existing installs first.' }
+& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) `
+    -Count 2 -InstallRoot C:\Actions-FileManager `
+    -GitHubUrl https://github.com/The-Running-Dev/SubZeroDev.FileManager `
+    -ExtraLabels subzerodev-windows-large -SkipBuildAgent
+```
+
+Repeat the bootstrap invocation (without the fresh-install guards) only for a deliberate rerun of that
+same install root and same `-GitHubUrl`. With this change available in the downloaded source, add
+`-TargetRepositories @('The-Running-Dev/SubZeroDev.FileManager')`; repository scope validates it
+automatically anyway. An organization setup instead supplies the actual **organization-owned** target list.
+
+To add other repository pairs on that same host after the bootstrap has installed PowerShell/Git/gh,
+use a **normal PowerShell 7** window and unique IDs. Multiple bootstrap roots would reuse `win01`/`win02`
+task names and mutexes; they are not independent. The lower-level installer supports distinct IDs:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$plan = @(
+    @{ Repository = 'The-Running-Dev/Docker-BuildAgent'; Ids = @('db01', 'db02') },
+    @{ Repository = 'The-Running-Dev/SubZeroDev.MemoryKit'; Ids = @('mk01', 'mk02') }
+)
+$root = 'C:\Actions-Additional'
+$source = (git -C C:\Actions-FileManager\_setup rev-parse HEAD)
+if ($LASTEXITCODE) { throw 'Cannot resolve the bootstrap source commit.' }
+# Validate the entire additive plan before installing anything. Existing clones/tasks are not adopted.
+foreach ($item in $plan) {
+    foreach ($id in $item.Ids) {
+        if (Test-Path (Join-Path $root $id)) { throw "Clone already exists for $id; inspect it first." }
+        if (Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -TaskName "Start Windows runner ($id)" -ErrorAction SilentlyContinue) { throw "Task already exists for $id." }
+    }
+}
+New-Item -ItemType Directory -Path $root -Force | Out-Null
+foreach ($item in $plan) {
+    foreach ($id in $item.Ids) {
+        $clone = Join-Path $root $id
+        git clone https://github.com/The-Running-Dev/SubZeroDev.Runners.git $clone
+        if ($LASTEXITCODE) { throw "Clone failed for $id." }
+        git -C $clone checkout --detach $source
+        if ($LASTEXITCODE) { throw "Source checkout failed for $id." }
+        & "$clone\scripts\Install-WindowsRunner.ps1" -InstanceId $id `
+            -GitHubUrl "https://github.com/$($item.Repository)" `
+            -ExtraLabels subzerodev-windows-large
+    }
+}
+```
+
+This adds four registrations, for six total including the FileManager pair; it does not share the two
+FileManager slots across repositories. It is an optional expansion, not something required to establish
+the first pair. Each pair has independent binaries, SDK/cache/workspace, tasks and credentials to maintain;
+all instances still compete for the same CPU/RAM/disk. A separate VM per repository can reuse the
+one-command bootstrap because task/mutex namespaces are then separate (use unique computer names).
+
+For a qualified Windows job, the proposed routing change is:
+
+```yaml
+runs-on: [self-hosted, Windows, X64, subzerodev-windows-large]
+```
+
+All labels must match. Keep this out of disposable-MSI and hosted-publishing jobs. Matrix jobs need
+an explicit Windows self-hosted label array while retaining their Linux entries. No workflow routing,
+registration, group policy or repository ownership is changed by documenting this proposal.
+
+The optional `-SmokeRepository` installs/dispatches a workflow and requires a private repository in
+the same registration scope: repository-scoped FileManager runners can smoke only in FileManager,
+not a different `RunnerSmoke` repository. A successful smoke checks both expected IDs and overlapping
+job intervals; an online registration alone does not prove that. Do not run the smoke option on an
+existing repository without authorizing that workflow write.
+
 ## BuildAgent provisioning and resuming setup
 
 After the runners are verified, setup provisions the host-level [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent)

@@ -13,6 +13,8 @@ param(
     [string] $InstallRoot = "$env:LOCALAPPDATA\SubZeroDev\Runners",
     [string] $GitHubUrl = 'https://github.com/AbsoluteZeroDev',
     [string[]] $ExtraLabels = @(),
+    # Repositories intended to consume these runners; checked before any instance is configured.
+    [string[]] $TargetRepositories = @(),
     [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,199}$')] [string] $SourceRef = 'main',
     [string] $SmokeRepository,
     [switch] $NonInteractive,
@@ -148,7 +150,7 @@ function Sync-SetupCheckout {
 }
 
 function Start-WindowsRunnerSetup {
-    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive, [bool] $SkipBuildAgent)
+    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string[]] $TargetRepositories, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive, [bool] $SkipBuildAgent)
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $false
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Use 64-bit PowerShell on x64 Windows 10/11 or a compatible Windows VM.' }
@@ -170,7 +172,7 @@ function Start-WindowsRunnerSetup {
     # This file contains options only. Credentials stay in gh's store or the inherited environment.
     $optionsPath = Join-Path ([IO.Path]::GetTempPath()) ("windows-runner-setup-" + [guid]::NewGuid().ToString('N') + '.json')
     try {
-        @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive; SkipBuildAgent = $SkipBuildAgent } |
+        @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); TargetRepositories = @($TargetRepositories); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive; SkipBuildAgent = $SkipBuildAgent } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $optionsPath -Encoding UTF8
         # The worker's exit 2 is not a failure: the runners are set up and the person has to act (it printed what).
         Invoke-SetupNative -File $tools.pwsh -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-OptionsPath', $optionsPath) -AllowExitCode 0, 2
@@ -180,4 +182,4 @@ function Start-WindowsRunnerSetup {
     }
 }
 
-exit ([int](Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive) -SkipBuildAgent ([bool]$SkipBuildAgent) | Select-Object -Last 1))
+exit ([int](Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -TargetRepositories $TargetRepositories -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive) -SkipBuildAgent ([bool]$SkipBuildAgent) | Select-Object -Last 1))
