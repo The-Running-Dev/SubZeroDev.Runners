@@ -112,8 +112,12 @@ $beforeChange = {
         # Wait for a running job rather than cancel it, and leave the registration alone if it outlasts the deadline.
         $stopped = Stop-WindowsRunner -Reason 'registration change'
         if ($stopped.Outcome -eq 'timeout') { throw "Registration not changed. $($stopped.Retained)" }
+        if ($stopped.Outcome -eq 'failed') { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
     }
-    else { Stop-WindowsRunnerProcesses }
+    else {
+        $stopped = Stop-WindowsRunnerProcesses
+        if (-not $stopped.Stopped) { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
+    }
 }
 $applied = Invoke-RunnerRegistration -Plan $plan -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Replace:$Replace -BeforeChange $beforeChange
 switch ($applied.Result) {
@@ -125,14 +129,8 @@ $problems = @(Confirm-RunnerRegistration -RunnerDirectory $WindowsRunner -Name $
 if ($problems) { throw "The registration does not match the configuration:`n - $($problems -join "`n - ")" }
 # Start at sign-in: the supervisor itself, not Start-Runners.ps1, which also needs Docker Desktop and the Linux container.
 if (-not $InstanceId) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName 'Start runners' -Confirm:$false -ErrorAction SilentlyContinue }
-$user = "$env:USERDOMAIN\$env:USERNAME"
-$action = New-ScheduledTaskAction -Execute $Pwsh -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Supervisor`"" -WorkingDirectory $WindowsRunner
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-$trigger.Delay = 'PT30S'
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-# The supervisor never exits on its own, so no time limit; it also holds a mutex against a second copy.
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the SubZeroDev Windows runner supervisor at sign-in.' -Force | Out-Null
+# The task is the supervisor's own process, so Task Scheduler restarts the supervisor if it dies (bounded; see Common.ps1).
+Register-WindowsSupervisorTask
 & (Join-Path $PSScriptRoot 'Register-LogTrimTask.ps1')
 
 if (-not (Get-SupervisorProcess)) { Start-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName }

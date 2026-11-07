@@ -73,10 +73,9 @@ function Get-BuildAgentInvocation {
     if ($Type -notin $BuildAgentTypes) {
         throw "'$Type' is not a build-agent build type. The types are: $($BuildAgentTypes -join ', '). A build-agent command that runs an arbitrary program does not exist, and a Windows executable cannot run in the Linux container."
     }
-    if ($Arguments.Count -gt 0 -and $Arguments[0] -notmatch '^--[A-Za-z]') { throw "Build arguments are --parameter value pairs after the build type; got '$($Arguments[0])'." }
-    foreach ($argument in $Arguments) {
-        if ($argument -match '(?i)\.(exe|cmd|bat|ps1)$') { throw "'$argument' is a Windows program. The build runs in a Linux container and cannot run it." }
-    }
+    # The arguments after the type belong to build-agent and reach it unchanged: its own syntax decides what is valid
+    # (--option value, and single-dash options such as node-template's -AppDir), and values such as paths or file names
+    # (build.ps1, tool.exe) are data to it, not programs this script would run.
     $environment = [ordered]@{
         BUILD_AGENT_IMAGE = $Settings.Image
         DOTNET_ROOT       = $Settings.RuntimeDirectory
@@ -118,14 +117,18 @@ function Invoke-BuildAgentInvocation([Parameter(Mandatory)] $Invocation) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
         [Environment]::SetEnvironmentVariable($name, $Invocation.Environment[$name], 'Process')
     }
-    Push-Location -LiteralPath $Invocation.WorkingDirectory
     try {
-        # Out-Host keeps the tool's output off the success stream, so the only value returned is the exit status.
-        & $Invocation.FilePath @($Invocation.Arguments) | Out-Host
-        $LASTEXITCODE
+        # Started as a process with an argument list, so every argument reaches the tool as one argument, exactly as given
+        # (spaces, quotes, empty values, a leading dash), whatever PowerShell's native-argument mode is. The tool shares this
+        # process's console and output streams; the only value returned is its exit status.
+        $info = [Diagnostics.ProcessStartInfo]::new($Invocation.FilePath)
+        $info.WorkingDirectory = $Invocation.WorkingDirectory
+        $info.UseShellExecute = $false
+        foreach ($argument in @($Invocation.Arguments)) { $info.ArgumentList.Add([string]$argument) }
+        $process = [Diagnostics.Process]::Start($info)
+        try { $process.WaitForExit(); $process.ExitCode } finally { $process.Dispose() }
     }
     finally {
-        Pop-Location
         foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
     }
 }

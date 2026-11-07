@@ -100,6 +100,7 @@ function Get-RunnerSetupEvidence {
     if ($Config.windows.instanceId -ne $InstanceId -or $registration.agentName -ne $Config.windows.name) { throw "Registration identity mismatch for $InstanceId." }
     $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $WindowsTaskName -ErrorAction Stop
     if ($task.Actions.Execute -ne $Pwsh -or -not $task.Actions.Arguments.Contains('"' + $Supervisor + '"') -or $task.Actions.WorkingDirectory -ne $WindowsRunner) { throw "Wrong startup action for $InstanceId." }
+    if (-not (Test-WindowsSupervisorTask $task)) { throw "The startup task for $InstanceId does not restart the supervisor on failure ($SupervisorRestartCount restarts, $([int]$SupervisorRestartInterval.TotalMinutes) minute apart)." }
     if ($task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Limited' -or $task.Settings.MultipleInstances -ne 'IgnoreNew' -or $task.Settings.ExecutionTimeLimit -ne 'PT0S') { throw "Unsafe startup task settings for $InstanceId." }
     if ($Config.logs.trimAt) {
         $trim = Get-ScheduledTask -TaskPath $TaskPath -TaskName $LogTrimTaskName -ErrorAction Stop

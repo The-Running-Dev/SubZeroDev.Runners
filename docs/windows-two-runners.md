@@ -115,6 +115,17 @@ Run these from the instance's clone as the runner's user (`Manage-WindowsRunner.
 The supervisor restarts a runner that exits, with a growing delay when it exits quickly (30 s, doubling to 10 min), shows one
 toast per failure streak and leaves the evidence in `supervisor.json` and the per-launch `_diag\Console_*-utc.log`.
 
+If the supervisor itself dies (killed, crashed), Task Scheduler relaunches the `Start Windows runner` task: up to 5 times,
+1 minute apart, then it gives up. The new supervisor keeps the one-per-instance mutex, does not start `run.cmd` while
+`maintenance.json` exists, and waits (`waiting-for-orphan`) while a listener left by the dead supervisor still runs, so one
+listener results. Each recovery, a failed task registration and the exhausted retries are recorded in `supervisor.json` and
+shown by `Status` (`Recovery` and `Warning` rows; exit 1 while the supervisor is down without having been stopped). A second
+recovery in a row raises a toast. `Start` registers or upgrades the task of an install made before this existed.
+
+A stop that fails (a process or container still running, or a state that cannot be read) exits 1, keeps maintenance with the
+reason and does not put the labels back; the original labels are saved in `maintenance.json` before they are withdrawn, so an
+interrupted drain can be undone by `Start`.
+
 **Drain, deadline and force.** `Stop`, `Restart` and `Maintenance` first withdraw the runner's custom labels at GitHub so it is
 offered no new job (admission control), then wait for the running job up to `lifecycle.drainTimeoutMinutes`
 (`-TimeoutMinutes` overrides). Idle is confirmed twice, a local worker-process check and GitHub's busy flag 2 s apart, to cover
@@ -134,7 +145,8 @@ withdrawing the labels fails, no stop is attempted. A workflow that targets only
 | Two instances, distinct identity and workspace | `Test-WindowsRunnerInstances.ps1`, `Test-RunnerIntegration.ps1` | Setup with `-SmokeRepository` on the host |
 | BuildAgent build | Invocation, mapping and refusal cases; no daemon | **Not collected**: a real build of the owner's project on Docker Desktop |
 | Concurrent jobs | Smoke evidence checker with synthetic results | `-SmokeRepository` run on the host |
-| Task-driven recovery (supervisor restart, scheduled task) | Backoff and state logic only | **Not collected** |
+| Supervisor recovery (kill the supervisor, one listener, maintenance holds) | `Test-LifecycleRecovery.ps1`: the real supervisor script in a child process against a stand-in listener, task definition and registration against a fake Task Scheduler | **Not collected**: Task Scheduler actually relaunching a killed supervisor on an installed task (the fixture does the relaunch itself) |
+| Failed stop keeps maintenance and exits 1 | `Test-LifecycleRecovery.ps1`: entry points in child processes with a fake `gh` and `docker` | **Not collected** against a real Docker daemon that refuses to stop a container |
 | Config change reaches the registration | Registration plan cases (name, target, work folder, labels) | **Not collected** against GitHub |
 | Active-job drain, timeout and force | Mocked GitHub and processes in `Test-RunnerIntegration.ps1` | **Not collected** with a live job |
 | Linux updater success, unhealthy restore, refusal | Command construction and exit-code mapping only | **Blocked**: needs a published `BuildAgent.Tool` containing Docker-BuildAgent PR #136 |

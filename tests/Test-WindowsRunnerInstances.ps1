@@ -55,6 +55,8 @@ function Invoke-Settings {
 }
 function Test-TaskPlan([string] $Clone) {
     . (Join-Path $Clone 'scripts\Common.ps1')
+    . (Join-Path $Clone 'scripts\Registration.ps1')
+    . (Join-Path $Clone 'scripts\Lifecycle.ps1')
     $InstanceId = $Config.windows.instanceId
     $Name = $Config.windows.name
     $taskCapture = @{ Records = [Collections.Generic.List[object]]::new(); Removed = [Collections.Generic.List[string]]::new(); Started = [Collections.Generic.List[string]]::new() }
@@ -77,6 +79,8 @@ function Test-TaskPlan([string] $Clone) {
     Assert ($startTask.Action.WorkingDirectory -eq $WindowsRunner) 'Startup working directory targets another clone.'
     Assert ($startTask.Trigger.Delay -eq 'PT30S' -and $startTask.Principal.LogonType -eq 'Interactive' -and $startTask.Principal.RunLevel -eq 'Limited') 'Sign-in principal or trigger changed.'
     Assert ($startTask.Settings.MultipleInstances -eq 'IgnoreNew' -and $startTask.Settings.ExecutionTimeLimit -eq 'PT0S') 'Supervisor task lifetime or duplicate policy changed.'
+    Assert ($startTask.Settings.RestartCount -eq 5 -and $startTask.Settings.RestartInterval -eq 'PT1M') 'The startup task does not restart a dead supervisor (5 restarts, 1 minute apart).'
+    Assert (Test-WindowsSupervisorTask ([pscustomobject]@{ Actions = @($startTask.Action); Settings = $startTask.Settings })) 'The registered task does not satisfy the supervisor-task check.'
     Assert ($trimTask.Action.Arguments.Contains((Join-Path $Clone 'scripts\Trim-RunnerLogs.ps1'))) 'Trim action targets another clone.'
     Assert ($taskCapture.Started.Count -eq 1 -and $taskCapture.Started[0] -eq $WindowsTaskName) 'Wrong startup task started.'
     if ($InstanceId) { Assert ($taskCapture.Removed.Count -eq 0) 'Named setup removed a legacy startup task.' }

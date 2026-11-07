@@ -63,8 +63,34 @@ try {
     Assert ($invocation.WorkingDirectory -eq $settings.Workspace) 'The build does not run in the per-instance workspace.'
     foreach ($type in 'docker', 'node', 'node-in-docker', 'node-template', 'forge') { Get-BuildAgentInvocation $settings $type | Out-Null }
     Assert-Throws { Get-BuildAgentInvocation $settings 'run' } 'not a build-agent build type' 'An invented build type was accepted.'
-    Assert-Throws { Get-BuildAgentInvocation $settings 'docker' @('--project', 'tool.exe') } 'Windows program' 'A Windows executable was accepted as a build argument.'
-    Assert-Throws { Get-BuildAgentInvocation $settings 'docker' @('Publish') } 'parameter value pairs' 'A bare build argument was accepted.'
+    # Arguments after the type belong to build-agent and reach it unchanged: single-dash options, values that end like a
+    # program or script, paths with spaces, bare values and empty values.
+    $verbatim = @(
+        , @('-AppDir', 'documentation')
+        , @('--target', 'Publish')
+        , @('--project', 'tool.exe')
+        , @('--script', 'build.ps1', '--shell', 'run.cmd', '--file', 'x.bat')
+        , @('-AppDir', 'C:\My Projects\site docs', '--output', 'out dir\a b.ps1')
+        , @('Publish')
+        , @('--name', '', '--label', 'say "hi"'))
+    foreach ($arguments in $verbatim) {
+        $built = Get-BuildAgentInvocation $settings 'node-template' $arguments
+        Assert (($built.Arguments | ConvertTo-Json -Compress) -eq ((@('build', 'node-template') + $arguments) | ConvertTo-Json -Compress)) "Arguments were changed or rejected: $($arguments -join ' | ') -> $($built.Arguments -join ' | ')"
+    }
+    Assert-Throws { Get-BuildAgentInvocation $settings 'node-template' @('-AppDir', 'documentation') | Out-Null; Get-BuildAgentInvocation $settings 'run' @('-AppDir', 'documentation') } 'not a build-agent build type' 'The build type is no longer validated.'
+    # Process level: each argument is exactly one argument of the tool, and the exit status is the tool's own.
+    $echo = Join-Path $temp 'echo-arguments.ps1'
+    Set-Content -LiteralPath $echo -Value '$args | ConvertTo-Json -AsArray -Compress | Set-Content -LiteralPath $env:ECHO_OUT; exit 7'
+    $received = Join-Path $temp 'received.json'
+    $env:ECHO_OUT = $received
+    try {
+        $sent = @('build', 'node-template', '-AppDir', 'C:\My Projects\site docs', '--script', 'build.ps1', '--project', 'tool.exe', '--name', 'say "hi"', 'Publish')
+        $fake = [pscustomobject]@{ FilePath = (Get-Process -Id $PID).Path; Arguments = @('-NoLogo', '-NoProfile', '-File', $echo) + $sent; WorkingDirectory = $temp; Environment = @{} }
+        $exitStatus = Invoke-BuildAgentInvocation $fake
+        Assert ($exitStatus -eq 7) "The tool's exit status was not returned unchanged (got $exitStatus)."
+        Assert ((Get-Content -Raw -LiteralPath $received | ConvertFrom-Json -NoEnumerate | ConvertTo-Json -Compress) -eq ($sent | ConvertTo-Json -Compress)) "The tool received different arguments: $(Get-Content -Raw -LiteralPath $received)"
+    }
+    finally { Remove-Item Env:\ECHO_OUT -ErrorAction SilentlyContinue }
     $withHost = $settings.PSObject.Copy(); $withHost.DockerHost = 'tcp://127.0.0.1:2375'
     Assert ((Get-BuildAgentInvocation $withHost 'docker').Environment.DOCKER_HOST -eq 'tcp://127.0.0.1:2375') 'A configured Docker host was not passed to the build.'
 
@@ -151,38 +177,7 @@ try {
     $plan = Get-TestPlan (New-LocalRegistration) (New-RemoteRunner 7 'win-a' @('self-hosted', 'Windows', 'subzerodev-windows', 'hand-added') @('subzerodev-windows', 'hand-added')) -Name 'win-b' -LocalRemote (New-RemoteRunner 7 'win-a' @('self-hosted', 'Windows', 'subzerodev-windows', 'hand-added') @('subzerodev-windows', 'hand-added'))
     Assert ($plan.PreserveLabels -contains 'hand-added' -and $plan.AllLabels -contains 'hand-added') 'A label added at GitHub was lost across a re-registration.'
 
-    # --- drain: admission control, deadline, force -----------------------------------------------------------------
-    $drainDirectory = Join-Path $temp 'drain'
-    New-Item -ItemType Directory -Path $drainDirectory | Out-Null
-    $state = Join-Path $drainDirectory 'maintenance.json'
-    $Config.lifecycle.pollSeconds = 1
-    $drain = $null
-    function Reset-Drain { $script:drain = @{ Closed = 0; Restored = @(); Busy = $false; CloseFails = $false }; Remove-Item -LiteralPath $state -ErrorAction SilentlyContinue }
-    function Close-RunnerAdmission { param($RunnerDirectory) $drain.Closed++; if ($drain.CloseFails) { throw 'gh is not authenticated' }; [pscustomobject]@{ RunnerId = 7; Scope = 'orgs/The-Running-Dev'; Labels = @('subzerodev-windows') } }
-    function Get-LocalRegistration { param($RunnerDirectory) [pscustomobject]@{ agentName = 'win-a'; agentId = 7; gitHubUrl = $url; workFolder = '_work' } }
-    function Get-GitHubRunner { param($Scope, $Name) [pscustomobject]@{ Id = 7; Name = $Name; Status = 'online'; Busy = $false; Labels = @('self-hosted'); CustomLabels = @() } }
-    function Get-GitHubRunnerState { param($RunnerDirectory) [pscustomobject]@{ Known = $true; Present = $true; Busy = $false } }
-    function Add-GitHubRunnerLabels { param($Scope, $Id, $Labels) $drain.Restored += $Labels }
-    Reset-Drain
-    $result = Enter-RunnerMaintenance -StateFile $state -RunnerDirectory $drainDirectory -IsBusy { $drain.Busy } -Reason 'test' -TimeoutMinutes 1
-    Assert ($result.Outcome -eq 'idle' -and $drain.Closed -eq 1) 'An idle runner was not drained after closing admission.'
-    $saved = Get-Content -Raw -LiteralPath $state | ConvertFrom-Json
-    Assert ($saved.phase -eq 'draining' -and $saved.savedLabels -contains 'subzerodev-windows') 'The withdrawn labels were not recorded before the wait.'
-    Assert (Exit-RunnerMaintenance $state $drainDirectory) 'Ending maintenance reported nothing to end.'
-    Assert ($drain.Restored -contains 'subzerodev-windows' -and -not (Test-Path -LiteralPath $state)) 'Ending maintenance did not restore the labels and remove the state file.'
-    Reset-Drain; $drain.Busy = $true
-    $result = Enter-RunnerMaintenance -StateFile $state -RunnerDirectory $drainDirectory -IsBusy { $drain.Busy } -Reason 'test' -TimeoutMinutes 0
-    Assert ($result.Outcome -eq 'timeout' -and $result.Retained -match 'Nothing was stopped') "A running job past the deadline did not keep the runner: $($result.Outcome)"
-    Assert ($drain.Restored -contains 'subzerodev-windows' -and -not (Test-Path -LiteralPath $state)) 'The labels were not restored after a drain timeout.'
-    Reset-Drain; $drain.Busy = $true
-    $result = Enter-RunnerMaintenance -StateFile $state -RunnerDirectory $drainDirectory -IsBusy { $drain.Busy } -Reason 'test' -TimeoutMinutes 5 -Force
-    Assert ($result.Outcome -eq 'forced') '-Force waited for the job.'
-    Exit-RunnerMaintenance $state $drainDirectory | Out-Null
-    Reset-Drain; $drain.CloseFails = $true
-    Assert-Throws { Enter-RunnerMaintenance -StateFile $state -RunnerDirectory $drainDirectory -IsBusy { $false } -TimeoutMinutes 1 } 'Could not close admission' 'A drain went ahead although admission could not be closed.'
-    $result = Enter-RunnerMaintenance -StateFile $state -RunnerDirectory $drainDirectory -IsBusy { $false } -TimeoutMinutes 1 -Force
-    Assert ($result.Outcome -eq 'forced' -and $result.Admission -match '^not closed') 'A forced stop did not report that admission stayed open.'
-    Remove-Item -LiteralPath $state -ErrorAction SilentlyContinue
+    # Drain, stop and recovery-record behavior is covered by tests\Test-LifecycleRecovery.ps1 (a fake GitHub, Docker and process table).
 
     # --- housekeeping never touches registrations or credentials ---------------------------------------------------
     foreach ($protected in '.runner', '.credentials', '.credentials_rsaparams', 'win01\_recovery\20250101\.runner', 'maintenance.json', 'runners.local.json') {

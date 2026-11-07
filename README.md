@@ -106,7 +106,7 @@ setup options. See [the Windows runbook](docs/windows-two-runners.md) for detail
 | `Set-DropboxIgnored.ps1` | Marks everything matched by `dropbox-ignore.txt` with `com.dropbox.ignored`. Idempotent |
 | `Trim-RunnerLogs.ps1` | Bounded housekeeping, each part independent: `_diag` files older than `logs.retentionDays` and beyond `logs.maxMB` (the newest Runner/Worker/Console log of each runner is kept), per-instance BuildAgent caches older than `buildAgent.cache.retentionDays` or beyond `buildAgent.cache.maxGB`, and a warning when a drive falls below `housekeeping.minFreeGB`. Never touches registration files or credentials; a locked file is retried a bounded number of times, then reported |
 | `Register-LogTrimTask.ps1` | Schedules the trim daily at `logs.trimAt` as `\SubZeroDev.Runners\Trim logs`. `trimAt: null` removes it |
-| `Run-WindowsRunner.ps1` | The supervisor: one supervisor per named Windows instance (mutex; unnamed installations keep the original mutex), writes `supervisor.pid`, relaunches `run.cmd` after it exits with a delay that doubles for each quick exit in a row (`lifecycle.restartDelaySeconds` up to `backoffMaxSeconds`), records state, restart count, last exit code and next retry in `supervisor.json`, idles while `maintenance.json` exists, one `_diag\Console_*-utc.log` per launch, and a toast after `lifecycle.quickExitLimit` quick exits in a row. Exports `SZR_SCRIPTS` (the scripts folder) to jobs |
+| `Run-WindowsRunner.ps1` | The supervisor: one supervisor per named Windows instance (mutex; unnamed installations keep the original mutex), writes `supervisor.pid`, relaunches `run.cmd` after it exits with a delay that doubles for each quick exit in a row (`lifecycle.restartDelaySeconds` up to `backoffMaxSeconds`), records state, restart count, last exit code and next retry in `supervisor.json`, idles while `maintenance.json` exists, waits for a listener left by a dead supervisor instead of starting a second, records its own recoveries, one `_diag\Console_*-utc.log` per launch, and a toast after `lifecycle.quickExitLimit` quick exits in a row. Exports `SZR_SCRIPTS` (the scripts folder) to jobs |
 | `Show-Notification.ps1` | Windows toast (runs under Windows PowerShell 5.1, which has WinRT); used by the two above |
 | `Clear-WindowsActionCache.ps1`, `Clear-LinuxWorkspace.sh` | Job-completed hooks: clear downloaded actions (and Linux checkouts) with a bounded number of retries (`housekeeping.retries`); on Linux also the job's leftover containers, networks and anonymous volumes. NuGet caches, images and build cache stay. They never touch registration or credential files |
 
@@ -128,6 +128,37 @@ withdrawn at GitHub so no new job is assigned, the script checks twice (local wo
 restored and nothing is stopped; the report lists what was kept. `-Force` skips the wait, cancels the job and reports the
 state it left behind. A workflow that targets **only** GitHub's default labels (`self-hosted`, `Windows`/`Linux`, `X64`) is
 not held back by a drain; the workflows for these runners use the `subzerodev-*` labels.
+
+**A stop that fails is a failure.** After the stop the scripts check what is left (the Windows supervisor, listener and
+worker processes; each container's state through `docker container inspect`). A stop command that returns an error, a
+container or process that is still running, or a state that cannot be read (Docker or the process table unavailable) is
+reported as `failed`, never as stopped: `Stop-Runners.ps1`, `Manage-WindowsRunner.ps1` and `Register-Runners.ps1` exit 1,
+maintenance stays on with `phase: stop-failed` and the reason, the labels are **not** put back, and `Register-Runners.ps1`
+does not touch the registration of a runner that did not stop. A container that is already stopped or absent is a
+successful stop. End the maintenance deliberately with `Manage-WindowsRunner.ps1 -Action Start` (Windows) or by rerunning the
+script once the cause is fixed.
+
+**The labels are recorded before they are withdrawn.** `maintenance.json` (in each runner's directory, written atomically)
+holds the runner's id, name, scope and its original custom labels, and a `phase` (`closing`, `draining`, `stop-failed`,
+`held`). It is written before the first label is deleted and kept whenever the deletion or the check afterwards is uncertain,
+so a script that was interrupted after the labels were withdrawn can restore them from the record. Ending maintenance
+checks the record's runner id against the registration, restores any label that is missing (a repeat is harmless), confirms
+at GitHub that all of them are back, and only then removes the file. If the identity does not match, or a label is still
+missing, the record stays and the report says so.
+
+**The Windows supervisor is restarted when it dies.** Besides restarting `run.cmd`, the task
+`\SubZeroDev.Runners\Start Windows runner` lets Task Scheduler relaunch a supervisor that exits with a failure: up to 5 times,
+1 minute apart. Both install paths use it: `Install-WindowsRunner.ps1` (Windows-only) registers it, and `Start-Runners.ps1`
+(combined) starts the supervisor through it (the `Start runners` sign-in task keeps its own 3 retries for the script as a
+whole). `Manage-WindowsRunner.ps1 -Action Start` and `Start-Runners.ps1` register or upgrade the task to that definition;
+if that fails the supervisor is started directly, marked unsupervised, and the failure is recorded. A task with another
+script or directory, or without the restarts, is reported by `Status`. The mutex still allows one supervisor per instance, a supervisor does not start
+`run.cmd` while `maintenance.json` exists, and it waits (state `waiting-for-orphan`) while a listener of that instance left
+by a dead supervisor is still running, rather than registering a second one. `supervisor.json` records each recovery
+(`recoveries`, `consecutiveRecoveries`, `lastRecoveryNote`), a registration that failed (`recoveryFailure`) and the point at
+which the restarts are used up (`retriesExhausted`); `Manage-WindowsRunner.ps1 -Action Status` prints them as `Recovery` and
+`Warning` rows and exits 1 while the supervisor is down without having been stopped. A clean exit (a duplicate supervisor)
+and a stop through Task Scheduler are not retried.
 
 ### BuildAgent builds
 

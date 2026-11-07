@@ -27,6 +27,7 @@ function Write-Outcome($Result) {
         'idle' { Write-Output 'Drained: no job was running; stopped.' }
         'forced' { Write-Output "Stopped without draining. $($Result.Cancelled)".Trim() }
         'timeout' { Write-Output $Result.Retained }
+        'failed' { [Console]::Error.WriteLine("The runner was not stopped; maintenance is kept (admission stays closed) so nothing restarts it. $(@($Result.Failures) -join ' ') Fix the cause and rerun, or end maintenance with: Manage-WindowsRunner.ps1 -Action Start") }
     }
     if ($Result.Admission -and $Result.Admission -ne 'closed') { Write-Warning "Admission: $($Result.Admission)" }
 }
@@ -37,6 +38,8 @@ switch ($Action) {
         if ($Json) { $state | ConvertTo-Json -Depth 6 }
         else {
             $detail = $state.SupervisorDetail
+            $recovery = $state.SupervisorRecovery
+            $warnings = 0
             $rows = [ordered]@{
                 Instance    = $state.Instance
                 Supervisor  = "$($state.Supervisor)$(if ($state.SupervisorState) { ", $($state.SupervisorState)" })"
@@ -46,7 +49,9 @@ switch ($Action) {
                 Maintenance = if ($state.Maintenance) { "$($state.Maintenance.phase) since $($state.Maintenance.sinceUtc) ($($state.Maintenance.reason))" } else { 'off' }
                 StartupTask = $state.StartupTask
                 LastExit    = if ($detail -and $null -ne $detail.lastExitCode) { "code $($detail.lastExitCode) at $($detail.lastExitUtc); $($detail.consecutiveQuickExits) quick exits; next retry $($detail.nextRetryUtc)" } else { 'none' }
+                Recovery    = if ($recovery.Recoveries) { "supervisor restarted $($recovery.Recoveries) times ($($recovery.ConsecutiveRecoveries) in a row), last at $($recovery.LastRecoveryUtc)" } else { 'supervisor never needed recovery' }
             }
+            foreach ($line in $recovery.Summary) { $rows["Warning$((++$warnings))"] = $line }
             $rows.GetEnumerator() | ForEach-Object { '{0,-12} {1}' -f $_.Key, $_.Value }
         }
         exit [int](-not $state.Healthy)
@@ -55,18 +60,18 @@ switch ($Action) {
     'Stop' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop'
         Write-Outcome $result
-        exit [int]($result.Outcome -eq 'timeout')
+        exit [int]($result.Outcome -in 'timeout', 'failed')
     }
     'Restart' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'restart'
         Write-Outcome $result
-        if ($result.Outcome -eq 'timeout') { exit 1 }
+        if ($result.Outcome -in 'timeout', 'failed') { exit 1 }
         Write-Output (Start-WindowsRunner)
     }
     'Maintenance' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Hold -Reason 'maintenance'
         Write-Outcome $result
-        if ($result.Outcome -eq 'timeout') { exit 1 }
+        if ($result.Outcome -in 'timeout', 'failed') { exit 1 }
         Write-Output 'Held in maintenance: the runner stays stopped, including after sign-in, until: Manage-WindowsRunner.ps1 -Action Start'
     }
 }

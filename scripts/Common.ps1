@@ -70,6 +70,60 @@ if ($Config.windows.instanceId) {
     $LogTrimTaskName += " ($($Config.windows.instanceId))"
 }
 
+# Supervisor recovery: Task Scheduler relaunches the supervisor's task when the supervisor dies (a result other than 0), at
+# most this many times and this far apart, then gives up; Get-WindowsRunnerState then reports it. A clean exit (0, the
+# duplicate-exclusion mutex was held) and a stop through Stop-ScheduledTask are not failures and are not retried.
+$SupervisorRestartCount = 5
+$SupervisorRestartInterval = New-TimeSpan -Minutes 1
+
+# $true when $Task runs this clone's supervisor, with the working directory and the bounded restart-on-failure.
+function Test-WindowsSupervisorTask($Task) {
+    $action = @($Task.Actions)[0]
+    $settings = $Task.Settings
+    [bool]($action -and $action.Execute -eq $Pwsh -and "$($action.Arguments)".Contains('"' + $Supervisor + '"') -and $action.WorkingDirectory -eq $WindowsRunner -and
+        $settings.RestartCount -eq $SupervisorRestartCount -and $settings.RestartInterval -and [Xml.XmlConvert]::ToTimeSpan("$($settings.RestartInterval)") -eq $SupervisorRestartInterval)
+}
+
+# supervisor.json as an object; $null when it is absent or unreadable.
+function Get-SupervisorStatus {
+    if (-not (Test-Path -LiteralPath $SupervisorStatusFile)) { return }
+    try { Get-Content -Raw -LiteralPath $SupervisorStatusFile | ConvertFrom-Json } catch { }
+}
+
+# Merges $Values into supervisor.json (whoever writes it: the supervisor, a stop, a start that could not register its task).
+function Set-SupervisorStatusValues([hashtable] $Values) {
+    $merged = [ordered]@{}
+    $current = Get-SupervisorStatus
+    if ($current) { foreach ($property in $current.PSObject.Properties) { $merged[$property.Name] = $property.Value } }
+    foreach ($key in $Values.Keys) { $merged[$key] = $Values[$key] }
+    $merged['updatedUtc'] = [DateTime]::UtcNow.ToString('o')
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($SupervisorStatusFile)) | Out-Null
+    $merged | ConvertTo-Json | Set-Content -LiteralPath $SupervisorStatusFile
+}
+
+# What a starting supervisor concludes from the status its predecessor left. A predecessor stopped on purpose is marked
+# 'stopped' (by itself, or by Stop-WindowsRunnerProcesses after killing it); any other state means it died without cleaning up,
+# which is a recovery. consecutiveRecoveries is reset by the supervisor once a run lasts past the quick-exit threshold.
+function Get-SupervisorRecovery($Previous) {
+    $count = { param($value) if ($null -ne $value) { [int]$value } else { 0 } }
+    $recovery = @{
+        recoveries = (& $count $Previous.recoveries); consecutiveRecoveries = (& $count $Previous.consecutiveRecoveries)
+        lastRecoveryUtc = $Previous.lastRecoveryUtc; lastRecoveryNote = $Previous.lastRecoveryNote; recoveryFailure = $Previous.recoveryFailure
+        retriesExhausted = $Previous.retriesExhausted
+    }
+    if ($Previous -and $Previous.state -and $Previous.state -ne 'stopped') {
+        $recovery.recoveries++
+        $recovery.consecutiveRecoveries++
+        $recovery.lastRecoveryUtc = [DateTime]::UtcNow.ToString('o')
+        $recovery.lastRecoveryNote = "The previous supervisor (pid $($Previous.pid), last state $($Previous.state)) ended without stopping."
+        # The restart that just happened was the last one Task Scheduler makes: if this supervisor dies too, nothing restarts it.
+        if ($recovery.consecutiveRecoveries -ge $SupervisorRestartCount) {
+            $recovery.retriesExhausted = "$([DateTime]::UtcNow.ToString('o')): restart $($recovery.consecutiveRecoveries) of $SupervisorRestartCount was the last Task Scheduler makes; if this supervisor dies, start it with Manage-WindowsRunner.ps1 -Action Start."
+        }
+    }
+    $recovery
+}
+
 # The running supervisor, found through the pid file it writes. A pid that now belongs to
 # another process (stale file after a hard kill) is ignored and the file removed.
 function Get-SupervisorProcess {
@@ -83,6 +137,12 @@ function Get-SupervisorProcess {
 # Runner.Worker processes of this instance. Matched by directory boundary, so instance win1 never claims win10's worker.
 function Get-WindowsRunnerWorkers {
     @(Get-CimInstance Win32_Process -Filter "Name='Runner.Worker.exe'" | Where-Object { $_.ExecutablePath -and (Test-PathUnder $_.ExecutablePath $WindowsRunner) })
+}
+
+# Runner.Listener processes of this instance (same directory-boundary match as the workers). Besides the lifecycle code, the
+# supervisor asks before it launches one: a listener left behind by a supervisor that died must not get a second one beside it.
+function Get-WindowsRunnerListeners {
+    @(Get-CimInstance Win32_Process -Filter "Name='Runner.Listener.exe'" | Where-Object { $_.ExecutablePath -and (Test-PathUnder $_.ExecutablePath $WindowsRunner) })
 }
 
 # True while the Windows runner is executing a job (its Runner.Worker exists).
