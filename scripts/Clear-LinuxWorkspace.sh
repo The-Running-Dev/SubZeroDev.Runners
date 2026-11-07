@@ -17,16 +17,20 @@ if docker info >/dev/null 2>&1; then
   docker volume prune -f >/dev/null
 fi
 shopt -s nullglob
+# Bounded: RUNNER_CLEANUP_RETRIES attempts, RUNNER_CLEANUP_DELAY seconds apart (runners.json housekeeping), 20 and 1 by default.
+retries="${RUNNER_CLEANUP_RETRIES:-20}"
+delay="${RUNNER_CLEANUP_DELAY:-1}"
+case "$retries" in ''|*[!0-9]*|0) retries=20 ;; esac
 for target in "$work/_actions" "$work"/[!_]*; do
-  for attempt in $(seq 1 60); do
+  for attempt in $(seq 1 "$retries"); do
     if rm -rf -- "$target" 2>/dev/null; then
       break
     fi
-    if [ "$attempt" -eq 60 ]; then
-      echo "Could not clean $target after 60 attempts." >&2
+    if [ "$attempt" -eq "$retries" ]; then
+      echo "Could not clean $target after $retries attempts." >&2
       exit 1
     fi
-    sleep 1
+    sleep "$delay"
   done
 done
 echo 'Workspace and action cache are ready for the next job.'

@@ -2,13 +2,65 @@
 # The registration in linux\runner survives; only the container's own disposable filesystem is replaced.
 # With linux.docker.mode 'sidecar' it also (re)creates the docker:dind container that jobs use as their Docker daemon;
 # with 'dind' it removes that container and runs the runner privileged, with its own daemon.
-param([switch] $Build)
+#
+# The running container is replaced only after the runner has been drained: it stops taking jobs (its custom labels are
+# withdrawn at GitHub), the script waits up to -TimeoutMinutes for a running job to finish, replaces the container, and
+# restores the labels. A job that outlasts the deadline is not cancelled: nothing is replaced and the report says so.
+# -Force replaces at once and cancels whatever is running.
+#
+# -Update hands the replacement of the runner container to BuildAgent's updater (`build-agent update`: lock, update record,
+# health wait, restore of the original container). It is blocked until a published BuildAgent.Tool containing
+# Docker-BuildAgent PR #136 is configured (buildAgent.updater.version), because without it the updater refuses this runner.
+# The updater restores the container, not what the replacement wrote to the mounted /runner (binaries, credentials) or
+# volumes; the runner's own mounted self-update is unchanged. The Docker sidecar has no health check, so it is always
+# replaced by this script, never by the updater.
+# Exit code 0: done. 1: blocked, kept (running job), or failed.
+param([switch] $Build, [switch] $Update, [int] $TimeoutMinutes, [switch] $Force)
 . "$PSScriptRoot\Common.ps1"
+. "$PSScriptRoot\RunnerArchive.ps1"
+. "$PSScriptRoot\BuildAgent.ps1"
+. "$PSScriptRoot\Registration.ps1"
+. "$PSScriptRoot\Lifecycle.ps1"
+if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
 $linux = $Config.linux
 $sidecar = $linux.docker
+if ($Update) {
+    $settings = Get-BuildAgentSettings $Config
+    $updater = Test-BuildAgentUpdater $settings
+    if (-not $updater.Available) {
+        [Console]::Error.WriteLine($updater.Reason + ' To replace the container now without the updater, run this script without -Update (it drains the runner first).')
+        exit 1
+    }
+}
 if ($Build) {
-    & $Docker build --pull --build-arg "BASE_IMAGE=$($linux.baseImage)" -f (Join-Path $Root 'linux\Dockerfile') -t $linux.image $Root
+    # One runner version for both platforms (runners.json runnerVersion), downloaded and checked against the SHA-256 GitHub
+    # publishes; the Dockerfile checks it again and fails when either build argument is missing.
+    $archive = Get-RunnerArchive -Platform linux-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $Root 'downloads') | Select-Object -Last 1
+    & $Docker build --pull --build-arg "BASE_IMAGE=$($linux.baseImage)" --build-arg "RUNNER_VERSION=$($Config.runnerVersion)" --build-arg "RUNNER_SHA256=$($archive.Sha256)" -f (Join-Path $Root 'linux\Dockerfile') -t $linux.image $Root
     if ($LASTEXITCODE) { throw 'Image build failed.' }
+}
+$registered = Test-Path -LiteralPath (Join-Path $LinuxRunner '.runner')
+$maintenanceFile = Get-LinuxMaintenanceFile
+if ($registered) {
+    $drain = Enter-RunnerMaintenance -StateFile $maintenanceFile -RunnerDirectory $LinuxRunner -IsBusy { Test-LinuxRunnerBusy } -Reason 'replace' -TimeoutMinutes $TimeoutMinutes -Force:$Force
+    if ($drain.Outcome -eq 'timeout') {
+        $built = if ($Build) { " The new image $($linux.image) is built; rerun this script to replace the container." }
+        [Console]::Error.WriteLine("Runner container kept. $($drain.Retained)$built")
+        exit 1
+    }
+    if ($drain.Outcome -eq 'forced' -and (Test-LinuxRunnerBusy)) { Write-Warning 'A running job is cancelled by this replacement (-Force).' }
+}
+if ($Update) {
+    # The updater replaces only the runner container, after the drain; the sidecar and its volumes are untouched.
+    $invocation = Get-BuildAgentUpdateInvocation $settings $linux.container $linux.image $Config.buildAgent.updater.healthTimeout
+    $timeoutSeconds = 600 + [int]($Config.buildAgent.updater.healthTimeout -replace '[^0-9]', '')
+    $run = Invoke-BoundedNative $invocation.FilePath $invocation.Arguments $timeoutSeconds $invocation.Environment
+    if ($run.Output) { Write-Output $run.Output }
+    if ($registered) { Exit-RunnerMaintenance $maintenanceFile $LinuxRunner | Out-Null }
+    $meaning = Get-BuildAgentUpdateExitMeaning $run.ExitCode
+    if ($run.ExitCode) { [Console]::Error.WriteLine($meaning); exit 1 }
+    Write-Output $meaning
+    exit 0
 }
 # The work folder lives in the registration, so keep it in step with runners.json.
 $registration = Join-Path $LinuxRunner '.runner'
@@ -75,9 +127,16 @@ elseif ($sidecar -and $sidecar.mode -eq 'dind') {
 & $Docker run -d --name $linux.container --restart unless-stopped --cpus $linux.cpus --memory $linux.memory `
     -e RUNNER_WORK_FOLDER=$($linux.workFolder) `
     -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/runner-hooks/Clear-LinuxWorkspace.sh `
+    -e RUNNER_CLEANUP_RETRIES=$($Config.housekeeping.retries) `
+    -e RUNNER_CLEANUP_DELAY=$($Config.housekeeping.retryDelaySeconds) `
     --mount "type=bind,source=$LinuxRunner,target=/runner" `
     --mount "type=volume,source=$($linux.cacheVolume),target=/cache" `
     --mount "type=bind,source=$PSScriptRoot,target=/runner-hooks,readonly" `
     @dockerArgs `
     $linux.image
-if ($LASTEXITCODE) { throw 'Container start failed.' }
+if ($LASTEXITCODE) {
+    # The old container is gone; the runner stays out of rotation (maintenance kept) until a start succeeds.
+    [Console]::Error.WriteLine('Container start failed. The runner stays in maintenance (labels withdrawn); fix the cause and rerun this script.')
+    exit 1
+}
+if ($registered) { Exit-RunnerMaintenance $maintenanceFile $LinuxRunner | Out-Null }

@@ -15,8 +15,19 @@ GitHub URL they are registered to comes from `runners.local.json`, which git ign
 { "github": { "url": "https://github.com/<owner>/<repo>" } }
 ```
 
-Any other setting placed there overrides `runners.json` on this machine only. Each runner gets `github.labels` plus its own
+Any other setting placed there overrides `runners.json` on this machine only (merged key by key, so a partial override
+keeps every other value). Every host script, hook and the supervisor read the merged result through one loader
+(`scripts\RunnerConfig.ps1`), which rejects an invalid file with every problem listed: floating image tags (`:latest`, tags
+without a digest), a floating tool version, `buildAgent.paths.extraMounts` other than empty, an output directory outside the
+workspace, a non-numeric `lifecycle`/`housekeeping` value. Each runner gets `github.labels` plus its own
 (`windows.labels`, `linux.labels`) and GitHub's defaults (`self-hosted`, the OS, `X64`).
+
+| Key | Controls |
+| --- | --- |
+| `runnerVersion` | The one Actions runner version for Windows and Linux. Archives are downloaded from the release and checked against its published SHA-256 (`scripts\RunnerArchive.ps1`); the Linux image build receives the same version and hash |
+| `buildAgent` | The pinned `BuildAgent.Tool` (`tool.version`, installed once per host in `tool.directory`), the net8.0 runtime it runs on (`dotnetRuntime`), the image by digest (`image`, passed to every build as `BUILD_AGENT_IMAGE`), the Docker connection (`docker.host`, `null` = Docker Desktop's default), per-instance build workspaces (`paths`), cache retention (`cache`) and the optional updater (`updater.version`, see below) |
+| `lifecycle` | Drain deadline, supervisor restart delay, backoff and the quick-exit threshold |
+| `logs`, `housekeeping` | Log age and size caps, the daily trim time, cleanup retries, the free-disk warning level |
 
 Each runner takes one job at a time, so one Windows and one Linux job can run together.
 Neither needs inbound ports.
@@ -34,6 +45,14 @@ opens GitHub authorization if necessary, and installs **two** independent runner
 `%LOCALAPPDATA%\SubZeroDev\Runners`. It verifies local tasks, supervisor processes, private .NET 10 SDKs,
 GitHub registration IDs, online state and labels before reporting success. Approve any Windows
 package-installer elevation prompts and the first GitHub sign-in; the runners remain unelevated.
+
+After the runners are verified it provisions the [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent)
+integration once for the host: Docker Desktop (installed with WinGet if missing, switched to Linux containers, waited
+until the daemon answers), the net8.0 runtime, the pinned `BuildAgent.Tool` and the pinned image. `-SkipBuildAgent`
+leaves it out. Exit codes: **0** done; **1** the BuildAgent part failed (the runners are still set up and running);
+**2** you have to act first (restart Windows, sign out and in, finish Docker Desktop's first run, join `docker-users`).
+The steps are printed and saved in `<InstallRoot>\setup-state.json`; do them and run the same command again, finished
+steps are skipped. Setup never restarts Windows, signs you out or enables automatic sign-in.
 
 For automatic real parallel-job validation too:
 
@@ -57,6 +76,9 @@ setup options. See [the Windows runbook](docs/windows-two-runners.md) for detail
 | --- | --- |
 | `runners.json`, `runners.local.json` | Settings every script reads (the second is git-ignored and wins): GitHub labels and URL, runner names and folders, container, base image, image, cache volume, work folders (`windows.workFolder` may be absolute and use `%TEMP%`-style variables), Docker daemon for Linux jobs (`linux.docker`, see below), CPU/RAM limits, startup mode, log retention |
 | `scripts\` | Host scripts and the job-completed hooks (mounted read-only at `/runner-hooks` in the container) |
+| `%LOCALAPPDATA%\SubZeroDev\BuildAgent\` | Host-level, shared by all instances: `tool\` (BuildAgent.Tool), `dotnet\` (net8.0 runtime), `workspaces\<instance>\` (one build workspace per instance, with its `artifacts` and `.cache` inside) |
+| `<InstallRoot>\setup-state.json` | What the last setup run finished and what is waiting for you (restart, sign-out, Docker Desktop) |
+| `linux\healthcheck.sh` | The Linux runner image's `HEALTHCHECK`: the runner listener is alive and, in `dind` mode, the daemon answers. What the updater judges a replacement by |
 | `windows\` | Windows runner: registration, binaries, private .NET SDK (`_tool\dotnet`), NuGet cache, `_work` (unless `windows.workFolder` points elsewhere), `_diag` logs (runner, console and `Startup_*` logs), `supervisor.pid` |
 | `linux\Dockerfile`, `linux\entrypoint.sh` | Linux image: `linux.baseImage` (Docker-BuildAgent pinned by digest; bump it in `runners.json`, then `New-LinuxRunner.ps1 -Build`) plus the Actions runner. Jobs run as root, like the base |
 | `linux\runner\` | Linux runner, mounted at `/runner`: registration, binaries, `_diag` logs. Checkouts use `/tmp/runner-work` inside the container |
@@ -72,25 +94,74 @@ setup options. See [the Windows runbook](docs/windows-two-runners.md) for detail
 | Script | Does |
 | --- | --- |
 | `Start-Runners.ps1` | Reapplies ignore rules, trims logs, starts the Windows supervisor if `supervisor.pid` names none, starts Docker Desktop if needed, then the Docker sidecar (in sidecar mode) and the Linux container. Logs to `windows\_diag\Startup_*-utc.log`; on failure shows a toast that opens that log |
-| `Stop-Runners.ps1 [-Drain] [-TimeoutMinutes 120]` | Kills the Windows supervisor (from `supervisor.pid`) and its runner, stops the Linux container, then the sidecar (in sidecar mode). `-Drain` first waits for running jobs to finish and stops nothing if one is still running at the timeout. Registrations stay |
-| `Register-Runners.ps1` | Drains and stops both runners, removes their current registrations, registers them under `github.url` with the names and labels from `runners.json`, starts them. Needs `gh` signed in as an admin |
+| `Stop-Runners.ps1 [-TimeoutMinutes] [-Force]` | Drains, then stops the Windows runner, the Linux container and the sidecar. Draining withdraws each runner's custom labels at GitHub (no new job is assigned), waits up to `lifecycle.drainTimeoutMinutes` (or `-TimeoutMinutes`) for the running job, restores the labels afterwards. A job that outlasts the deadline is **not** cancelled: that runner keeps running and the report names it (exit 1). `-Force` stops at once and cancels the running job. Registrations stay |
+| `Manage-WindowsRunner.ps1 -Action Status\|Start\|Stop\|Restart\|Maintenance [-TimeoutMinutes] [-Force] [-Json]` | One Windows instance, from its clone (also for Windows-only installs). `Status` prints supervisor, listener, job and GitHub state and exits non-zero unless all are healthy. `Stop`/`Restart` drain like `Stop-Runners.ps1`. `Maintenance` drains and stops and keeps the supervisor idle (`maintenance.json`) until `Start` |
+| `Register-Runners.ps1` | Drains and stops both runners, then for each decides from what is registered: nothing → register; matching → leave alone; changed name, target or work folder → reconfigure; a runner GitHub no longer has → register again. The runner's ID, labels (including labels added in the GitHub UI), credentials and workspace survive an unchanged rerun; a name registered by another machine is refused. Identity, target, workspace and labels are verified at GitHub before it reports success. Needs `gh` signed in as an admin |
+| `Invoke-BuildAgent.ps1 -Type <type> [-Source] [-CopyOutputTo] [-Dry]` | What a workflow step calls to build with Docker-BuildAgent: `build-agent build <type>` (the types it defines) with the pinned tool and image, in this instance's own workspace. `-Dry` prints the invocation. See [BuildAgent builds](#buildagent-builds) |
+| `Get-BuildAgentStatus.ps1 [-Json]` | One line each for tool, runtime, mapping, Docker daemon (Linux containers), image and updater; exit 0 when builds can run |
+| `Install-BuildAgent.ps1` | Provisions or verifies the host-level pieces (runtime, tool, Docker daemon, image). Exit 0 ready, 1 failed, 2 you must act first. Run by setup; safe to run alone |
 | `Set-WindowsStartup.ps1 [-Mode Disabled\|Logon]` | Applies `windows.startup` (or `-Mode`). `Logon` registers `\SubZeroDev.Runners\Start runners`, run 30 s after this user signs in and retried up to three times if `Start-Runners.ps1` fails; `Disabled` removes it. Both remove the older `SubZeroDev.Runners` Run entry (Windows could skip it at sign-in) |
 | `Install-WindowsRunner.ps1 [-InstanceId] [-Name] [-ExtraLabels] [-GitHubUrl] [-WorkFolder] [-Replace]` | Sets up the Windows runner alone on another machine (no Docker Desktop, no Linux runner), from a clone outside Dropbox, as a non-elevated user: writes `runners.local.json`, downloads the runner and checks its published SHA-256, installs the private .NET 10 SDK, registers it under a per-machine name (default `subzerodev.runner.windows.<computer>`) with the shared labels plus `-ExtraLabels`, and registers `\SubZeroDev.Runners\Start Windows runner` (the supervisor at sign-in) and the log trim. Refuses a name already registered elsewhere unless `-Replace`. On such a machine, stop it with `taskkill /PID (Get-Content windows\supervisor.pid) /T /F`; the scripts that also drive Docker do not apply there |
-| `New-LinuxRunner.ps1 [-Build]` | Recreates the Docker sidecar (when `linux.docker.mode` is `sidecar`; removes it otherwise) and the container from `runners.json` (`-Build` rebuilds the image first, on `linux.baseImage`) and keeps the registration's work folder in step |
+| `New-LinuxRunner.ps1 [-Build] [-Update] [-TimeoutMinutes] [-Force]` | Recreates the Docker sidecar (when `linux.docker.mode` is `sidecar`; removes it otherwise) and the container from `runners.json` (`-Build` rebuilds the image first, on `linux.baseImage`, with the verified runner archive) and keeps the registration's work folder in step. A running container is replaced only after the runner has been drained (same deadline and `-Force` semantics as above). `-Update` hands the container replacement to BuildAgent's updater; see [Linux updates](#linux-updates) |
 | `Set-DropboxIgnored.ps1` | Marks everything matched by `dropbox-ignore.txt` with `com.dropbox.ignored`. Idempotent |
-| `Trim-RunnerLogs.ps1` | Deletes `_diag` files older than `logs.retentionDays` in both runners, keeping the newest Runner/Worker/Console log of each runner |
+| `Trim-RunnerLogs.ps1` | Bounded housekeeping, each part independent: `_diag` files older than `logs.retentionDays` and beyond `logs.maxMB` (the newest Runner/Worker/Console log of each runner is kept), per-instance BuildAgent caches older than `buildAgent.cache.retentionDays` or beyond `buildAgent.cache.maxGB`, and a warning when a drive falls below `housekeeping.minFreeGB`. Never touches registration files or credentials; a locked file is retried a bounded number of times, then reported |
 | `Register-LogTrimTask.ps1` | Schedules the trim daily at `logs.trimAt` as `\SubZeroDev.Runners\Trim logs`. `trimAt: null` removes it |
-| `Run-WindowsRunner.ps1` | The supervisor: one supervisor per named Windows instance (mutex; unnamed installations keep the original mutex), writes `supervisor.pid`, relaunches `run.cmd` 30 s after it exits, one `_diag\Console_*-utc.log` per launch, and a toast after three quick exits in a row |
+| `Run-WindowsRunner.ps1` | The supervisor: one supervisor per named Windows instance (mutex; unnamed installations keep the original mutex), writes `supervisor.pid`, relaunches `run.cmd` after it exits with a delay that doubles for each quick exit in a row (`lifecycle.restartDelaySeconds` up to `backoffMaxSeconds`), records state, restart count, last exit code and next retry in `supervisor.json`, idles while `maintenance.json` exists, one `_diag\Console_*-utc.log` per launch, and a toast after `lifecycle.quickExitLimit` quick exits in a row. Exports `SZR_SCRIPTS` (the scripts folder) to jobs |
 | `Show-Notification.ps1` | Windows toast (runs under Windows PowerShell 5.1, which has WinRT); used by the two above |
-| `Clear-WindowsActionCache.ps1`, `Clear-LinuxWorkspace.sh` | Job-completed hooks: clear downloaded actions (and Linux checkouts) with retries; on Linux also the job's leftover containers, networks and anonymous volumes. NuGet caches, images and build cache stay |
+| `Clear-WindowsActionCache.ps1`, `Clear-LinuxWorkspace.sh` | Job-completed hooks: clear downloaded actions (and Linux checkouts) with a bounded number of retries (`housekeeping.retries`); on Linux also the job's leftover containers, networks and anonymous volumes. NuGet caches, images and build cache stay. They never touch registration or credential files |
 
 ```powershell
 # From the repository folder
 .\scripts\Start-Runners.ps1
-.\scripts\Stop-Runners.ps1 -Drain
+.\scripts\Stop-Runners.ps1                     # drains first; add -Force to cancel a running job
+.\scripts\Manage-WindowsRunner.ps1 -Action Status   # from an instance's clone
+.\scripts\Get-BuildAgentStatus.ps1
 gh api repos/<owner>/<repo>/actions/runners --jq '.runners[] | {name,status,busy,labels:[.labels[].name]}'
 docker logs --tail 40 subzerodev-runner-linux
 ```
+
+### Draining and its limits
+
+Stopping, restarting, maintenance and replacing the Linux container all drain first: the runner's custom labels are
+withdrawn at GitHub so no new job is assigned, the script checks twice (local worker processes, then GitHub's busy flag,
+2 s apart) that nothing is running, and only then stops. If a job is still running at the deadline the labels are
+restored and nothing is stopped; the report lists what was kept. `-Force` skips the wait, cancels the job and reports the
+state it left behind. A workflow that targets **only** GitHub's default labels (`self-hosted`, `Windows`/`Linux`, `X64`) is
+not held back by a drain; the workflows for these runners use the `subzerodev-*` labels.
+
+### BuildAgent builds
+
+Docker-BuildAgent owns the build tooling, the Docker daemon lifecycle and the container updater; this repository only
+provisions it and calls it. A workflow step runs `Invoke-BuildAgent.ps1` from the instance's clone (`$env:SZR_SCRIPTS`),
+which runs `build-agent build <type>` with the pinned tool, the digest-pinned image (`BUILD_AGENT_IMAGE`) and the
+Docker Desktop daemon in Linux-container mode. `build-agent build` mounts only the working directory (as `/workspace`)
+and the Docker socket, so:
+
+- each instance builds in its own workspace (`buildAgent.paths.workspaceRoot\<instance>`), the checked-out source copied
+  in, with the output (`artifacts`) and caches (`.cache`) inside it. Two instances never share a directory, and two jobs
+  on one instance are serialised by a per-instance lock;
+- there is **no cache shared between instances**. Each instance warms its own; `buildAgent.cache` prunes them by age and size;
+- `buildAgent.paths.extraMounts` must stay empty, and a mapping that is a UNC path, inside a Dropbox folder, overlaps a
+  runner clone, contains a comma, or puts the output outside the workspace is refused before anything runs;
+- a Windows executable is never run inside the Linux container: only the build types BuildAgent defines (`docker`, `node`,
+  `node-in-docker`, `node-template`, `forge`) are accepted.
+
+The build jobs run unelevated, as the runner's user. That user needs Docker Desktop's pipe: setup reports `docker-users`
+membership (which needs a sign-out and sign-in) as an action rather than changing it silently.
+
+### Linux updates
+
+`New-LinuxRunner.ps1` recreates the container itself. `-Update` instead delegates to BuildAgent's updater
+(`build-agent update`: locking, an update record, a wait for the replacement's own `HEALTHCHECK`, restore of the original
+container). Only a `BuildAgent.Tool` containing Docker-BuildAgent PR #136 can update this container (2.1.0 refuses a
+privileged container or one with CPU/memory limits), and that change has **no published artifact yet**, so
+`buildAgent.updater.version` is `null` and `-Update` stops with that reason; `Get-BuildAgentStatus.ps1` shows the same. Set
+the version only to an exact published release containing #136, never to `latest`. Notes that hold once it is available:
+
+- restore puts back the container, **not** what the replacement changed in the mounted `/runner` folder (runner binaries,
+  registration, credentials) or in volumes. The runner's own mounted self-update still works as before and is outside
+  the updater's rollback;
+- the `docker:dind` sidecar has no health check, so it is never updater-managed and keeps being recreated by the script.
 
 After editing `runners.json` or `runners.local.json`: rerun `Set-WindowsStartup.ps1` for `windows.startup`,
 `Register-LogTrimTask.ps1` for `logs`, `New-LinuxRunner.ps1` for anything under `linux`,
@@ -138,8 +209,10 @@ Use `subzerodev-windows-large` to target only this machine. There are no per-run
 limits; jobs share the host user, installed tools, ports and machine-wide state.
 Two is a starting concurrency setting; available RAM alone does not determine capacity.
 
-Startup still requires the Windows user to sign in. Use the Windows-only installer/supervisor;
-the combined start/stop/register scripts also manage Linux and Docker.
+Startup requires the Windows user to sign in: the runners start 30 s after that user's sign-in (a scheduled task), not at
+boot and not while signed out. Nothing here enables automatic sign-in or restarts the PC. After a restart, sign in once and
+check `Manage-WindowsRunner.ps1 -Action Status` in each clone. Use the Windows-only installer/supervisor; the combined
+start/stop/register scripts also manage Linux and Docker.
 
 ## Using the runners from a repository
 

@@ -3,6 +3,37 @@
   "github": {
     "labels": ["subzerodev"]
   },
+  "buildAgent": {
+    "enabled": true,
+    "tool": {
+      "package": "BuildAgent.Tool",
+      "version": "2.1.0",
+      "directory": "%LOCALAPPDATA%\\SubZeroDev\\BuildAgent\\tool"
+    },
+    "dotnetRuntime": {
+      "channel": "8.0",
+      "directory": "%LOCALAPPDATA%\\SubZeroDev\\BuildAgent\\dotnet"
+    },
+    "image": "ghcr.io/the-running-dev/build-agent@sha256:cc13d62b66fab58e264eb583de5c47eb5f49a3ee8a2cdd48f0de0b1d0ba16556",
+    "docker": {
+      "host": null,
+      "readyTimeoutSeconds": 300
+    },
+    "paths": {
+      "workspaceRoot": "%LOCALAPPDATA%\\SubZeroDev\\BuildAgent\\workspaces",
+      "outputDirectory": "artifacts",
+      "cacheDirectory": ".cache",
+      "extraMounts": []
+    },
+    "cache": {
+      "retentionDays": 30,
+      "maxGB": 20
+    },
+    "updater": {
+      "version": null,
+      "healthTimeout": "120s"
+    }
+  },
   "windows": {
     "directory": "windows",
     "name": "subzerodev.runner.windows",
@@ -15,7 +46,6 @@
     "name": "subzerodev.runner.linux",
     "labels": ["subzerodev-linux"],
     "container": "subzerodev-runner-linux",
-    "baseImage": "ghcr.io/the-running-dev/build-agent@sha256:cc13d62b66fab58e264eb583de5c47eb5f49a3ee8a2cdd48f0de0b1d0ba16556",
     "image": "subzerodev-runner-linux:local",
     "cacheVolume": "subzerodev-runner-linux-cache",
     "workFolder": "/tmp/runner-work",
@@ -34,8 +64,23 @@
       "memory": "4g"
     }
   },
+  "lifecycle": {
+    "drainTimeoutMinutes": 120,
+    "pollSeconds": 10,
+    "stopTimeoutSeconds": 60,
+    "restartDelaySeconds": 30,
+    "quickExitSeconds": 300,
+    "quickExitLimit": 3,
+    "backoffMaxSeconds": 600
+  },
   "logs": {
     "retentionDays": 14,
+    "maxMB": 512,
     "trimAt": "04:00"
+  },
+  "housekeeping": {
+    "retries": 20,
+    "retryDelaySeconds": 1,
+    "minFreeGB": 10
   }
 }

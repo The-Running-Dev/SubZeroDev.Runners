@@ -1,6 +1,15 @@
 . "$PSScriptRoot\Common.ps1"
+# Supervisor for this instance's runner: starts run.cmd, restarts it when it exits, backs off when it cannot stay up,
+# idles while maintenance.json exists, and records what it is doing in supervisor.json (read by Manage-WindowsRunner.ps1).
 $mutex = [Threading.Mutex]::new($false, $WindowsMutexName)
 if (-not $mutex.WaitOne(0)) { exit }
+
+function Write-SupervisorStatus([hashtable] $Values) {
+    foreach ($key in $Values.Keys) { $script:status[$key] = $Values[$key] }
+    $script:status.updatedUtc = [DateTime]::UtcNow.ToString('o')
+    try { $script:status | ConvertTo-Json | Set-Content -LiteralPath $SupervisorStatusFile } catch { }
+}
+
 try {
     $env:DOTNET_INSTALL_DIR = Join-Path $WindowsRunner '_tool\dotnet'
     $env:DOTNET_ROOT = $env:DOTNET_INSTALL_DIR
@@ -10,6 +19,7 @@ try {
     $env:DOTNET_NOLOGO = '1'
     $env:ACTIONS_RUNNER_HOOK_JOB_COMPLETED = Join-Path $PSScriptRoot 'Clear-WindowsActionCache.ps1'
     $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
+    $env:SZR_SCRIPTS = $PSScriptRoot
     $env:PATH = "$env:DOTNET_ROOT;$env:PATH"
     foreach ($secret in 'GH_TOKEN', 'GITHUB_TOKEN', 'NUGET_FEED_TOKEN') {
         Remove-Item "Env:\$secret" -ErrorAction SilentlyContinue
@@ -18,21 +28,44 @@ try {
     New-Item -ItemType Directory -Force $diag | Out-Null
     Set-Content $SupervisorPidFile $PID
     Set-Location $WindowsRunner
+
+    $lifecycle = $Config.lifecycle
+    $status = @{ state = 'starting'; pid = $PID; startedUtc = [DateTime]::UtcNow.ToString('o'); restarts = 0; consecutiveQuickExits = 0; lastExitCode = $null; lastExitUtc = $null; nextRetryUtc = $null }
+    Write-SupervisorStatus @{}
     $quickExits = 0
     while ($true) {
+        # Maintenance: nothing may start a listener until Start-WindowsRunner removes the flag.
+        if (Test-Path -LiteralPath $MaintenanceFile) {
+            Write-SupervisorStatus @{ state = 'maintenance'; nextRetryUtc = $null }
+            Start-Sleep -Seconds $lifecycle.pollSeconds
+            continue
+        }
         # One console log per runner launch, so Trim-RunnerLogs.ps1 can age them out like the runner's own logs.
         $log = Join-Path $diag ('Console_{0:yyyyMMdd-HHmmss}-utc.log' -f [DateTime]::UtcNow)
         $started = Get-Date
+        Write-SupervisorStatus @{ state = 'running'; nextRetryUtc = $null; log = $log }
         & .\run.cmd *>> $log
-        # run.cmd normally never returns, so three exits in a row within five minutes each means it cannot start.
-        $quickExits = if (((Get-Date) - $started).TotalMinutes -lt 5) { $quickExits + 1 } else { 0 }
-        if ($quickExits -eq 3) {
-            Show-Notification 'SubZeroDev Windows runner keeps failing' "run.cmd exited 3 times in a row (last code $LASTEXITCODE). Retrying every 30 seconds." $log
+        $exitCode = $LASTEXITCODE
+        # A stop for maintenance kills this process tree; reaching here means run.cmd exited by itself.
+        $quick = ((Get-Date) - $started).TotalSeconds -lt $lifecycle.quickExitSeconds
+        $quickExits = if ($quick) { $quickExits + 1 } else { 0 }
+        # Wait restartDelaySeconds, doubled for each quick exit beyond the first, never more than backoffMaxSeconds.
+        $delay = $lifecycle.restartDelaySeconds
+        for ($i = 1; $i -lt $quickExits -and $delay -lt $lifecycle.backoffMaxSeconds; $i++) { $delay *= 2 }
+        $delay = [Math]::Min($delay, $lifecycle.backoffMaxSeconds)
+        Write-SupervisorStatus @{
+            state = if ($quickExits) { 'backoff' } else { 'starting' }; restarts = $status.restarts + 1; consecutiveQuickExits = $quickExits
+            lastExitCode = $exitCode; lastExitUtc = [DateTime]::UtcNow.ToString('o'); nextRetryUtc = [DateTime]::UtcNow.AddSeconds($delay).ToString('o')
         }
-        Start-Sleep -Seconds 30
+        # Once per failure streak, not on every retry.
+        if ($quickExits -eq $lifecycle.quickExitLimit) {
+            Show-Notification 'SubZeroDev Windows runner keeps failing' "run.cmd exited $quickExits times in a row (last code $exitCode). Retrying every $delay seconds at most $($lifecycle.backoffMaxSeconds)." $log
+        }
+        Start-Sleep -Seconds $delay
     }
 }
 finally {
+    try { Write-SupervisorStatus @{ state = 'stopped'; pid = $null } } catch { }
     Remove-Item $SupervisorPidFile -ErrorAction SilentlyContinue
     $mutex.ReleaseMutex()
     $mutex.Dispose()

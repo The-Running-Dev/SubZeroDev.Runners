@@ -43,6 +43,105 @@ Every instance also gets a `subzerodev-host-<computer>` label. Only the first tw
 `subzerodev-pair-<computer>` for the concurrent-job test; this works even on a host with more than two
 runners. The `subzerodev-windows-large` label is opt-in so ordinary VMs do not receive large-host jobs.
 
+## BuildAgent provisioning and resuming setup
+
+After the runners are verified, setup provisions the host-level [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent)
+integration (`scripts\Install-BuildAgent.ps1`, once per host, shared by every instance). It reuses the PowerShell, Git and
+`gh` the bootstrap just verified and adds, each step skipped when already satisfied:
+
+1. Docker Desktop and its prerequisites (WinGet package, WSL 2), found by supported discovery (`buildAgent.docker.cli` if set,
+   `docker.exe` on PATH, then Docker Desktop's registered install location).
+2. A running Linux-container daemon: Docker Desktop is started unelevated, switched to Linux containers if it is on Windows
+   containers, and waited for up to `buildAgent.docker.readyTimeoutSeconds`. The daemon type and readiness are verified
+   with `docker info`, not assumed.
+3. The net8.0 runtime (`buildAgent.dotnetRuntime`) that `BuildAgent.Tool` runs on, installed beside the tool. The instances'
+   private SDK 10 is not used for this and no second host toolchain is installed.
+4. The pinned `BuildAgent.Tool` (`buildAgent.tool.version`, 2.1.0) in `buildAgent.tool.directory`, shared by all instances.
+5. The pinned image, pulled by digest (`buildAgent.image`), or a different digest set as `buildAgent.image` in
+   `runners.local.json`; a tag or `:latest` is rejected by validation. Every build receives it as `BUILD_AGENT_IMAGE`.
+
+Jobs and the BuildAgent steps run unelevated; only the WinGet package installs can show a UAC prompt. Exit codes of
+`Setup-WindowsRunners.ps1`:
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| 0 | Everything finished | Nothing |
+| 1 | The optional BuildAgent integration failed; the runners are set up and running | Read the printed step, fix, rerun the same command |
+| 2 | Something needs you: restart Windows, sign out and in (for `docker-users`), accept Docker Desktop's first-run terms | Do what the printed list says, then rerun the same command |
+
+The list is also saved in `<InstallRoot>\setup-state.json` (per step: state, time, message), so a rerun resumes after the
+restart or sign-out instead of starting over, and an action that was waiting for a restart is dropped once Windows has
+booted since. Setup never restarts Windows, never signs you out and never enables automatic sign-in. `-SkipBuildAgent`
+skips the whole section. A failed or action-needed BuildAgent step does not stop the runners from being installed,
+started or smoke-tested, and nothing about the Dashboard is a runtime dependency of any of this.
+
+Check the result at any time with `scripts\Get-BuildAgentStatus.ps1` (one row each for tool, runtime, mapping, Docker
+daemon, image, updater).
+
+## Builds with BuildAgent
+
+Workflow steps call `scripts\Invoke-BuildAgent.ps1 -Type <type>` (the clone's path is in `$env:SZR_SCRIPTS`), which runs
+`build-agent build <type>` with the pinned tool, the pinned image and the Docker daemon from this host's validated
+configuration. Only the named types BuildAgent already defines are accepted, and Windows executables are never run in the
+Linux container.
+
+`build-agent build` mounts one directory, the working directory, as `/workspace` plus the Docker socket. Hence:
+
+- Each instance has its own workspace under `buildAgent.paths.workspaceRoot` (`...\workspaces\win01`, `...\win02`) with the
+  build output (`artifacts`) and caches (`.cache`) inside it. Instances cannot see each other's files and two concurrent
+  jobs on different instances do not interfere. Two jobs on the same instance wait for each other (one runner takes one
+  job at a time anyway).
+- **Caches are per instance, not shared.** The first build on each instance is cold. `buildAgent.cache.retentionDays`/`maxGB`
+  bound them (applied by the daily log trim). A shared host cache would need a second mount, which BuildAgent does not offer;
+  `buildAgent.paths.extraMounts` is therefore required to be empty.
+- Paths that cannot be mounted safely are refused before the build starts: UNC paths, folders inside Dropbox, folders that
+  overlap a runner clone, paths containing a comma, an output directory outside the workspace.
+- A scheduled task that needs the tool uses the full path from `buildAgent.tool.directory`, not PATH.
+
+BuildAgent's exit status is passed through unchanged, with its documented meaning printed on failure.
+
+## Operating a Windows instance
+
+Run these from the instance's clone as the runner's user (`Manage-WindowsRunner.ps1 -Action ...`):
+
+| Action | Does |
+| --- | --- |
+| `Status` | One line each for the supervisor (state, PID, restarts, last exit, next retry), the listener process, the running job, and the GitHub registration (online, busy, labels). Exits non-zero unless all are healthy; `-Json` for tools |
+| `Start` | Ends maintenance and starts the supervisor if none runs |
+| `Stop` | Drains, then stops the supervisor and runner. Registration stays |
+| `Restart` | `Stop`, then `Start` |
+| `Maintenance` | Drains and stops, and keeps the sign-in task from starting anything until `Start` |
+
+The supervisor restarts a runner that exits, with a growing delay when it exits quickly (30 s, doubling to 10 min), shows one
+toast per failure streak and leaves the evidence in `supervisor.json` and the per-launch `_diag\Console_*-utc.log`.
+
+**Drain, deadline and force.** `Stop`, `Restart` and `Maintenance` first withdraw the runner's custom labels at GitHub so it is
+offered no new job (admission control), then wait for the running job up to `lifecycle.drainTimeoutMinutes`
+(`-TimeoutMinutes` overrides). Idle is confirmed twice, a local worker-process check and GitHub's busy flag 2 s apart, to cover
+a job assigned while the first check ran. If the deadline passes the labels are restored, nothing is stopped and the command
+exits non-zero naming the job that was kept. `-Force` stops immediately, cancels the job, and reports what that left behind
+(the job's workspace and any containers it started are not cleaned until the next job-completed hook or the trim). If
+withdrawing the labels fails, no stop is attempted. A workflow that targets only the default labels (`self-hosted`,
+`Windows`, `X64`) is not held back by a drain.
+
+## Evidence: what is checked where
+
+| Scenario | Automated (CI fixtures and mocks) | Real host / real GitHub |
+| --- | --- | --- |
+| Config validation, merged local override | `Test-RunnerIntegration.ps1` | n/a |
+| Fresh install (WinGet, Docker Desktop, tool, image) | Mocked in `Test-BuildAgentProvisioning.ps1` / `Test-WindowsRunnerHostSetup.ps1` | **Not collected**: needs a clean VM with Docker Desktop |
+| Resumable setup after restart or sign-out | State file and pending-action logic in `Test-BuildAgentProvisioning.ps1` | **Not collected** |
+| Two instances, distinct identity and workspace | `Test-WindowsRunnerInstances.ps1`, `Test-RunnerIntegration.ps1` | Setup with `-SmokeRepository` on the host |
+| BuildAgent build | Invocation, mapping and refusal cases; no daemon | **Not collected**: a real build of the owner's project on Docker Desktop |
+| Concurrent jobs | Smoke evidence checker with synthetic results | `-SmokeRepository` run on the host |
+| Task-driven recovery (supervisor restart, scheduled task) | Backoff and state logic only | **Not collected** |
+| Config change reaches the registration | Registration plan cases (name, target, work folder, labels) | **Not collected** against GitHub |
+| Active-job drain, timeout and force | Mocked GitHub and processes in `Test-RunnerIntegration.ps1` | **Not collected** with a live job |
+| Linux updater success, unhealthy restore, refusal | Command construction and exit-code mapping only | **Blocked**: needs a published `BuildAgent.Tool` containing Docker-BuildAgent PR #136 |
+| Cleanup, retries, Docker-unavailable diagnostics | Locked-file, protected-path, retention and free-disk cases | **Not collected** under real Docker Desktop failure |
+
+Mocked and fixture results show the logic; they are not evidence that a host, a Docker daemon or a GitHub job behaved that way.
+
 Add `-SmokeRepository AbsoluteZeroDev/RunnerSmoke` to automate the actual GitHub job smoke test.
 Setup creates the named repository private if missing and installs the manual-only smoke workflow if
 absent, then dispatches and checks two distinct expected identities plus overlapping execution. An
@@ -69,11 +168,11 @@ GitHub CLI environment authentication: <https://cli.github.com/manual/gh_help_en
 
 ## Manual setup and inspection
 
-These commands configure two independent clones on the 128 GB Windows machine. Run the installer as the normal Windows user whose account will execute jobs. Startup is at that user's sign-in, not at boot. Both jobs share the host's CPU, memory, installed tools and ports; there are no per-runner resource limits.
+These commands configure two independent clones on the 128 GB Windows machine. Run the installer as the normal Windows user whose account will execute jobs. Startup is at that user's sign-in, not at boot: after a restart nothing runs until that user signs in, and nothing here sets up automatic sign-in. Both jobs share the host's CPU, memory, installed tools and ports; there are no per-runner resource limits.
 
 ## Prerequisites
 
-Windows x64, internet access to GitHub and .NET downloads, Git, GitHub CLI and PowerShell 7.2 or later. The installer expects PowerShell at `C:\Program Files\PowerShell\7\pwsh.exe` and installs a private .NET 10 SDK for each runner. Docker is not required.
+Windows x64, internet access to GitHub, .NET and `ghcr.io`, Git, GitHub CLI and PowerShell 7.2 or later. The installer expects PowerShell at `C:\Program Files\PowerShell\7\pwsh.exe` and installs a private .NET 10 SDK for each runner. The runners themselves do not need Docker. The BuildAgent integration (below) needs Docker Desktop with WSL 2 and Linux containers; the automatic setup installs and verifies it, the manual route below does not.
 
 From a Windows terminal, install missing prerequisites (approve package installer elevation if prompted):
 

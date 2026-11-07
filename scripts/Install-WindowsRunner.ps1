@@ -25,7 +25,6 @@ if ($root -match '(?i)\\Dropbox(\\|$)') { throw "Clone this repository outside D
 $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run from a normal, not elevated, PowerShell 7 window: the runner and its jobs run as this user.' }
 $missing = @(
-    if (-not (Test-Path 'C:\Program Files\PowerShell\7\pwsh.exe')) { 'Microsoft.PowerShell' }
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { 'Git.Git' }
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { 'GitHub.cli' }
 )
@@ -70,69 +69,60 @@ $local | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $localPath
 . "$PSScriptRoot\Common.ps1"
 
 $parts = ([Uri]$GitHubUrl).AbsolutePath.Trim('/').Split('/')
-$scope = if ($parts.Count -eq 1) { "orgs/$($parts[0])" } else { "repos/$($parts[0])/$($parts[1])" }
-function Get-RunnerToken([string] $Kind) {
-    $token = gh api -X POST "$scope/actions/runners/$Kind-token" --jq .token
-    if ($LASTEXITCODE -or -not $token) { throw "No $Kind token for $GitHubUrl. gh must be signed in as its admin with the admin:org scope: gh auth refresh --hostname github.com --scopes admin:org" }
-    $token
-}
+. "$PSScriptRoot\Registration.ps1"
+. "$PSScriptRoot\Lifecycle.ps1"
+. "$PSScriptRoot\RunnerArchive.ps1"
+$scope = Get-RunnerScope $GitHubUrl
 function Get-RunnerStatus {
-    $row = gh api "$scope/actions/runners" --paginate --jq '.runners[] | [.name, .status] | @tsv' | Where-Object { $_.Split("`t")[0] -eq $Name }
-    if ($row) { $row.Split("`t")[1] }
+    $runner = Get-GitHubRunner $scope $Name
+    if ($runner) { $runner.Status }
 }
+if (Get-MaintenanceState) { throw "This runner is held in maintenance ($MaintenanceFile). Run Manage-WindowsRunner.ps1 -Action Start, then rerun this script." }
 
 # Runner binaries, checked against the digest GitHub publishes for the release.
-$version = $Config.runnerVersion
-$zipName = "actions-runner-win-x64-$version.zip"
-$downloads = Join-Path $Root 'downloads'
-New-Item -ItemType Directory -Force $downloads, $WindowsRunner | Out-Null
-$zip = Join-Path $downloads $zipName
+New-Item -ItemType Directory -Force $WindowsRunner | Out-Null
 if (-not (Test-Path -LiteralPath (Join-Path $WindowsRunner 'config.cmd'))) {
-    if (-not (Test-Path -LiteralPath $zip)) {
-        Write-Output "Downloading $zipName..."
-        Invoke-WebRequest "https://github.com/actions/runner/releases/download/v$version/$zipName" -OutFile $zip
-    }
-    $release = gh api "repos/actions/runner/releases/tags/v$version" | ConvertFrom-Json
-    $digest = ($release.assets | Where-Object name -eq $zipName).digest
-    $expected = if ($digest) { $digest -replace '^sha256:' } elseif ($release.body -match '<!-- BEGIN SHA win-x64 -->([0-9a-f]{64})<!-- END SHA win-x64 -->') { $Matches[1] }
-    if (-not $expected) { throw "GitHub publishes no SHA-256 for $zipName; not extracting it." }
-    if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $expected) {
-        Remove-Item -LiteralPath $zip
-        throw "$zipName does not match its published SHA-256 and was deleted; rerun to download it again."
-    }
-    Expand-Archive -LiteralPath $zip -DestinationPath $WindowsRunner -Force
-    Write-Output "Runner $version extracted to $WindowsRunner."
+    $archive = Get-RunnerArchive -Platform win-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $Root 'downloads')
+    Expand-Archive -LiteralPath $archive.Path -DestinationPath $WindowsRunner -Force
+    Write-Output "Runner $($Config.runnerVersion) extracted to $WindowsRunner."
 }
 
 # The private SDK the supervisor puts first on PATH; actions/setup-dotnet adds other versions next to it.
 $dotnet = Join-Path $WindowsRunner '_tool\dotnet'
 if (-not (Test-Path -LiteralPath (Join-Path $dotnet 'dotnet.exe'))) {
     & (Join-Path $PSScriptRoot 'dotnet-install.ps1') -Channel 10.0 -InstallDir $dotnet -NoPath
+    if (-not (Test-Path -LiteralPath (Join-Path $dotnet 'dotnet.exe'))) { throw "The .NET SDK was not installed in $dotnet." }
 }
 
-# Registration. A rerun with the same name keeps the existing one.
-$registration = Join-Path $WindowsRunner '.runner'
-$registeredHere = if (Test-Path -LiteralPath $registration) { (Get-Content -Raw -LiteralPath $registration | ConvertFrom-Json).agentName }
-$labels = (@($Config.github.labels) + @($Config.windows.labels)) -join ','
-$status = Get-RunnerStatus
-if ($registeredHere -eq $Name -and $status) {
-    Write-Output "$Name is already registered from this machine ($status)."
-}
-else {
-    if ($status -and -not $Replace) { throw "A runner named $Name is already registered elsewhere ($status). Pick another -Name, or pass -Replace to take its place." }
-    $supervisor = Get-SupervisorProcess
-    if ($supervisor) { taskkill.exe /PID $supervisor.ProcessId /T /F | Out-Null }
-    $configure = Join-Path $WindowsRunner 'config.cmd'
-    if ($registeredHere) {
-        & $configure remove --token (Get-RunnerToken 'remove')
-        Remove-Item -LiteralPath ('.runner', '.runner_migrated', '.credentials', '.credentials_migrated', '.credentials_rsaparams' | ForEach-Object { Join-Path $WindowsRunner $_ }) -Force -ErrorAction SilentlyContinue
+# Registration. What the merged configuration asks for is compared with the local registration and with GitHub; every
+# difference is applied or refused, never saved and ignored. Unchanged settings keep the name, id, labels and credentials.
+$labelList = @(@($Config.github.labels) + @($Config.windows.labels) | Select-Object -Unique)
+$labels = $labelList -join ','
+$registration = Get-LocalRegistration $WindowsRunner
+$plan = Get-RegistrationPlan `
+    -Local $registration `
+    -Remote (Get-GitHubRunner $scope $Name) `
+    -LocalRemote $(if ($registration) { Get-GitHubRunner (Get-RunnerScope $registration.gitHubUrl) $registration.agentName }) `
+    -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder -RunnerDirectory $WindowsRunner `
+    -HasCredentials (Test-Path -LiteralPath (Join-Path $WindowsRunner '.credentials')) -Replace:$Replace
+foreach ($reason in $plan.Reasons) { Write-Output "Registration: $reason" }
+$beforeChange = {
+    if (-not (Get-SupervisorProcess) -and -not (Get-WindowsRunnerListeners)) { return }
+    if ($registration -and $plan.LinkedId) {
+        # Wait for a running job rather than cancel it, and leave the registration alone if it outlasts the deadline.
+        $stopped = Stop-WindowsRunner -Reason 'registration change'
+        if ($stopped.Outcome -eq 'timeout') { throw "Registration not changed. $($stopped.Retained)" }
     }
-    $arguments = @('--unattended', '--url', $GitHubUrl, '--token', (Get-RunnerToken 'registration'), '--name', $Name, '--labels', $labels, '--work', [Environment]::ExpandEnvironmentVariables($Config.windows.workFolder))
-    if ($Replace) { $arguments += '--replace' }
-    & $configure @arguments
-    if ($LASTEXITCODE) { throw "Registering $Name failed." }
+    else { Stop-WindowsRunnerProcesses }
 }
-
+$applied = Invoke-RunnerRegistration -Plan $plan -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Replace:$Replace -BeforeChange $beforeChange
+switch ($applied.Result) {
+    'unchanged' { Write-Output "$Name is already registered from this clone with the requested settings." }
+    'labels-added' { Write-Output "$Name keeps its registration; added labels $($applied.Labels -join ', ')." }
+    default { Write-Output "$Name registered ($($applied.Result)); previous registration files saved in $($applied.Evidence)." }
+}
+$problems = @(Confirm-RunnerRegistration -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder)
+if ($problems) { throw "The registration does not match the configuration:`n - $($problems -join "`n - ")" }
 # Start at sign-in: the supervisor itself, not Start-Runners.ps1, which also needs Docker Desktop and the Linux container.
 if (-not $InstanceId) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName 'Start runners' -Confirm:$false -ErrorAction SilentlyContinue }
 $user = "$env:USERDOMAIN\$env:USERNAME"
