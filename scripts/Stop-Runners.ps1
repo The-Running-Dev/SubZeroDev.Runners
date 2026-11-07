@@ -1,25 +1,27 @@
-# Stops both runners; registrations stay. -Drain first waits (up to -TimeoutMinutes) for running jobs to finish.
-param([switch] $Drain, [int] $TimeoutMinutes = 120)
+#Requires -Version 7.2
+# Stops both runners; registrations stay. Each runner is drained first: it stops taking jobs (its custom labels are withdrawn
+# at GitHub), then the script waits up to -TimeoutMinutes for the running job to finish, then stops it and restores the labels.
+# A job that outlasts the deadline is not cancelled: that runner keeps running and the report says so. -Force stops at once
+# and cancels whatever is running. The Windows runner is stopped before the Linux runner, which stops before its Docker sidecar.
+# Exit code 0: both stopped. 1: a runner was kept because of a running job, or could not be stopped.
+param([int] $TimeoutMinutes, [switch] $Force)
 . "$PSScriptRoot\Common.ps1"
-if ($Drain) {
-    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-    while ((Test-WindowsRunnerBusy) -or (Test-LinuxRunnerBusy)) {
-        if ((Get-Date) -gt $deadline) { throw "A job was still running after $TimeoutMinutes minutes; nothing was stopped." }
-        Write-Output 'Waiting for the running job to finish...'
-        Start-Sleep -Seconds 15
+. "$PSScriptRoot\Registration.ps1"
+. "$PSScriptRoot\Lifecycle.ps1"
+if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
+$kept = 0
+foreach ($step in @(
+        @{ Label = 'Windows'; Run = { Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop' } }
+        @{ Label = 'Linux'; Run = { Stop-LinuxRunners -TimeoutMinutes $TimeoutMinutes -Force:$Force } }
+    )) {
+    try {
+        $result = & $step.Run
+        switch ($result.Outcome) {
+            'timeout' { $kept++; Write-Warning "$($step.Label) runner kept running. $($result.Retained)" }
+            'forced' { Write-Output "$($step.Label) runner stopped without draining.$(if ($result.Cancelled) { " $($result.Cancelled)" })" }
+            default { Write-Output "$($step.Label) runner stopped." }
+        }
     }
+    catch { $kept++; Write-Warning "$($step.Label) runner not stopped: $($_.Exception.Message)" }
 }
-# Neither runner can be told to stop taking jobs, so a job that starts in the gap between the check and the stop is cancelled.
-$supervisor = Get-SupervisorProcess
-if ($supervisor) {
-    # The supervisor and its own child tree, leaving other runners and apps alone.
-    taskkill.exe /PID $supervisor.ProcessId /T /F | Out-Null
-    Remove-Item -LiteralPath $SupervisorPidFile -ErrorAction SilentlyContinue
-    Write-Output 'Windows runner stopped.'
-}
-& $Docker stop --timeout 60 $Config.linux.container | Out-Null
-Write-Output 'Linux runner stopped.'
-if ($DockerSidecar) {
-    & $Docker stop --timeout 60 $DockerSidecar | Out-Null
-    Write-Output 'Docker sidecar stopped.'
-}
+exit [int]($kept -gt 0)

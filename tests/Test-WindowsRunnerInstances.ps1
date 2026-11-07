@@ -41,8 +41,8 @@ function New-Fixture([string] $Id) {
     $clone = Join-Path $fixture $Id
     New-Item -ItemType Directory -Path (Join-Path $clone 'scripts') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $repo 'runners.json') -Destination $clone
-    Copy-Item -LiteralPath (Join-Path $repo 'scripts\Common.ps1') -Destination (Join-Path $clone 'scripts')
-    Copy-Item -LiteralPath (Join-Path $repo 'scripts\Register-LogTrimTask.ps1') -Destination (Join-Path $clone 'scripts')
+    # The whole scripts directory: Common.ps1 dot-sources the shared loader and modules beside it.
+    Get-ChildItem -LiteralPath (Join-Path $repo 'scripts') -File | Copy-Item -Destination (Join-Path $clone 'scripts')
     $clone
 }
 function Invoke-Settings {

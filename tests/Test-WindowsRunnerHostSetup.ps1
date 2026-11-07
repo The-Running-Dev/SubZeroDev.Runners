@@ -68,19 +68,36 @@ function Get-RunnerSetupEvidence {
 }
 function Confirm-RunnerSetupHost { param($Instances, $Scope) $flow.Verified = $Instances.Count }
 function Invoke-RunnerSetupSmoke { param($Repository, $Label, $SourceClone, $ExpectedRunnerNames) $flow.Smoke += [pscustomobject]@{ Repo = $Repository; Label = $Label; Names = $ExpectedRunnerNames } }
+$flow.BuildAgent = @(); $flow.BuildAgentExit = 0
+function Install-RunnerSetupBuildAgent { param($Clone, $InstallRoot) $flow.BuildAgent += [pscustomobject]@{ Clone = $Clone; InstallRoot = $InstallRoot }; $flow.BuildAgentExit }
 $options = @{ Count = 3; InstallRoot = 'C:\Fixtures'; GitHubUrl = 'https://github.com/AbsoluteZeroDev'; ExtraLabels = @('extra'); SourceCommit = ('a' * 40); SmokeRepository = 'AbsoluteZeroDev/RunnerSmoke'; NonInteractive = $true }
-Invoke-WindowsRunnerHostSetup @options
+$outcome = Invoke-WindowsRunnerHostSetup @options | Select-Object -Last 1
 Assert ($flow.Auth -eq 1 -and $flow.Verified -eq 3 -and $flow.Installs.Count -eq 3) 'Host setup skipped authentication, instances or verification.'
+# BuildAgent is provisioned once per host, from the first instance's clone, after the runners are verified.
+Assert ($flow.BuildAgent.Count -eq 1 -and $flow.BuildAgent[0].Clone -eq 'C:\Fixtures\win01' -and $flow.BuildAgent[0].InstallRoot -eq 'C:\Fixtures') 'BuildAgent was not provisioned once from win01.'
+Assert ($outcome.BuildAgentExitCode -eq 0 -and -not $outcome.ActionRequired -and $outcome.Runners -eq 3) 'A ready BuildAgent was reported as not ready.'
 Assert (($flow.Installs.Id -join ',') -eq 'win01,win02,win03') 'Instance IDs were not deterministic.'
 $pair = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())"
 Assert ($flow.Installs[0].Labels -contains $pair -and $flow.Installs[1].Labels -contains $pair -and $flow.Installs[2].Labels -notcontains $pair) 'Smoke targeting did not select only the first two instances.'
 Assert (($flow.Smoke[0].Names -join ',') -eq 'custom-win01,custom-win02') 'Smoke ignored actual persisted identities.'
+$flow.BuildAgent = @()
+$skipped = Invoke-WindowsRunnerHostSetup @options -SkipBuildAgent $true | Select-Object -Last 1
+Assert ($flow.BuildAgent.Count -eq 0 -and $skipped.BuildAgentExitCode -eq 0) '-SkipBuildAgent still provisioned BuildAgent.'
+# Exit 2 (the person has to act) is reported, the runners and the smoke test are not blocked, and nothing is thrown.
+$flow.BuildAgentExit = 2; $flow.Smoke = @()
+$paused = Invoke-WindowsRunnerHostSetup @options | Select-Object -Last 1
+Assert ($paused.ActionRequired -and $paused.BuildAgentExitCode -eq 2 -and $flow.Smoke.Count -eq 1) 'Action-required BuildAgent blocked the runners or was not reported.'
+# A failed optional integration is a non-zero outcome, not an exception, and the runners stay set up.
+$flow.BuildAgentExit = 1
+$broken = Invoke-WindowsRunnerHostSetup @options 3>$null | Select-Object -Last 1
+Assert ($broken.BuildAgentExitCode -eq 1 -and -not $broken.ActionRequired -and $broken.Runners -eq 3) 'A failed BuildAgent step was hidden or blocked the runners.'
+$flow.BuildAgentExit = 0; $flow.Smoke = @()
 $options.SmokeRepository = 'DifferentOrg/Smoke'
 Assert-Throws { Invoke-WindowsRunnerHostSetup @options } 'Cross-target smoke repository accepted.'
 $options.SmokeRepository = ''
 $options.Count = 1
 Invoke-WindowsRunnerHostSetup @options
-Assert ($flow.Smoke.Count -eq 1) 'Setup dispatched a smoke test without a requested repository.'
+Assert ($flow.Smoke.Count -eq 0) 'Setup dispatched a smoke test without a requested repository.'
 
 # Verify online state, remote/local ID equality, isolation and adding labels to existing registrations.
 . $functions

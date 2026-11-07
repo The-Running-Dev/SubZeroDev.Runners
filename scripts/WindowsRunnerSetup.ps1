@@ -1,5 +1,6 @@
 #Requires -Version 7.2
 # Testable host orchestration. Dot-sourcing this file does not install or register anything.
+. "$PSScriptRoot\SetupState.ps1"
 
 function Invoke-RunnerSetupGit {
     param([string[]] $Arguments, [switch] $Capture)
@@ -201,6 +202,18 @@ function Confirm-RunnerSetupHost {
     Write-Host 'Verified on this host: registrations online, unique identities/workspaces/processes, startup tasks and labels.'
 }
 
+# Provisions or verifies the host-level BuildAgent integration from an instance's clone, in its own PowerShell so the clone's
+# configuration is the one that applies. Returns the exit code: 0 ready, 1 failed, 2 the person has to act first (the actions
+# are in the install root's setup state).
+function Install-RunnerSetupBuildAgent {
+    param([string] $Clone, [string] $InstallRoot)
+    $pwsh = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    & $pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Clone 'scripts\Install-BuildAgent.ps1') -InstallRoot $InstallRoot | Out-Host
+    $LASTEXITCODE
+}
+
+# Setup keeps going when the optional BuildAgent integration cannot be completed: the registered runners are already verified,
+# and a failure here is reported at the end with a non-zero exit instead of undoing or blocking them.
 function Invoke-WindowsRunnerHostSetup {
     param(
         [ValidateRange(1, 16)] [int] $Count,
@@ -209,8 +222,10 @@ function Invoke-WindowsRunnerHostSetup {
         [string[]] $ExtraLabels,
         [ValidatePattern('^[0-9a-f]{40}$')] [string] $SourceCommit,
         [string] $SmokeRepository,
-        [bool] $NonInteractive
+        [bool] $NonInteractive,
+        [bool] $SkipBuildAgent
     )
+    foreach ($pending in @(Get-SetupPendingAction $InstallRoot)) { Write-Host "Resuming; still pending from the last run: [$($pending.kind)] $($pending.message)" }
     $scope = Get-RunnerSetupScope $GitHubUrl
     if ($SmokeRepository -and $Count -lt 2) { throw 'A concurrent-job smoke test requires at least two runners.' }
     if ($SmokeRepository -and $SmokeRepository -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*/[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw 'SmokeRepository must be owner/repository.' }
@@ -230,10 +245,23 @@ function Invoke-WindowsRunnerHostSetup {
         Get-RunnerSetupEvidence -Clone $clone -InstanceId $id
     })
     Confirm-RunnerSetupHost -Instances $instances -Scope $scope
+    Set-SetupStep $InstallRoot 'runners'
+    $buildAgentExit = 0
+    if ($SkipBuildAgent) {
+        Write-Host 'BuildAgent integration skipped (-SkipBuildAgent).'
+    } else {
+        Write-Host 'Provisioning the shared BuildAgent tooling (net8.0 runtime, build-agent tool, Docker, image)...'
+        $buildAgentExit = [int](Install-RunnerSetupBuildAgent -Clone (Join-Path $InstallRoot 'win01') -InstallRoot $InstallRoot | Select-Object -Last 1)
+    }
     if ($SmokeRepository) {
         Invoke-RunnerSetupSmoke -Repository $SmokeRepository -Label $pairLabel -SourceClone (Join-Path $InstallRoot 'win01') -ExpectedRunnerNames @($instances[0..1].Name)
     } else {
         Write-Host 'Actual concurrent-job execution has not been tested. Add -SmokeRepository OWNER/REPO to run and verify it automatically.'
     }
-    Write-Host "Setup complete: $Count runner(s). Automatic startup occurs when this Windows user signs in."
+    switch ($buildAgentExit) {
+        0 { Write-Host "Setup complete: $Count runner(s). Automatic startup occurs when this Windows user signs in." }
+        2 { Write-Host "Runners are set up ($Count), but BuildAgent needs your action first (listed above). Rerun the same command afterwards; finished steps are skipped." -ForegroundColor Yellow }
+        default { Write-Warning "Runners are set up ($Count), but the BuildAgent integration failed (exit $buildAgentExit); see the messages above. The runners are not affected." }
+    }
+    [pscustomobject]@{ Runners = $Count; BuildAgentExitCode = $buildAgentExit; ActionRequired = ($buildAgentExit -eq 2); Instances = $instances }
 }

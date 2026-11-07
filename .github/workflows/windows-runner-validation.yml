@@ -27,3 +27,9 @@ jobs:
       - name: Exercise automated host setup with isolated fixtures
         shell: pwsh
         run: ./tests/Test-WindowsRunnerHostSetup.ps1
+      - name: Exercise BuildAgent provisioning and resumable setup state with fixtures
+        shell: pwsh
+        run: ./tests/Test-BuildAgentProvisioning.ps1
+      - name: Exercise configuration, BuildAgent invocation, registration, drain, housekeeping and Linux image guards
+        shell: pwsh
+        run: ./tests/Test-RunnerIntegration.ps1

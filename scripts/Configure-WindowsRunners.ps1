@@ -5,4 +5,6 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $options = Get-Content -Raw -LiteralPath $OptionsPath | ConvertFrom-Json -AsHashtable
 . "$PSScriptRoot\WindowsRunnerSetup.ps1"
-Invoke-WindowsRunnerHostSetup @options
+$result = Invoke-WindowsRunnerHostSetup @options
+# 0 everything done, 1 the optional BuildAgent integration failed (the runners are set up), 2 the person has to act, then rerun.
+exit ([int]($result | Select-Object -Last 1).BuildAgentExitCode)

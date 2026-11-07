@@ -1,18 +1,47 @@
 # Shared settings for the host scripts. Dot-source it: . "$PSScriptRoot\Common.ps1"
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path $PSScriptRoot -Parent
-$Config = Get-Content -Raw (Join-Path $Root 'runners.json') | ConvertFrom-Json
-# runners.local.json (git-ignored) holds this machine's settings, such as github.url, over runners.json's. Objects merge
-# setting by setting at every level, so { "linux": { "docker": { "mode": "dind" } } } changes only that mode.
-function Merge-Settings($Target, $Source) {
-    foreach ($setting in $Source.PSObject.Properties) {
-        $current = $Target.($setting.Name)
-        if ($current -is [pscustomobject] -and $setting.Value -is [pscustomobject]) { Merge-Settings $current $setting.Value }
-        else { $Target | Add-Member -Force -NotePropertyName $setting.Name -NotePropertyValue $setting.Value }
-    }
-}
+. (Join-Path $PSScriptRoot 'RunnerConfig.ps1')
+$Config = Read-RunnerConfig -Root $Root
 $LocalConfig = Join-Path $Root 'runners.local.json'
-if (Test-Path -LiteralPath $LocalConfig) { Merge-Settings $Config (Get-Content -Raw $LocalConfig | ConvertFrom-Json) }
+
+# docker.exe by supported discovery: the configured CLI, PATH, then Docker Desktop's registered install location.
+# $null when Docker is not installed.
+function Find-DockerExe {
+    $configured = $Config.buildAgent.docker.cli
+    if ($configured -and (Test-Path -LiteralPath $configured)) { return (Get-CanonicalPath $configured) }
+    $command = Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    foreach ($key in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop') {
+        $location = (Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue).InstallLocation
+        if ($location) {
+            $candidate = Join-Path $location 'resources\bin\docker.exe'
+            if (Test-Path -LiteralPath $candidate) { return $candidate }
+        }
+    }
+    $candidate = Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin\docker.exe'
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+}
+
+# Docker Desktop's own executable, to start it. $null when it is not installed.
+function Find-DockerDesktopExe {
+    foreach ($key in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop') {
+        $location = (Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue).InstallLocation
+        if ($location -and (Test-Path -LiteralPath (Join-Path $location 'Docker Desktop.exe'))) { return (Join-Path $location 'Docker Desktop.exe') }
+    }
+    $candidate = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+}
+
+# PowerShell 7 for scheduled tasks and child scripts: the running one when this is pwsh, else PATH, else the MSI location.
+function Find-PwshExe {
+    if ($PSVersionTable.PSEdition -eq 'Core') { return [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+    $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    $candidate = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+}
+
 $WindowsRunner = Join-Path $Root $Config.windows.directory
 $LinuxRunner = Join-Path $Root $Config.linux.directory
 # linux.docker.mode 'sidecar': the Linux runner's Docker daemon is a separate docker:dind container.
@@ -20,10 +49,15 @@ $LinuxRunner = Join-Path $Root $Config.linux.directory
 $DockerSidecar = if ($Config.linux.docker -and $Config.linux.docker.mode -eq 'sidecar') { $Config.linux.docker.container }
 # Linux containers in start order; stop them in reverse.
 $LinuxContainers = @(@($DockerSidecar, $Config.linux.container) | Where-Object { $_ })
-$Docker = 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
-$Pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+$Docker = Find-DockerExe
+if (-not $Docker) { $Docker = 'docker.exe' }
+$Pwsh = Find-PwshExe
+if (-not $Pwsh) { $Pwsh = 'pwsh.exe' }
 $Supervisor = Join-Path $PSScriptRoot 'Run-WindowsRunner.ps1'
 $SupervisorPidFile = Join-Path $WindowsRunner 'supervisor.pid'
+# Written by the supervisor: what it is doing now. Written by Manage-WindowsRunner: whether it may start the listener.
+$SupervisorStatusFile = Join-Path $WindowsRunner 'supervisor.json'
+$MaintenanceFile = Join-Path $WindowsRunner 'maintenance.json'
 $StartupValueName = 'SubZeroDev.Runners'
 $TaskPath = '\SubZeroDev.Runners\'
 $WindowsMutexName = 'Local\SubZeroDev.Runners.Windows'
@@ -31,7 +65,6 @@ $WindowsTaskName = 'Start Windows runner'
 $LogTrimTaskName = 'Trim logs'
 # Named instances live in separate clones, with their own tasks and supervisor.
 if ($Config.windows.instanceId) {
-    if ($Config.windows.instanceId -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$') { throw 'Invalid windows.instanceId: use 1-40 letters, digits, underscores or hyphens.' }
     $WindowsMutexName += ".$($Config.windows.instanceId)"
     $WindowsTaskName += " ($($Config.windows.instanceId))"
     $LogTrimTaskName += " ($($Config.windows.instanceId))"
@@ -47,12 +80,17 @@ function Get-SupervisorProcess {
     Remove-Item -LiteralPath $SupervisorPidFile -ErrorAction SilentlyContinue
 }
 
-# True while the Windows runner is executing a job (its Runner.Worker exists).
-function Test-WindowsRunnerBusy {
-    [bool](Get-CimInstance Win32_Process -Filter "Name='Runner.Worker.exe'" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($WindowsRunner, [StringComparison]::OrdinalIgnoreCase) })
+# Runner.Worker processes of this instance. Matched by directory boundary, so instance win1 never claims win10's worker.
+function Get-WindowsRunnerWorkers {
+    @(Get-CimInstance Win32_Process -Filter "Name='Runner.Worker.exe'" | Where-Object { $_.ExecutablePath -and (Test-PathUnder $_.ExecutablePath $WindowsRunner) })
 }
 
-# True while the Linux container is executing a job.
+# True while the Windows runner is executing a job (its Runner.Worker exists).
+function Test-WindowsRunnerBusy {
+    (Get-WindowsRunnerWorkers).Count -gt 0
+}
+
+# True while the Linux container is executing a job. $false when Docker or the container is down.
 function Test-LinuxRunnerBusy {
     & $Docker exec $Config.linux.container pgrep -f Runner.Worker 2>$null | Out-Null
     $LASTEXITCODE -eq 0

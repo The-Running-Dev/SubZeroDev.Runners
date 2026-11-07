@@ -15,14 +15,19 @@ param(
     [string[]] $ExtraLabels = @(),
     [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,199}$')] [string] $SourceRef = 'main',
     [string] $SmokeRepository,
-    [switch] $NonInteractive
+    [switch] $NonInteractive,
+    # Registers the runners only; leaves Docker Desktop, the build-agent tool and its image alone.
+    [switch] $SkipBuildAgent
 )
 
+# Exit codes of this script: 0 done, 1 failed, 2 the person has to act first (restart Windows, sign out, start Docker Desktop...);
+# the steps needed are printed and saved in <InstallRoot>\setup-state.json, and rerunning the same command resumes.
 function Invoke-SetupNative {
-    param([string] $File, [string[]] $Arguments, [switch] $Capture)
+    param([string] $File, [string[]] $Arguments, [switch] $Capture, [int[]] $AllowExitCode = @(0))
     $result = & $File @Arguments
     $code = $LASTEXITCODE
-    if ($code) { throw "$(Split-Path $File -Leaf) failed (exit $code). Inspect the preceding output and rerun setup." }
+    $script:SetupNativeExit = $code
+    if ($code -and $code -notin $AllowExitCode) { throw "$(Split-Path $File -Leaf) failed (exit $code). Inspect the preceding output and rerun setup." }
     if ($Capture) { $result } else { $result | Out-Host }
 }
 
@@ -104,6 +109,26 @@ function Install-SetupPrerequisites {
     $tools
 }
 
+# Docker Desktop is optional (BuildAgent builds need it, the runners do not), so a failure here is a warning, never a stop.
+# winget asks for administrator approval itself; this script stays unelevated. Exit 3010 means Windows must restart, which is
+# left to the person: nothing is restarted here.
+function Install-SetupDockerDesktop {
+    $docker = Find-SetupTool 'docker'
+    if (-not $docker) { $docker = @("$env:ProgramFiles\Docker\Docker\resources\bin\docker.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1 }
+    if ($docker) { Write-Host 'Docker Desktop is already installed.'; return 'present' }
+    $winget = Find-SetupTool 'winget'
+    if (-not (Test-SetupWinGet $winget)) { Write-Warning 'WinGet is unavailable, so Docker Desktop was not installed. Install it yourself (Docker.DockerDesktop), then rerun setup.'; return 'unavailable' }
+    Write-Host 'Installing Docker.DockerDesktop (approve the Windows elevation prompt)...'
+    try {
+        Invoke-SetupNative -File $winget -Arguments @('install', '--id', 'Docker.DockerDesktop', '--exact', '--source', 'winget', '--silent', '--accept-source-agreements', '--accept-package-agreements', '--disable-interactivity') -AllowExitCode 0, 3010
+    } catch {
+        Write-Warning "Docker Desktop was not installed: $($_.Exception.Message)"
+        return 'failed'
+    }
+    if ($script:SetupNativeExit -eq 3010) { Write-Warning 'Docker Desktop is installed but Windows must restart before it works. Restart Windows yourself, start Docker Desktop once, then rerun this same setup.'; return 'restart' }
+    'installed'
+}
+
 function Sync-SetupCheckout {
     param([string] $Git, [string] $Path, [string] $Ref)
     $repository = 'https://github.com/The-Running-Dev/SubZeroDev.Runners.git'
@@ -123,7 +148,7 @@ function Sync-SetupCheckout {
 }
 
 function Start-WindowsRunnerSetup {
-    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive)
+    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive, [bool] $SkipBuildAgent)
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $false
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Use 64-bit PowerShell on x64 Windows 10/11 or a compatible Windows VM.' }
@@ -137,6 +162,7 @@ function Start-WindowsRunnerSetup {
     $InstallRoot = $fullRoot.TrimEnd('\')
     New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
     $tools = Install-SetupPrerequisites
+    if (-not $SkipBuildAgent) { Install-SetupDockerDesktop | Out-Null }
     $checkout = Join-Path $InstallRoot '_setup'
     $commit = Sync-SetupCheckout -Git $tools.git -Path $checkout -Ref $SourceRef
     $worker = Join-Path $checkout 'scripts\Configure-WindowsRunners.ps1'
@@ -144,12 +170,14 @@ function Start-WindowsRunnerSetup {
     # This file contains options only. Credentials stay in gh's store or the inherited environment.
     $optionsPath = Join-Path ([IO.Path]::GetTempPath()) ("windows-runner-setup-" + [guid]::NewGuid().ToString('N') + '.json')
     try {
-        @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive } |
+        @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive; SkipBuildAgent = $SkipBuildAgent } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $optionsPath -Encoding UTF8
-        Invoke-SetupNative -File $tools.pwsh -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-OptionsPath', $optionsPath)
+        # The worker's exit 2 is not a failure: the runners are set up and the person has to act (it printed what).
+        Invoke-SetupNative -File $tools.pwsh -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-OptionsPath', $optionsPath) -AllowExitCode 0, 2
+        [int]$script:SetupNativeExit
     } finally {
         Remove-Item -LiteralPath $optionsPath -Force -ErrorAction SilentlyContinue
     }
 }
 
-Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive)
+exit ([int](Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive) -SkipBuildAgent ([bool]$SkipBuildAgent) | Select-Object -Last 1))
