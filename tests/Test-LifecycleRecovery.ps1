@@ -1032,6 +1032,97 @@ Test-Case 'Legacy migration: an incomplete or unreadable record does not count a
     Assert ($result.Changed -and (Get-LegacyMigration).kind -eq 'upgraded') 'An incomplete record was not replaced by a verified migration.'
 }
 
+# Registry reads must distinguish confirmed absence from an inspection failure, before and after removal. Each case
+# dot-sources these fakes into its own scope; the real cleanup sees them without any access to the real registry.
+$UseFakeRunKey = {
+    function Get-ItemProperty {
+        [CmdletBinding()] param($LiteralPath, $Name)
+        $registryFixture.Reads++
+        & $registryFixture.Read $registryFixture.Reads
+    }
+    function Remove-ItemProperty {
+        [CmdletBinding()] param($LiteralPath, $Name)
+        $registryFixture.Removes++
+    }
+}
+Test-Case 'Legacy Run entry: a genuinely missing key is absent, not a failed cleanup' {
+    $registryFixture = @{ Reads = 0; Removes = 0; Read = {
+        Write-Error -Exception ([System.Management.Automation.ItemNotFoundException]::new('The Run key does not exist.')) -ErrorId PathNotFound -Category ObjectNotFound
+    } }
+    . $UseFakeRunKey
+    $result = Remove-LegacyStartupTasks -Tasks @() -RunKey 'HKCU:\Fixture' -RunValueName 'Mine'
+    Assert ($result.Failed.Count -eq 0 -and $result.Removed.Count -eq 0 -and $registryFixture.Removes -eq 0) "A missing key was not treated as absent: $($result.Failed -join ' | ')"
+}
+
+Test-Case 'Legacy Run entry: an existing key without the value is absent' {
+    $registryFixture = @{ Reads = 0; Removes = 0; Read = { [pscustomobject]@{ Other = 'another startup entry' } } }
+    . $UseFakeRunKey
+    $result = Remove-LegacyStartupTasks -Tasks @() -RunKey 'HKCU:\Fixture' -RunValueName 'Mine'
+    Assert ($result.Failed.Count -eq 0 -and $result.Removed.Count -eq 0 -and $result.Kept.Count -eq 0 -and $registryFixture.Removes -eq 0) 'An absent value failed cleanup or changed another entry.'
+}
+
+Test-Case 'Legacy Run entry: access denied on the initial read is a failed cleanup' {
+    $registryFixture = @{ Reads = 0; Removes = 0; Read = {
+        Write-Error -Exception ([UnauthorizedAccessException]::new('Access to the Run key is denied.')) -ErrorId PermissionDenied -Category PermissionDenied
+    } }
+    . $UseFakeRunKey
+    $result = Remove-LegacyStartupTasks -Tasks @() -RunKey 'HKCU:\Fixture' -RunValueName 'Mine'
+    Assert ($result.Failed.Count -eq 1 -and $result.Failed[0] -match 'Access to the Run key is denied' -and $result.Removed.Count -eq 0 -and $registryFixture.Removes -eq 0) 'The denied initial read was treated as absence.'
+}
+
+Test-Case 'Legacy Run entry: access denied on verification is a failed cleanup, not a confirmed removal' {
+    $registryFixture = @{ Reads = 0; Removes = 0; Read = {
+        param($Read)
+        if ($Read -eq 1) { return [pscustomobject]@{ Mine = ('pwsh -File "' + $Supervisor + '"') } }
+        Write-Error -Exception ([UnauthorizedAccessException]::new('Access to verify the Run key is denied.')) -ErrorId PermissionDenied -Category PermissionDenied
+    } }
+    . $UseFakeRunKey
+    $result = Remove-LegacyStartupTasks -Tasks @() -RunKey 'HKCU:\Fixture' -RunValueName 'Mine'
+    Assert ($registryFixture.Removes -eq 1 -and $result.Failed.Count -eq 1 -and $result.Failed[0] -match 'Access to verify the Run key is denied' -and $result.Removed.Count -eq 0) 'An unverified removal was reported as complete.'
+}
+
+Test-Case 'Legacy Run entry: verification confirms a removed value or a removed key' {
+    foreach ($mode in 'missing-value', 'missing-key') {
+        $registryFixture = @{ Reads = 0; Removes = 0; Read = {
+            param($Read)
+            if ($Read -eq 1) { return [pscustomobject]@{ Mine = ('pwsh -File "' + $Supervisor + '"') } }
+            if ($mode -eq 'missing-key') { Write-Error -Exception ([System.Management.Automation.ItemNotFoundException]::new('The Run key was removed.')) -ErrorId PathNotFound -Category ObjectNotFound }
+            else { [pscustomobject]@{ Other = 'untouched' } }
+        } }
+        . $UseFakeRunKey
+        $result = Remove-LegacyStartupTasks -Tasks @() -RunKey 'HKCU:\Fixture' -RunValueName 'Mine'
+        Assert ($registryFixture.Removes -eq 1 -and $result.Removed.Count -eq 1 -and $result.Failed.Count -eq 0) "Mode $($mode): a confirmed removal failed: $($result.Failed -join ' | ')"
+    }
+}
+
+Test-Case 'Legacy migration: denied initial Run entry inspection prevents a completion record' {
+    $case = New-MigrationCase -Upgrade
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    $registryFixture = @{ Reads = 0; Removes = 0; Read = {
+        Write-Error -Exception ([UnauthorizedAccessException]::new('Initial Run entry inspection denied.')) -ErrorId PermissionDenied -Category PermissionDenied
+    } }
+    . $UseFakeRunKey
+    $scheduler = New-FakeScheduler
+    . $UseFakeScheduler
+    $failure = Get-MigrationFailure { Invoke-LegacyMigration }
+    Assert ($failure -match 'Initial Run entry inspection denied' -and -not (Test-Path -LiteralPath $case.Marker)) 'An unreadable Run entry allowed migration completion.'
+}
+
+Test-Case 'Legacy migration: denied Run entry verification prevents a completion record' {
+    $case = New-MigrationCase -Upgrade
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    $registryFixture = @{ Reads = 0; Removes = 0; Read = {
+        param($Read)
+        if ($Read -eq 1) { return [pscustomobject]@{ Mine = ('pwsh -File "' + $Supervisor + '"') } }
+        Write-Error -Exception ([UnauthorizedAccessException]::new('Run entry verification denied.')) -ErrorId PermissionDenied -Category PermissionDenied
+    } }
+    . $UseFakeRunKey
+    $scheduler = New-FakeScheduler
+    . $UseFakeScheduler
+    $failure = Get-MigrationFailure { Invoke-LegacyMigration }
+    Assert ($failure -match 'Run entry verification denied' -and -not (Test-Path -LiteralPath $case.Marker)) 'An unverified Run entry removal allowed migration completion.'
+}
+
 # A clone whose supervisor cannot be killed: supervisor.json says it was running, Get-SupervisorProcess and Invoke-TaskKill are
 # replaced (functions appended to the clone's own copy of Lifecycle.ps1) by a supervisor with a fake pid that taskkill refuses to
 # end. Nothing here addresses a real process.
@@ -1349,3 +1440,4 @@ Write-Host "$($cases.Count - $failed.Count) of $($cases.Count) lifecycle recover
 if ($failed) { Write-Host "Failed:`n - $(($failed | ForEach-Object { $_.Name }) -join "`n - ")"; exit 1 }
 # The cases run native commands that exit nonzero on purpose; without this a CI step (pwsh -Command) reports the last of them.
 exit 0
+
