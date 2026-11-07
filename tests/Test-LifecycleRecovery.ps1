@@ -894,3 +894,5 @@ Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 $failed = @($cases | Where-Object { -not $_.Passed })
 Write-Host "$($cases.Count - $failed.Count) of $($cases.Count) lifecycle recovery checks passed."
 if ($failed) { Write-Host "Failed:`n - $(($failed | ForEach-Object { $_.Name }) -join "`n - ")"; exit 1 }
+# The cases run native commands that exit nonzero on purpose; without this a CI step (pwsh -Command) reports the last of them.
+exit 0
