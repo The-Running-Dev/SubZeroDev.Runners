@@ -9,6 +9,36 @@ Open a **normal, non-elevated Windows PowerShell** window on a new x64 Windows d
 ```
 
 No manual Git clone, prerequisite installation, terminal restart or registration token copying is needed.
+For automatic setup **and BuildAgent verification** against an existing private repository, supply `-Repository`:
+
+```powershell
+& ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) -Repository The-Running-Dev/SubZeroDev.FileManager -Count 2
+```
+
+This opts into workflow installation and controlled lifecycle tests. Registration defaults to that exact repository. For an
+organization pool, explicitly add `-GitHubUrl https://github.com/AbsoluteZeroDev` and use an `AbsoluteZeroDev/...` private
+repository permitted by its runner group. A public, missing or cross-scope target is refused. Differing acceptance workflows
+are never overwritten. The target must already have a default-branch commit.
+
+After provisioning, the same command downloads the pinned build fixture, checks every clone's BuildAgent readiness, builds
+locally, checks adoption and an unchanged setup rerun, installs/runs the two-build acceptance workflow, and exercises drain,
+timeout and force using disposable hold jobs. The controller verifies each hold job's runner name and ID before stopping
+that clone. Timeout/force runs are cancelled through GitHub afterwards; failed stops retain maintenance and are never
+automatically restarted. Both workflow files remain in the target for later use; existing project workflows are not modified.
+
+Run this from the host's terminal, not from a job on the runner it will stop. Reserve the pair for setup verification.
+Checkpoints are saved in `<InstallRoot>\acceptance-state.json`; existing acceptance output goes under
+`<InstallRoot>\acceptance`. Rerun the same command after a required reboot/sign-out or a failure. Readiness is checked on
+every run; successful stages are reused only while the source commit, registration IDs/names and configuration match.
+Changed inputs invalidate completed checkpoints. These describe earlier test runs, not continuous health.
+An interrupted controlled run is cleaned up before instance installation; a retained/unreadable maintenance hold blocks
+installation until its cause is fixed and maintenance is explicitly ended. A corrupt journal also blocks recovery.
+
+Exit 0 means requested verification passed; exit 1 means failure, and exit 2 means a printed user action is required.
+Browser authorization, UAC consent, Docker's first-run agreement and required reboots/sign-out remain interactive.
+After sign-in, rerun the same command to start the supervisors and resume. Live clean-machine acceptance has not yet
+been collected for this flow.
+
 The entry point supports Windows PowerShell 5.1. It uses Microsoft's `Microsoft.WinGet.Client` repair
 route if WinGet is missing/broken, then silently installs missing PowerShell 7.2+, Git and GitHub CLI.
 Windows may request package-installation elevation or an elevated WinGet repair; the GitHub setup,
@@ -577,4 +607,5 @@ gh run view $runId --repo $smokeRepo --log
 The evidence checker requires successful jobs on both expected names, distinct GitHub runner IDs, and overlapping hold-step intervals. Two successful sequential jobs fail this check. A queued job usually means a missing label, unavailable runner, runner-group repository access, or another job occupying a slot; do not conclude concurrency passed from the dispatch alone. Cancel a stuck run with `gh run cancel $runId --repo $smokeRepo`.
 
 Only results collected from the target host and this actual workflow run establish that the two runners are online and execute jobs concurrently.
+
 

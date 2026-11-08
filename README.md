@@ -34,6 +34,12 @@ Neither needs inbound ports.
 
 ## One-command Windows setup
 
+Add `-Repository OWNER/PRIVATE-REPO -Count 2` to provision and automatically verify BuildAgent and runner lifecycle behavior.
+Registration defaults to that repository; an explicit organization `-GitHubUrl` can share an organization pool. The command
+downloads the pinned fixture, installs acceptance workflows, runs builds and controlled lifecycle checks, and saves resumable
+checkpoints. See [the setup guide](docs/windows-two-runners.md#automatic-setup-recommended). Reporting and telemetry remain
+separate work.
+
 On a new x64 Windows machine or VM, open a **normal Windows PowerShell window** and paste:
 
 ```powershell
@@ -336,3 +342,4 @@ Jobs run code from the repositories that use these runners, with that repository
   Fits `windows\_work`, `windows\_nuget` and other caches; Microsoft advises keeping SDKs
   (here `windows\_tool\dotnet`) on the system drive. No gain for the Linux container, whose
   checkouts are already on a volume in Docker's VM. Works inside a VM too.
+

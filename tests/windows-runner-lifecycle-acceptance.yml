@@ -1,0 +1,30 @@
+# Installed only by explicit -Repository setup. This workflow holds a disposable job for the local lifecycle controller.
+name: Windows runner lifecycle acceptance
+run-name: Windows runner lifecycle acceptance ${{ inputs.correlation }}
+on:
+  workflow_dispatch:
+    inputs:
+      correlation:
+        required: true
+        type: string
+      runner_label:
+        required: true
+        type: string
+      hold_seconds:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  hold:
+    name: Controlled lifecycle job
+    runs-on: [self-hosted, Windows, '${{ inputs.runner_label }}']
+    timeout-minutes: 10
+    steps:
+      - name: Hold controlled acceptance job
+        shell: pwsh
+        env:
+          HOLD_SECONDS: ${{ inputs.hold_seconds }}
+        run: |
+          $seconds = 0
+          if (-not [int]::TryParse($env:HOLD_SECONDS, [ref]$seconds) -or $seconds -lt 30 -or $seconds -gt 300) { throw 'hold_seconds must be 30..300.' }
+          Start-Sleep -Seconds $seconds
