@@ -43,9 +43,10 @@ $registered = Test-Path -LiteralPath (Join-Path $LinuxRunner '.runner')
 $maintenanceFile = Get-LinuxMaintenanceFile
 if ($registered) {
     $drain = Enter-RunnerMaintenance -StateFile $maintenanceFile -RunnerDirectory $LinuxRunner -IsBusy { Test-LinuxRunnerBusy } -Reason 'replace' -TimeoutMinutes $TimeoutMinutes -Force:$Force
-    if ($drain.Outcome -eq 'timeout') {
+    if ($drain.Outcome -in 'timeout', 'failed') {
         $built = if ($Build) { " The new image $($linux.image) is built; rerun this script to replace the container." }
-        [Console]::Error.WriteLine("Runner container kept. $($drain.Retained)$built")
+        $why = if ($drain.Outcome -eq 'failed') { @($drain.Failures) -join ' ' } else { $drain.Retained }
+        [Console]::Error.WriteLine("Runner container kept. $why$built")
         exit 1
     }
     if ($drain.Outcome -eq 'forced' -and (Test-LinuxRunnerBusy)) { Write-Warning 'A running job is cancelled by this replacement (-Force).' }

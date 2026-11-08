@@ -30,8 +30,9 @@ foreach ($file in $files) {
 Write-Output 'PASS: complete PowerShell files parse; installer parameter order and ID validation retained.'
 $installer = Get-Content -Raw (Join-Path $repo 'scripts\Install-WindowsRunner.ps1')
 $start = $installer.IndexOf('$localPath =')
-$end = $installer.IndexOf('$parts =')
-$setup = [scriptblock]::Create($installerParameters + "`n" + $installer.Substring($start, $end - $start).Replace('$PSScriptRoot\Common.ps1', '$root\scripts\Common.ps1'))
+$end = $installer.IndexOf('try {', $start)
+if ($end -lt 0) { throw 'The installer no longer guards its settings write with try; update the test.' }
+$setup = [scriptblock]::Create($installerParameters + "`n" + $installer.Substring($start, $end - $start) + "`n. `"`$root\scripts\Common.ps1`"")
 # The whole installer from the settings phase on, run in-process (the real one refuses an elevated session, as on CI). Every call
 # that would download, register, stop or start is replaced after the real modules load, and the process launch and the scheduler
 # are faked, so nothing is registered with Windows and no real task or Run entry is looked at.
@@ -113,6 +114,14 @@ $injectScheduler = {
         if ($fakeRemoveError) { throw $fakeRemoveError }
         [void]$fakeGone.Add($TaskName)
     }.GetNewClosure()
+    # A fresh clone has an empty runner folder when the migration runs; the installer's later steps need the runner files, so they
+    # are put in place right after the migration returns.
+    $realMigration = ${function:Invoke-LegacyMigration}
+    function Invoke-LegacyMigration {
+        $result = & $realMigration
+        if ($deferFiles) { New-Item -ItemType Directory -Path (Join-Path $WindowsRunner '_tool\dotnet') -Force | Out-Null; Set-Content -LiteralPath (Join-Path $WindowsRunner 'config.cmd') -Value ''; Set-Content -LiteralPath (Join-Path $WindowsRunner '_tool\dotnet\dotnet.exe') -Value '' }
+        $result
+    }
     function Remove-LegacyStartupTasks {
         # Called with no arguments by the migration: the names and scripts are the real defaults of this scope. The Run key is a
         # throwaway that does not exist.
@@ -120,16 +129,17 @@ $injectScheduler = {
     }
 }
 function Invoke-Installer {
-    param([string] $Clone, [switch] $Upgrade, [switch] $NoRunnerFiles, [switch] $Marker, [hashtable] $Scheduler = @{ Tasks = @{} })
+    param([string] $Clone, [switch] $Upgrade, [switch] $NoRunnerFiles, [switch] $Marker, [switch] $Fresh, [hashtable] $Scheduler = @{ Tasks = @{} }, [string] $InstanceId)
     $scriptsDir = Join-Path $Clone 'scripts'
     $root = $Clone
     $schedulerPlan = $Scheduler
     $trace = [Collections.Generic.List[string]]::new()
     $direct = @{ Started = [Collections.Generic.List[object]]::new() }
+    $deferFiles = $Fresh -and -not $NoRunnerFiles
     $windows = Join-Path $Clone 'windows'
     if (Test-Path -LiteralPath $windows) { Remove-Item -LiteralPath $windows -Recurse -Force }
-    New-Item -ItemType Directory -Path (Join-Path $windows '_tool\dotnet') -Force | Out-Null
-    if (-not $NoRunnerFiles) {
+    if (-not $Fresh) { New-Item -ItemType Directory -Path (Join-Path $windows '_tool\dotnet') -Force | Out-Null }
+    if (-not $NoRunnerFiles -and -not $Fresh) {
         Set-Content -LiteralPath (Join-Path $windows 'config.cmd') -Value ''
         Set-Content -LiteralPath (Join-Path $windows '_tool\dotnet\dotnet.exe') -Value ''
     }
@@ -137,7 +147,9 @@ function Invoke-Installer {
     if ($Upgrade) { Set-Content -LiteralPath (Join-Path $windows '.runner') -Value '{"agentName":"before"}' }
     $failure = $null
     $output = @()
-    try { $output = @(. $full) } catch { $failure = $_.Exception.Message }
+    $installArguments = @{}
+    if ($InstanceId) { $installArguments.InstanceId = $InstanceId }
+    try { $output = @(. $full @installArguments) } catch { $failure = $_.Exception.Message }
     [pscustomobject]@{
         Output = @($output | ForEach-Object { "$_" }); Failure = $failure; Trace = $trace; Started = $direct.Started
         Marker = (Test-Path -LiteralPath $LegacyMigrationFile); MarkerFile = $LegacyMigrationFile
@@ -188,14 +200,22 @@ function Test-InstallerMigration([string] $Clone) {
     foreach ($case in @(
             @{ Name = 'removal failure'; Plan = @{ Tasks = $own; RemoveError = 'Access is denied.' }; Pattern = 'Could not remove the legacy task.*Access is denied' }
             @{ Name = 'inspection failure'; Plan = @{ Tasks = $own; InspectError = 'The Task Scheduler service is not running.' }; Pattern = 'Could not look for the legacy task.*not running' })) {
+        $localFile = Join-Path $Clone 'runners.local.json'
+        $localBytes = [IO.File]::ReadAllBytes($localFile)
         $run = Invoke-Installer -Clone $Clone -Upgrade -NoRunnerFiles -Scheduler $case.Plan
+        $registrationAfter = Get-Content -Raw -LiteralPath $run.Runner
+        Assert ((Compare-Object $localBytes ([IO.File]::ReadAllBytes($localFile)) -SyncWindow 0) -eq $null) "The $($case.Name) left runners.local.json changed."
+        Remove-Item -LiteralPath $localFile
+        $absent = Invoke-Installer -Clone $Clone -NoRunnerFiles -Scheduler $case.Plan -InstanceId $probe.Config.windows.instanceId
+        Assert ($absent.Failure -match $case.Pattern -and -not (Test-Path -LiteralPath $localFile)) "The $($case.Name) left a runners.local.json that did not exist before: $($absent.Failure)"
+        [IO.File]::WriteAllBytes($localFile, $localBytes)
         Assert ($run.Failure -match $case.Pattern -and $run.Failure -match 'taskschd\.msc' -and $run.Failure -match 'no migration is recorded') "The $($case.Name) did not fail the install with the fix: $($run.Failure)"
         $touched = @($run.Trace | Where-Object { $_ -in $changes })
         Assert ($touched.Count -eq 0) "The $($case.Name) still changed things first: $($touched -join ', ')"
         Assert ($run.Started.Count -eq 0) "The $($case.Name) still started the supervisor."
         Assert (-not $run.Marker) "The $($case.Name) recorded the migration."
         Assert (-not ($run.Output -match 'online|Supervisor') ) "The $($case.Name) printed success output: $($run.Output -join ' | ')"
-        Assert ((Get-Content -Raw -LiteralPath $run.Runner) -match 'before') 'The failed install changed the registration files.'
+        Assert ($registrationAfter -match 'before') 'The failed install changed the registration files.'
     }
     # Fixed scheduler, same clone: the install completes and records it.
     $fixed = Invoke-Installer -Clone $Clone -Upgrade -Scheduler @{ Tasks = $own }
@@ -207,7 +227,7 @@ function Test-InstallerMigration([string] $Clone) {
     Assert ((Get-Content -Raw -LiteralPath $foreign.MarkerFile) -match 'belongs to another clone') 'The kept foreign task was not recorded.'
     # Fresh and already-migrated installs: a scheduler that fails on any access proves it is not asked.
     $tripwire = @{ Tasks = $own; InspectError = 'TRIPWIRE: the scheduler was asked.'; RemoveError = 'TRIPWIRE: the scheduler was asked.' }
-    $fresh = Invoke-Installer -Clone $Clone -Scheduler $tripwire
+    $fresh = Invoke-Installer -Clone $Clone -Fresh -Scheduler $tripwire
     Assert (-not $fresh.Failure -and $fresh.Marker) "A fresh install failed: $($fresh.Failure)"
     Assert (@($fresh.Trace | Where-Object { $_ -match '^(get|remove):' }).Count -eq 0) "A fresh install asked the scheduler: $(($fresh.Trace | Where-Object { $_ -match '^(get|remove):' }) -join ', ')"
     $repeat = Invoke-Installer -Clone $Clone -Upgrade -Marker -Scheduler $tripwire

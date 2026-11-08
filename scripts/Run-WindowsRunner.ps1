@@ -54,7 +54,8 @@ try {
             Start-Sleep -Seconds $lifecycle.pollSeconds
             continue
         }
-        # One console log per runner launch, so Trim-RunnerLogs.ps1 can age them out like the runner's own logs.
+        # One console log per runner launch, so Trim-RunnerLogs.ps1 (run by the job-completed hook, the installer and
+        # Start-Runners.ps1) can age them out like the runner's own logs.
         $log = Join-Path $diag ('Console_{0:yyyyMMdd-HHmmss}-utc.log' -f [DateTime]::UtcNow)
         $started = Get-Date
         Write-SupervisorStatus @{ state = 'running'; nextRetryUtc = $null; log = $log }
@@ -70,7 +71,7 @@ try {
         # A run that lasted is a healthy supervisor: the streak of supervisor recoveries ends.
         if (-not $quick) { $status.consecutiveRecoveries = 0; $status.repeatedDeaths = $null }
         Write-SupervisorStatus @{
-            state = if ($quickExits) { 'backoff' } else { 'starting' }; restarts = $status.restarts + 1; consecutiveQuickExits = $quickExits
+            state = if ($quickExits) { 'backoff' } else { 'restarting' }; restarts = $status.restarts + 1; consecutiveQuickExits = $quickExits
             lastExitCode = $exitCode; lastExitUtc = [DateTime]::UtcNow.ToString('o'); nextRetryUtc = [DateTime]::UtcNow.AddSeconds($delay).ToString('o')
         }
         # Once per failure streak, not on every retry.

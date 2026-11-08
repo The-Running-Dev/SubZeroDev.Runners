@@ -6,3 +6,15 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\Housekeeping.ps1"
 Write-Output (Clear-RunnerActionCache $WindowsRunner)
+
+# Nothing is scheduled any more, and the supervisor sits inside run.cmd for as long as the runner lives, so this hook (the one
+# thing that runs on a long-lived runner) also keeps the logs and caches within logs.* / housekeeping.*: at most once per
+# $TrimIntervalHours. Its failure is a warning; it never fails the job.
+try {
+    $stamp = Get-Item -LiteralPath $TrimStampFile -ErrorAction SilentlyContinue
+    if (-not $stamp -or ([DateTime]::UtcNow - $stamp.LastWriteTimeUtc).TotalHours -ge $TrimIntervalHours) {
+        & (Join-Path $PSScriptRoot 'Trim-RunnerLogs.ps1') | ForEach-Object { Write-Output $_ }
+    }
+}
+catch { Write-Warning "Housekeeping trim failed: $($_.Exception.Message)" }
+exit 0

@@ -131,6 +131,16 @@ Test-Case 'a drain timeout restores the labels and clears the record' {
     Assert ((Join-Sorted $gh.Custom) -eq 'subzerodev,subzerodev-windows' -and -not (Test-Path -LiteralPath $file)) 'The labels were not restored after the timeout.'
 }
 
+Test-Case 'a drain timeout whose label restoration fails is a "failed" outcome that keeps the record, not an exception' {
+    $dir = New-CaseDirectory; $file = Join-Path $dir 'maintenance.json'; $gh = New-FakeGitHub $file; $gh.AddFails = 'HTTP 503: unavailable'
+    $result = Enter-RunnerMaintenance -StateFile $file -RunnerDirectory $dir -IsBusy { $true } -Reason 'test' -TimeoutMinutes 0
+    Assert ($result.Outcome -eq 'failed' -and (@($result.Failures) -join ' ') -match 'could not be confirmed back' -and (@($result.Failures) -join ' ') -match 'HTTP 503') "Unexpected result: $($result | ConvertTo-Json -Compress)"
+    Assert (Test-Path -LiteralPath $file) 'The recovery record was dropped although the labels are not back.'
+    $gh.AddFails = $null
+    Assert (Exit-RunnerMaintenance $file $dir) 'The retry found nothing to do.'
+    Assert ((Join-Sorted $gh.Custom) -eq 'subzerodev,subzerodev-windows' -and -not (Test-Path -LiteralPath $file)) 'The retry did not restore the labels.'
+}
+
 Test-Case '-Force does not wait for the job' {
     $dir = New-CaseDirectory; $file = Join-Path $dir 'maintenance.json'; $gh = New-FakeGitHub $file
     $result = Enter-RunnerMaintenance -StateFile $file -RunnerDirectory $dir -IsBusy { $true } -Reason 'test' -TimeoutMinutes 5 -Force
@@ -414,8 +424,16 @@ Test-Case 'a failed stop stops re-registration before it changes anything' {
 #   never     alive, never wrote a status                         stale    alive; supervisor.json is its pid but from an earlier start
 #   other-pid alive; supervisor.json belongs to another pid       exit23   exited with code 23 before it initialized
 #   adopt     exited 0 (mutex held); another initialized supervisor (pid 987653) of the instance is running
-function New-FakeSpawn { @{ Order = @(); Started = @(); Mode = 'ok' } }
+#   starting  alive, wrote only its pre-loop 'starting' status       adopt-late  as adopt, but the winner publishes only after a moment
+#   adopt-never  exited 0 (mutex held) and no winner ever shows up
+# $spawn.OnSleep runs once, the first time the code under test sleeps (through the Start-Sleep wrapper below).
+function New-FakeSpawn { @{ Order = @(); Started = @(); Mode = 'ok'; OnSleep = $null } }
 $spawn = New-FakeSpawn
+function Start-Sleep {
+    [CmdletBinding()] param([int] $Seconds, [int] $Milliseconds)
+    if ($spawn.OnSleep) { $hook = $spawn.OnSleep; $spawn.OnSleep = $null; & $hook }
+    if ($Milliseconds) { Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds } elseif ($Seconds) { Microsoft.PowerShell.Utility\Start-Sleep -Seconds $Seconds }
+}
 function Start-Process {
     [CmdletBinding()] param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch] $PassThru)
     $spawn.Order += 'start-process'
@@ -424,7 +442,8 @@ function Start-Process {
     $now = [DateTime]::UtcNow.ToString('o'); $hourAgo = [DateTime]::UtcNow.AddHours(-1).ToString('o')
     $process = [pscustomobject]@{ Id = 987700 }
     switch ($spawn.Mode) {
-        'ok' { $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; Set-SupervisorStatusValues @{ state = 'starting'; pid = 987700; startedUtc = $now } }
+        'ok' { $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; Set-SupervisorStatusValues @{ state = 'running'; pid = 987700; startedUtc = $now } }
+        'starting' { $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; Set-SupervisorStatusValues @{ state = 'starting'; pid = 987700; startedUtc = $now } }
         'orphan' {
             $win.Supervisor = [pscustomobject]@{ ProcessId = 987700 }; $win.Listeners = @([pscustomobject]@{ ProcessId = 987654 })
             Set-SupervisorStatusValues @{ state = 'waiting-for-orphan'; pid = 987700; startedUtc = $now }
@@ -439,6 +458,17 @@ function Start-Process {
         }
         'adopt' {
             $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; Set-SupervisorStatusValues @{ state = 'running'; pid = 987653; startedUtc = $hourAgo }
+            $process | Add-Member -NotePropertyName HasExited -NotePropertyValue $true
+            $process | Add-Member -NotePropertyName ExitCode -NotePropertyValue 0
+        }
+        'adopt-late' {
+            $win.Supervisor = $null
+            $spawn.OnSleep = { $win.Supervisor = [pscustomobject]@{ ProcessId = 987653 }; Set-SupervisorStatusValues @{ state = 'running'; pid = 987653; startedUtc = [DateTime]::UtcNow.AddHours(-1).ToString('o') } }
+            $process | Add-Member -NotePropertyName HasExited -NotePropertyValue $true
+            $process | Add-Member -NotePropertyName ExitCode -NotePropertyValue 0
+        }
+        'adopt-never' {
+            $win.Supervisor = $null
             $process | Add-Member -NotePropertyName HasExited -NotePropertyValue $true
             $process | Add-Member -NotePropertyName ExitCode -NotePropertyValue 0
         }
@@ -631,6 +661,37 @@ Test-Case 'Start: a launch that loses the mutex to an initialized supervisor of 
     Assert ($how -eq 'already running (pid 987653)') "Unexpected result: $how"
 }
 
+Test-Case 'Start: the pre-loop "starting" status is not an initialization' {
+    . Use-WindowsFixture
+    $spawn.Mode = 'starting'
+    Assert-Throws { Start-WindowsRunner -TimeoutSeconds 1 } 'did not report that it initialized' 'A supervisor that only wrote "starting" was reported as started.'
+    foreach ($state in 'running', 'restarting', 'backoff', 'maintenance', 'waiting-for-orphan') {
+        . Use-WindowsFixture
+        Set-SupervisorStatusValues @{ state = $state; pid = 987700; startedUtc = [DateTime]::UtcNow.ToString('o') }
+        Assert ($null -ne (Get-SupervisorInitialization 987700 ([DateTime]::UtcNow.AddMinutes(-1)))) "State $state was not accepted."
+    }
+    foreach ($state in 'starting', 'stopped') {
+        . Use-WindowsFixture
+        Set-SupervisorStatusValues @{ state = $state; pid = 987700; startedUtc = [DateTime]::UtcNow.ToString('o') }
+        Assert ($null -eq (Get-SupervisorInitialization 987700 ([DateTime]::UtcNow.AddMinutes(-1)))) "State $state was accepted."
+    }
+}
+
+Test-Case 'Start: a mutex loser whose winner publishes its pid a moment later still adopts it' {
+    . Use-WindowsFixture
+    $spawn.Mode = 'adopt-late'
+    $how = Start-WindowsRunner
+    Assert ($how -eq 'already running (pid 987653)') "Unexpected result: $how"
+}
+
+Test-Case 'Start: a mutex loser with no winner fails after the bounded grace' {
+    . Use-WindowsFixture
+    $spawn.Mode = 'adopt-never'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    Assert-Throws { Start-WindowsRunner -TimeoutSeconds 2 } 'exited with code 0 before it initialized' 'A mutex loser with no winner was reported as started.'
+    Assert ($clock.Elapsed.TotalSeconds -lt 10) "The grace was not bounded: $($clock.Elapsed.TotalSeconds) s."
+}
+
 Test-Case 'No script outside the legacy cleanup registers, starts or inspects scheduled tasks, and the config has no startup or trim-time setting' {
     $hits = Get-ChildItem -LiteralPath (Join-Path $repo 'scripts') -Filter '*.ps1' | Where-Object { $_.Name -ne 'LegacyCleanup.ps1' } |
         Where-Object { (Get-Content -Raw -LiteralPath $_.FullName) -match 'ScheduledTask|schtasks|CurrentVersion.Run' } | ForEach-Object { $_.Name }
@@ -675,6 +736,15 @@ Test-Case 'Recovery: a supervisor found dead 3 times in a row is reported as rep
     Assert ($recovery.repeatedDeaths -notmatch 'retr|Task Scheduler') "The text talks about retries or Task Scheduler: $($recovery.repeatedDeaths)"
     $recovery = Get-SupervisorRecovery ([pscustomobject]@{ state = 'stopped'; repeatedDeaths = 'KEPT' })
     Assert ($recovery.repeatedDeaths -eq 'KEPT') 'A stop on purpose dropped the recorded repeated deaths (only a long run clears them).'
+}
+
+Test-Case 'Recovery: deaths more than 6 hours apart start a new streak; recent ones keep accumulating' {
+    Assert ($SupervisorDeathStreakHours -eq 6) "The window is $SupervisorDeathStreakHours hours."
+    $old = [DateTime]::UtcNow.AddHours(-7).ToString('o'); $recent = [DateTime]::UtcNow.AddHours(-1).ToString('o')
+    $recovery = Get-SupervisorRecovery ([pscustomobject]@{ state = 'running'; pid = 1; recoveries = 9; consecutiveRecoveries = 2; lastRecoveryUtc = $old; repeatedDeaths = 'OLD' })
+    Assert ($recovery.recoveries -eq 10 -and $recovery.consecutiveRecoveries -eq 1 -and -not $recovery.repeatedDeaths) "An old streak was carried over: $($recovery | ConvertTo-Json -Compress)"
+    $recovery = Get-SupervisorRecovery ([pscustomobject]@{ state = 'running'; pid = 1; recoveries = 9; consecutiveRecoveries = 2; lastRecoveryUtc = $recent })
+    Assert ($recovery.consecutiveRecoveries -eq 3 -and $recovery.repeatedDeaths) "A recent streak was reset: $($recovery | ConvertTo-Json -Compress)"
 }
 
 Test-Case 'Recovery report: down is not running without a clean stop; the summary says nothing restarts it and what to do' {
@@ -1004,6 +1074,59 @@ Test-Case 'Legacy migration: a fresh install is recorded without looking at the 
     Assert ($result.Kind -eq 'fresh' -and $result.Changed) "Fresh: $($result | ConvertTo-Json -Compress)"
     Assert ($scheduler.Calls.Count -eq 0) "A fresh install asked the scheduler: $($scheduler.Calls -join ', ')"
     Assert ((Get-LegacyMigration).kind -eq 'fresh') 'A fresh install is not recorded.'
+}
+
+Test-Case 'Legacy migration: any content in the runner folder (a log, a pid file) is an upgrade, and the scheduler is asked' {
+    $case = New-MigrationCase
+    Set-Content -LiteralPath (Join-Path $case.Windows 'runner-console.log') -Value 'x'
+    $scheduler = New-FakeScheduler -Tasks @{ Mine = $case.Script }
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $result = Invoke-LegacyMigration
+    Assert ($result.Kind -eq 'upgraded' -and $scheduler.Calls.Count -gt 0) "A used folder was recorded as fresh and left its task: $($result | ConvertTo-Json -Compress)"
+    Assert (-not $scheduler.Tasks.ContainsKey('Mine')) 'The owned task is still registered.'
+}
+
+Test-Case 'Legacy ownership: a path matches case-insensitively and only up to a boundary' {
+    Assert (Test-LegacyPathReferenced '-File "C:\Runners\scripts\Run-WindowsRunner.ps1"' 'c:\runners\SCRIPTS\run-windowsrunner.ps1') 'A path that differs only in case did not match.'
+    Assert (Test-LegacyPathReferenced '"pwsh.exe" -File C:\Runners\scripts\Start-Runners.ps1' 'C:\Runners\scripts\Start-Runners.ps1') 'A path at the end of the text did not match.'
+    Assert (Test-LegacyPathReferenced '-File C:\Runners\scripts\x.ps1' 'C:\Runners\scripts') 'A folder followed by a separator did not match.'
+    Assert (-not (Test-LegacyPathReferenced '-File "C:\Runners-old\scripts\x.ps1"' 'C:\Runners')) 'A sibling folder with the same prefix matched.'
+    Assert (Test-LegacyPathReferenced '-File "C:\Runners-old\x.ps1" -File "C:\Runners\x.ps1"' 'C:\Runners') 'A later real match was missed after a sibling.'
+    Assert (-not (Test-LegacyPathReferenced '' 'C:\Runners') -and -not (Test-LegacyPathReferenced 'C:\Runners' '')) 'Empty input matched.'
+}
+
+Test-Case 'Legacy migration: a task of this clone is removed when its path differs only in case' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler -Tasks @{ Mine = $case.Script.ToUpperInvariant() }
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $null = Invoke-LegacyMigration
+    Assert (-not $scheduler.Tasks.ContainsKey('Mine')) 'A task registered with another spelling of this clone''s path was left behind.'
+}
+
+Test-Case 'Legacy migration: a task for a different file with the same prefix is kept' {
+    $case = New-MigrationCase -Upgrade
+    $scheduler = New-FakeScheduler -Tasks @{ Mine = "$($case.Script).bak" }
+    $WindowsRunner = $case.Windows; $LegacyMigrationFile = $case.Marker
+    . $UseFakeScheduler
+    $null = Invoke-LegacyMigration
+    Assert ($scheduler.Tasks.ContainsKey('Mine') -and @($scheduler.Calls | Where-Object { $_ -like 'remove:*' }).Count -eq 0) 'A task for a different file with the same prefix was removed.'
+}
+
+Test-Case 'Legacy Run entry: an upgrade is recognised from a Run value that runs this clone, in any case; a sibling clone''s is not' {
+    $scratch = Use-LegacyScratch
+    try {
+        New-Item -Path $scratch.RunKey -Force | Out-Null
+        Set-ItemProperty -LiteralPath $scratch.RunKey -Name 'Mine' -Value "`"$Pwsh`" -File `"$((Join-Path $repo 'scripts\Start-Runners.ps1').ToUpperInvariant())`""
+        $WindowsRunner = Join-Path (New-CaseDirectory) 'windows'
+        Assert (Test-LegacyUpgrade -RunKey $scratch.RunKey -RunValueName 'Mine') 'A Run value that runs this clone did not mark an upgrade.'
+        $result = Remove-LegacyStartupTasks -TaskPath $scratch.TaskPath -Tasks @() -RunKey $scratch.RunKey -RunValueName 'Mine'
+        Assert ($result.Removed.Count -eq 1 -and $result.Failed.Count -eq 0) "The value was not removed: $($result.Removed -join ' | ') / $($result.Failed -join ' | ')"
+        Set-ItemProperty -LiteralPath $scratch.RunKey -Name 'Mine' -Value "`"$Pwsh`" -File `"$($repo)-old\scripts\Start-Runners.ps1`""
+        Assert (-not (Test-LegacyUpgrade -RunKey $scratch.RunKey -RunValueName 'Mine')) 'A sibling clone''s Run value marked an upgrade.'
+    }
+    finally { Remove-LegacyScratch $scratch }
 }
 
 Test-Case 'Legacy migration: another clone''s task with the same name is kept, does not block, and the migration is recorded' {

@@ -66,6 +66,11 @@ if ($Config.windows.instanceId) { $WindowsMutexName += ".$($Config.windows.insta
 # supervisor itself, with backoff. A supervisor that is found dead by its successor this many times in a row is reported as one
 # that keeps dying.
 $SupervisorRepeatedDeaths = 3
+# Deaths further apart than this are not a streak: a supervisor that ran for longer, then died (a reboot, a logoff), starts a new count.
+$SupervisorDeathStreakHours = 6
+# Housekeeping (Trim-RunnerLogs.ps1) is not scheduled: the job-completed hook runs it when it has not run for this long.
+$TrimIntervalHours = 24
+$TrimStampFile = Join-Path $WindowsRunner 'last-trim.txt'
 # How long Start-WindowsRunner waits for a launched supervisor to write its initialization status before it fails.
 $SupervisorStartTimeoutSeconds = [int]$Config.lifecycle.startTimeoutSeconds
 
@@ -110,7 +115,8 @@ function Set-SupervisorStatusValues([hashtable] $Values) {
 
 # What a starting supervisor concludes from the status its predecessor left. A predecessor stopped on purpose is marked
 # 'stopped' (by itself, or by Stop-WindowsRunnerProcesses after killing it); any other state means it died without cleaning up,
-# which is a recovery. consecutiveRecoveries is reset by the supervisor once a run lasts past the quick-exit threshold.
+# which is a recovery. consecutiveRecoveries restarts when the previous recovery is older than $SupervisorDeathStreakHours, or
+# when the supervisor sees a run that lasts past the quick-exit threshold.
 function Get-SupervisorRecovery($Previous) {
     $count = { param($value) if ($null -ne $value) { [int]$value } else { 0 } }
     $recovery = @{
@@ -119,6 +125,14 @@ function Get-SupervisorRecovery($Previous) {
         repeatedDeaths = $Previous.repeatedDeaths
     }
     if ($Previous -and $Previous.state -and $Previous.state -ne 'stopped') {
+        # The supervisor can run for weeks inside one run.cmd, so the streak cannot be ended by a relaunch. A death long after the
+        # previous recovery is a new streak, not the third in a row.
+        $last = [DateTime]::MinValue
+        if ($recovery.lastRecoveryUtc -and [DateTime]::TryParse("$($recovery.lastRecoveryUtc)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref] $last) -and
+            ([DateTime]::UtcNow - $last.ToUniversalTime()).TotalHours -gt $SupervisorDeathStreakHours) {
+            $recovery.consecutiveRecoveries = 0
+            $recovery.repeatedDeaths = $null
+        }
         $recovery.recoveries++
         $recovery.consecutiveRecoveries++
         $recovery.lastRecoveryUtc = [DateTime]::UtcNow.ToString('o')

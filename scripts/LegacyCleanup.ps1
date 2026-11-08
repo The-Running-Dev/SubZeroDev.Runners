@@ -23,6 +23,19 @@ function Get-LegacyRunValue([string] $RunKey, [string] $RunValueName) {
     if ($property) { $property.Value }
 }
 
+# Does Text run Path? Windows paths are case-insensitive, and a path that is only the start of a longer one (C:\runners inside
+# C:\runners-old\...) is a different path: the match must end at the end of the text, a quote, whitespace or a path separator.
+function Test-LegacyPathReferenced([string] $Text, [string] $Path) {
+    if (-not $Text -or -not $Path) { return $false }
+    $from = 0
+    while (($at = $Text.IndexOf($Path, $from, [StringComparison]::OrdinalIgnoreCase)) -ge 0) {
+        $end = $at + $Path.Length
+        if ($end -ge $Text.Length -or '"''\/'.IndexOf($Text[$end]) -ge 0 -or [char]::IsWhiteSpace($Text[$end])) { return $true }
+        $from = $at + 1
+    }
+    $false
+}
+
 function Remove-LegacyStartupTasks {
     param(
         [string] $TaskPath = $LegacyTaskPath,
@@ -49,7 +62,7 @@ function Remove-LegacyStartupTasks {
         }
         if (-not $task) { continue }
         $arguments = (@($task.Actions) | ForEach-Object { "$($_.Arguments)" }) -join ' '
-        if (-not $arguments.Contains('"' + $entry.Script + '"')) {
+        if (-not (Test-LegacyPathReferenced $arguments $entry.Script)) {
             $result.Kept.Add("Left the task ${label}: its action does not run $($entry.Script), so it belongs to another clone.")
             continue
         }
@@ -70,7 +83,7 @@ function Remove-LegacyStartupTasks {
     try {
         $value = Get-LegacyRunValue $RunKey $RunValueName
         if ($value) {
-            if ("$value".Contains($PSScriptRoot)) {
+            if (Test-LegacyPathReferenced "$value" $PSScriptRoot) {
                 Remove-ItemProperty -LiteralPath $RunKey -Name $RunValueName -ErrorAction Stop
                 if (Get-LegacyRunValue $RunKey $RunValueName) {
                     $result.Failed.Add("The legacy sign-in entry $RunValueName is still in $RunKey after it was removed.")
@@ -84,13 +97,16 @@ function Remove-LegacyStartupTasks {
     $result
 }
 
-# A clone that has run before (a registration, a supervisor pid or status file) may have been given startup entries by an
-# earlier version. A clone with none of these has never been set up: nothing could have registered anything for it.
+# A clone that has been set up before may have been given startup entries by an earlier version. Evidence of that, none of it
+# from Task Scheduler: anything at all in the runner folder (a registration, a pid or status file, logs, an extracted runner;
+# the installer creates the folder only after the migration), or a sign-in entry in the Run key that runs this clone's scripts.
+# A clone with none of these has never been set up: nothing could have registered anything for it.
 function Test-LegacyUpgrade {
-    foreach ($name in '.runner', 'supervisor.json', 'supervisor.pid') {
-        if (Test-Path -LiteralPath (Join-Path $WindowsRunner $name)) { return $true }
-    }
-    $false
+    param([string] $RunKey = $LegacyRunKey, [string] $RunValueName = $LegacyStartupValueName)
+    if ((Test-Path -LiteralPath $WindowsRunner -PathType Container) -and (Get-ChildItem -LiteralPath $WindowsRunner -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) { return $true }
+    # Unreadable is not absent: when the Run key cannot be read, treat the clone as one that may have an entry.
+    try { Test-LegacyPathReferenced "$(Get-LegacyRunValue $RunKey $RunValueName)" $PSScriptRoot }
+    catch { $true }
 }
 
 function Save-LegacyMigration([string] $Kind, [string[]] $Removed = @(), [string[]] $Kept = @()) {

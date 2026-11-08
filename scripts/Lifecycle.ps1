@@ -177,7 +177,8 @@ function Wait-RunnerIdle {
     }
 }
 
-# Closes admission and waits for idle. Result.Outcome: idle | forced | timeout.
+# Closes admission and waits for idle. Result.Outcome: idle | forced | timeout | failed (timed out, and the labels could not be
+# confirmed back: Failures says so and the recovery record is kept).
 # The recovery record is written before any label is withdrawn: phase 'closing', then 'draining' once the withdrawal is
 # verified. If the withdrawal fails or cannot be verified the labels are put back at once, and the record stays when that
 # cannot be confirmed either. On timeout nothing is stopped, admission is reopened and Result.Retained says what is still running.
@@ -227,7 +228,15 @@ function Enter-RunnerMaintenance {
     $wait = Wait-RunnerIdle -IsBusy $IsBusy -RunnerDirectory $RunnerDirectory -TimeoutMinutes $TimeoutMinutes -PollSeconds $Config.lifecycle.pollSeconds -UseGitHub ([bool]$admission)
     if ($wait.Idle) { return [pscustomobject]@{ Outcome = 'idle'; Admission = $note; Retained = $null } }
     $retained = "A job was still running after $TimeoutMinutes minutes. Nothing was stopped; the runner takes jobs again (labels restored, maintenance cleared)."
-    Exit-RunnerMaintenance $StateFile $RunnerDirectory | Out-Null
+    # Reopening admission can fail like any other GitHub call: report it as an outcome, with the record kept, rather than throwing
+    # past callers that only look at Outcome.
+    try { Exit-RunnerMaintenance $StateFile $RunnerDirectory | Out-Null }
+    catch {
+        return [pscustomobject]@{
+            Outcome = 'failed'; Admission = $note; Retained = $retained; Cancelled = $null
+            Failures = @("A job was still running after $TimeoutMinutes minutes and nothing was stopped, but the labels could not be confirmed back on the runner: $($_.Exception.Message) The recovery record $StateFile keeps them; ending maintenance (Manage-WindowsRunner.ps1 -Action Start, or rerunning this command) restores them.")
+        }
+    }
     [pscustomobject]@{ Outcome = 'timeout'; Admission = $note; Retained = $retained }
 }
 
@@ -294,7 +303,7 @@ function New-StopFailure($Result, [string[]] $Failures, $Cancelled) {
 function Stop-WindowsRunner {
     param([int] $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes, [switch] $Force, [switch] $Hold, [string] $Reason = 'stop')
     $result = Enter-RunnerMaintenance -StateFile $MaintenanceFile -RunnerDirectory $WindowsRunner -IsBusy { Test-WindowsRunnerBusy } -Reason $Reason -TimeoutMinutes $TimeoutMinutes -Force:$Force
-    if ($result.Outcome -eq 'timeout') { return $result }
+    if ($result.Outcome -in 'timeout', 'failed') { return $result }
     $cancelled = if ($result.Outcome -eq 'forced' -and (Test-WindowsRunnerBusy)) { 'A running job was cancelled.' }
     $stop = Stop-WindowsRunnerProcesses
     if (-not $stop.Stopped) {
@@ -319,7 +328,9 @@ function Stop-WindowsRunner {
 function Get-SupervisorInitialization([int] $ProcessId, [datetime] $Since) {
     $status = Get-SupervisorStatus
     if (-not $status -or $status.pid -ne $ProcessId -or -not $status.startedUtc) { return }
-    if ($status.state -notin 'starting', 'running', 'backoff', 'maintenance', 'waiting-for-orphan') { return }
+    # 'starting' is the first thing the supervisor writes, before it has entered its loop: it proves nothing yet. The states below
+    # are written only from inside the loop ('restarting' is the pause between two launches of run.cmd).
+    if ($status.state -notin 'running', 'restarting', 'backoff', 'maintenance', 'waiting-for-orphan') { return }
     try { $startedUtc = ([datetime]$status.startedUtc).ToUniversalTime() } catch { return }
     if ($startedUtc -lt $Since.ToUniversalTime()) { return }
     $status
@@ -334,6 +345,7 @@ function Wait-SupervisorInitialized {
     param([object] $Process, [datetime] $Since, [int] $TimeoutSeconds = $SupervisorStartTimeoutSeconds)
     $expectedId = [int]$Process.Id
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $adoptDeadline = $null
     while ($true) {
         $found = Get-SupervisorProcess
         if ($found -and [int]$found.ProcessId -eq $expectedId) {
@@ -346,6 +358,12 @@ function Wait-SupervisorInitialized {
             $exitCode = $Process.ExitCode
             $winner = Get-SupervisorProcess
             if ($exitCode -eq 0 -and $winner -and [int]$winner.ProcessId -ne $expectedId) { $expectedId = [int]$winner.ProcessId; $Since = [datetime]::MinValue; continue }
+            # Exit 0 is what a supervisor that lost the mutex does. The winner may not have published its pid file yet (it takes
+            # the mutex first), so give it a short, bounded moment before calling this a failure.
+            if ($exitCode -eq 0) {
+                if (-not $adoptDeadline) { $adoptDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(5, $TimeoutSeconds)) }
+                if ([DateTime]::UtcNow -lt $adoptDeadline -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 250; continue }
+            }
             throw "The supervisor (pid $($Process.Id)) exited with code $exitCode before it initialized ($seen). Run it in a console to see why: pwsh -File `"$Supervisor`""
         }
         if ([DateTime]::UtcNow -ge $deadline) {
@@ -444,7 +462,7 @@ function Stop-LinuxRunners {
     $result = [pscustomobject]@{ Outcome = 'idle'; Admission = 'no registration'; Retained = $null }
     if ($registered) {
         $result = Enter-RunnerMaintenance -StateFile (Get-LinuxMaintenanceFile) -RunnerDirectory $LinuxRunner -IsBusy { Test-LinuxRunnerBusy } -Reason 'stop' -TimeoutMinutes $TimeoutMinutes -Force:$Force
-        if ($result.Outcome -eq 'timeout') { return $result }
+        if ($result.Outcome -in 'timeout', 'failed') { return $result }
     }
     $containers = @()
     $failed = $null

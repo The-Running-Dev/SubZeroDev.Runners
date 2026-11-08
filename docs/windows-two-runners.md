@@ -92,7 +92,7 @@ Linux container.
   jobs on different instances do not interfere. Two jobs on the same instance wait for each other (one runner takes one
   job at a time anyway).
 - **Caches are per instance, not shared.** The first build on each instance is cold. `buildAgent.cache.retentionDays`/`maxGB`
-  bound them (applied by `Trim-RunnerLogs.ps1`, which `Start-Runners.ps1` and `Install-WindowsRunner.ps1` run; nothing schedules it). A shared host cache would need a second mount, which BuildAgent does not offer;
+  bound them (applied by `Trim-RunnerLogs.ps1`, which `Start-Runners.ps1`, `Install-WindowsRunner.ps1` and, at most once a day, the Windows job-completed hook run; nothing schedules it). A shared host cache would need a second mount, which BuildAgent does not offer;
   `buildAgent.paths.extraMounts` is therefore required to be empty.
 - Paths that cannot be mounted safely are refused before the build starts: UNC paths, folders inside Dropbox, folders that
   overlap a runner clone, paths containing a comma, an output directory outside the workspace.

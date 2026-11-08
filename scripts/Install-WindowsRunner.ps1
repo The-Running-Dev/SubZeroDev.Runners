@@ -69,27 +69,41 @@ if ($InstanceId) { $local.windows.instanceId = $InstanceId }
 $local.windows.name = $Name
 $local.windows.labels = @(@($shared.windows.labels) + $ExtraLabels | Select-Object -Unique)
 $local.windows.workFolder = $WorkFolder
+# Common.ps1 reads these settings, so they are written before it is loaded; a refusal below puts the file back as it was
+# (or removes it when there was none), so a failed install leaves nothing changed.
+$localBefore = if (Test-Path -LiteralPath $localPath) { [IO.File]::ReadAllBytes($localPath) }
 $local | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $localPath
-. "$PSScriptRoot\Common.ps1"
+try {
+    . "$PSScriptRoot\Common.ps1"
 
-$parts = ([Uri]$GitHubUrl).AbsolutePath.Trim('/').Split('/')
-. "$PSScriptRoot\Registration.ps1"
-. "$PSScriptRoot\Lifecycle.ps1"
-. "$PSScriptRoot\RunnerArchive.ps1"
-$scope = Get-RunnerScope $GitHubUrl
+    $parts = ([Uri]$GitHubUrl).AbsolutePath.Trim('/').Split('/')
+    . "$PSScriptRoot\Registration.ps1"
+    . "$PSScriptRoot\Lifecycle.ps1"
+    . "$PSScriptRoot\RunnerArchive.ps1"
+    $scope = Get-RunnerScope $GitHubUrl
+    if (Get-MaintenanceState) { throw "This runner is held in maintenance ($MaintenanceFile). Run Manage-WindowsRunner.ps1 -Action Start, then rerun this script." }
+
+    # Legacy startup migration, before anything else changes: a download, a registration change or a process stop has not happened
+    # yet, so a startup entry of an earlier version that cannot be removed or verified gone fails the install here (nonzero, with
+    # the fix) and leaves everything as it was. A fresh clone is recorded without asking Task Scheduler; an already migrated one
+    # is a no-op; an upgrade removes this clone's entries and verifies them gone (another clone's are kept and do not block).
+    . "$PSScriptRoot\LegacyCleanup.ps1"
+    $migration = Invoke-LegacyMigration
+}
+catch {
+    $failure = $_
+    try {
+        if ($null -ne $localBefore) { [IO.File]::WriteAllBytes($localPath, $localBefore) }
+        else { Remove-Item -LiteralPath $localPath -Force -ErrorAction Stop }
+    }
+    catch { Write-Warning "Could not restore $localPath after the install stopped: $($_.Exception.Message)" }
+    throw $failure
+}
+foreach ($line in $migration.Lines) { Write-Output $line }
 function Get-RunnerStatus {
     $runner = Get-GitHubRunner $scope $Name
     if ($runner) { $runner.Status }
 }
-if (Get-MaintenanceState) { throw "This runner is held in maintenance ($MaintenanceFile). Run Manage-WindowsRunner.ps1 -Action Start, then rerun this script." }
-
-# Legacy startup migration, before anything else changes: a download, a registration change or a process stop has not happened
-# yet, so a startup entry of an earlier version that cannot be removed or verified gone fails the install here (nonzero, with
-# the fix) and leaves everything as it was. A fresh clone is recorded without asking Task Scheduler; an already migrated one
-# is a no-op; an upgrade removes this clone's entries and verifies them gone (another clone's are kept and do not block).
-. "$PSScriptRoot\LegacyCleanup.ps1"
-$migration = Invoke-LegacyMigration
-foreach ($line in $migration.Lines) { Write-Output $line }
 
 # Runner binaries, checked against the digest GitHub publishes for the release.
 New-Item -ItemType Directory -Force $WindowsRunner | Out-Null

@@ -1,6 +1,7 @@
 # Paths that stay on this PC only. Scripts\Set-DropboxIgnored.ps1 marks each match with
-# Dropbox's com.dropbox.ignored stream; Start-Runners.ps1 and the daily log task reapply it,
-# so folders created later (runner updates, new caches) are picked up.
+# Dropbox's com.dropbox.ignored stream; Start-Runners.ps1, Install-WindowsRunner.ps1 and the
+# housekeeping run by the job-completed hook (Trim-RunnerLogs.ps1) reapply it, so folders created later (runner updates,
+# new caches) are picked up.
 # One path per line, relative to this folder; * and ? wildcards are allowed.
 
 # Windows runner: binaries (re-extracted or self-updated), toolchain, caches, workspace, logs
@@ -15,6 +16,11 @@ windows/_dotnet-home
 windows/_diag
 windows/runner-console.log
 windows/supervisor.pid
+windows/supervisor.json
+windows/maintenance.json
+windows/legacy-migration.json
+windows/legacy-migration.json.tmp
+windows/last-trim.txt
 
 # Linux runner, mounted at /runner in the container
 linux/runner/bin
