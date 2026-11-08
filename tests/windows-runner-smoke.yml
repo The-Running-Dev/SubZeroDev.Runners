@@ -1,5 +1,7 @@
 # Copy to .github/workflows/windows-runner-smoke.yml in an authorized AbsoluteZeroDev repository.
 # Deliberately a template: this personal-account repository cannot use organization-scoped runners.
+# Concurrency only: two runners overlapping on a 90 s sleep. It builds nothing and is NOT BuildAgent validation;
+# use windows-runner-buildagent.yml for that.
 name: Windows runner concurrency smoke
 run-name: Windows runner smoke ${{ inputs.setup_id }}
 

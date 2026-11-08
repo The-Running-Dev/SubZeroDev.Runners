@@ -21,6 +21,15 @@ jobs:
       - name: Verify smoke evidence checker with synthetic job results
         shell: pwsh
         run: ./tests/Test-WindowsRunnerSmokeEvidence.ps1
+      - name: Verify BuildAgent acceptance checker with synthetic evidence
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerBuildAgentEvidence.ps1
+      - name: Verify BuildAgent acceptance dispatch with a fake gh
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerBuildAgentDispatch.ps1
+      - name: Verify host acceptance against fake clones
+        shell: pwsh
+        run: ./tests/Test-WindowsHostAcceptance.ps1
       - name: Exercise bootstrap under stock Windows PowerShell 5.1
         shell: powershell
         run: ./tests/Test-WindowsRunnerBootstrap.ps1

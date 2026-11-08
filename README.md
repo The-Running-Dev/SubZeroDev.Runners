@@ -193,6 +193,8 @@ and the Docker socket, so:
 - a Windows executable is never run inside the Linux container: only the build types BuildAgent defines (`docker`, `node`,
   `node-in-docker`, `node-template`, `forge`) are accepted.
 
+Acceptance of real builds is separate from the 90 s concurrency smoke (which proves overlap only): `tests/windows-runner-buildagent.yml` runs two concurrent builds of a known-good project plus a failing build and uploads an acceptance report (`tests/Invoke-WindowsRunnerBuildAgentAcceptance.ps1`), and `tests/Invoke-WindowsHostAcceptance.ps1` checks the host (readiness, build, adoption, unchanged rerun, drain/timeout/force). The build checker re-reads the downloaded site files (expected file, length, SHA-256, own and foreign markers) instead of trusting `report.json`, and the disruptive host stages never restart a runner whose stop was not verified. Both are manual and opt-in; see [docs/windows-two-runners.md](docs/windows-two-runners.md#buildagent-acceptance-real-builds) for the commands and which evidence is still uncollected.
+
 The build jobs run unelevated, as the runner's user. That user needs Docker Desktop's pipe: setup reports `docker-users`
 membership (which needs a sign-out and sign-in) as an action rather than changing it silently.
 
@@ -203,7 +205,7 @@ membership (which needs a sign-out and sign-in) as an action rather than changin
 container). Only a `BuildAgent.Tool` containing Docker-BuildAgent PR #136 can update this container (2.1.0 refuses a
 privileged container or one with CPU/memory limits), and that change has **no published artifact yet**, so
 `buildAgent.updater.version` is `null` and `-Update` stops with that reason; `Get-BuildAgentStatus.ps1` shows the same. Set
-the version only to an exact published release containing #136, never to `latest`. Notes that hold once it is available:
+the version only to an exact published release containing #136, never to `latest`; this repository does not duplicate the updater. After publication, validate a healthy update, restoration when the replacement fails its health check, and an interrupted update on Docker Desktop. Notes that hold once it is available:
 
 - restore puts back the container, **not** what the replacement changed in the mounted `/runner` folder (runner binaries,
   registration, credentials) or in volumes. The runner's own mounted self-update still works as before and is outside

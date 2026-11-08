@@ -36,6 +36,29 @@ function Test-LegacyPathReferenced([string] $Text, [string] $Path) {
     $false
 }
 
+# Read-only look at this clone's leftover legacy entries, for tests\Invoke-WindowsHostAcceptance.ps1 (through Get-RunnerFacts.ps1).
+# Changes nothing. Returns Tasks (one row each: Name, Present, RunsThisClone, Error) and RunEntry (present, runsThisClone, error).
+function Get-LegacyEntryFacts {
+    param([Parameter(Mandatory)] [object[]] $Entries, [Parameter(Mandatory)] [string] $RunScriptFolder)
+    $tasks = foreach ($entry in $Entries) {
+        $row = [ordered]@{ Name = $entry.Name; Present = $false; RunsThisClone = $false; Error = $null }
+        try {
+            $task = ScheduledTasks\Get-ScheduledTask -TaskPath $LegacyTaskPath -TaskName $entry.Name -ErrorAction Stop
+            $row.Present = $true
+            $row.RunsThisClone = Test-LegacyPathReferenced ((@($task.Actions) | ForEach-Object { "$($_.Arguments)" }) -join ' ') $entry.Script
+        }
+        catch { if (-not (Test-LegacyTaskMissing $_)) { $row.Error = $_.Exception.Message } }
+        [pscustomobject]$row
+    }
+    $runValue = $null
+    $runError = $null
+    try { $runValue = Get-LegacyRunValue $LegacyRunKey $LegacyStartupValueName } catch { $runError = $_.Exception.Message }
+    [pscustomobject]@{
+        Tasks = @($tasks)
+        RunEntry = [ordered]@{ present = [bool]$runValue; runsThisClone = (Test-LegacyPathReferenced "$runValue" $RunScriptFolder); error = $runError }
+    }
+}
+
 function Remove-LegacyStartupTasks {
     param(
         [string] $TaskPath = $LegacyTaskPath,

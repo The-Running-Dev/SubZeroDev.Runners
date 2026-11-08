@@ -245,6 +245,89 @@ Linux container.
 
 BuildAgent's exit status is passed through unchanged, with its documented meaning printed on failure.
 
+## BuildAgent acceptance (real builds)
+
+The 90 s sleep in the smoke workflow below proves only that two runners overlap. It builds nothing and says nothing about
+BuildAgent. Acceptance of BuildAgent on these runners is a separate, manual, opt-in set of commands. None of it runs in CI
+and none of it has been run for this change: the results below are what you collect on the host.
+
+**1. Two concurrent real builds (GitHub).** `tests\windows-runner-buildagent.yml` is a `workflow_dispatch` template for a
+private repository **inside the organization the runners are registered to** (an `AbsoluteZeroDev` repository, not the
+personal account: organization runners cannot run workflows of the personal account). It builds the owner's known-working
+project, `The-Running-Dev/GitHub-ActionTemplates` at `1c3b5f76554aca455cd4a284c4e473edd21c0d72`, `tests/fixtures/docusaurus`,
+with `Invoke-BuildAgent.ps1 -Type node-template -AppDir docs` called through `$env:SZR_SCRIPTS`. Jobs:
+
+| Job | Proves |
+| --- | --- |
+| `Build slot 1`, `Build slot 2` (one per runner instance, overlapping) | the host, the pinned tool version and the pinned image digest, a reachable Linux Docker daemon, a build that exits 0 and the expected `docs/build/index.html` in that instance's own workspace, stamped with the job's own marker; uploads the build log, the site and a per-job report |
+| `Failure propagation` | a deliberately failing `node` build fails with a BuildAgent failure code (1 or 255; 0, 5 and 125 are rejected) |
+| `Acceptance report` | judges the evidence of all three and uploads `buildagent-acceptance-report` |
+
+```powershell
+# From a clone on the host, with `gh` signed in and able to use the organization repository's Actions:
+.\tests\Invoke-WindowsRunnerBuildAgentAcceptance.ps1 -Repository AbsoluteZeroDev/<private-repo> [-InstallWorkflow]
+```
+
+The script refuses a public repository, never overwrites a differing workflow, commits the workflow only with
+`-InstallWorkflow`, dispatches with the `runners.json` pins, waits, then runs `Assert-WindowsRunnerBuildAgent.ps1`, which
+rereads GitHub's own job records and artifacts and fails unless all of these hold:
+
+- two successful build jobs on the two **distinct expected runner names** (distinct GitHub runner IDs) and their overlapping
+  build steps;
+- separate workspaces and caches per runner;
+- the downloaded files, not the reports, prove the output. The checker is given each downloaded artifact folder
+  (`buildagent-slot-N`) and requires the expected file there. The mapping is explicit: the workspace-relative artifact
+  `docs/build/index.html` is uploaded as `site/index.html` (the site directory `docs/build` becomes `site/`; an artifact outside
+  it, or with a `..`, `.`, empty or drive segment, has no uploaded path and fails). It recomputes the file's length and SHA-256
+  and compares both with `report.json`; a missing, empty, modified or re-recorded file fails even when `report.json` says it
+  exists;
+- no cross-contamination, judged from the uploaded `site/` (every file), not from `report.json`: the job's own marker
+  (`acceptance-marker-r<run>-a<attempt>-slot<N>`, of this run) is found, and no other marker is present. The report's own
+  `markerFound` and `foreignMarkers` flags can only add failures;
+- the tool version and image digest equal to the pins;
+- the failing build failing the step, not passing.
+
+The report (markdown) is printed and written to `-ReportDirectory`. A queued run usually means the repository is not in the
+runners' runner group or a slot is busy; the script cancels the run when `-TimeoutMinutes` passes.
+
+**2. Host acceptance (on the Windows/Docker Desktop host).**
+
+```powershell
+# Read-only checks plus real builds; the site must come out of each instance's own workspace:
+.\tests\Invoke-WindowsHostAcceptance.ps1 -FixtureDirectory D:\fixture\docusaurus -Stage Readiness,Build,Adoption
+# Unchanged setup rerun: registration files, runners.local.json and agent ids must not change:
+.\tests\Invoke-WindowsHostAcceptance.ps1 -Stage Rerun -SetupCommand '<the exact Setup-WindowsRunners.ps1 command you ran>'
+# Drain, timeout, force: start a long job in the clone first (the 90 s smoke or a build), then:
+.\tests\Invoke-WindowsHostAcceptance.ps1 -Stage Drain -AllowDisruptive -DisruptiveClone C:\Actions\win01
+.\tests\Invoke-WindowsHostAcceptance.ps1 -Stage Timeout -AllowDisruptive -DisruptiveClone C:\Actions\win01 -TimeoutMinutes 1
+.\tests\Invoke-WindowsHostAcceptance.ps1 -Stage Force -AllowDisruptive -DisruptiveClone C:\Actions\win01
+```
+
+It runs the real scripts in each clone (`Get-BuildAgentStatus.ps1`, `Invoke-BuildAgent.ps1`, `Manage-WindowsRunner.ps1`,
+and `Get-RunnerFacts.ps1` for the read-only registration, migration-record and legacy-entry facts) and writes a report that
+lists every stage not selected as `NOT RUN (no evidence collected)`. `Drain`, `Timeout` and `Force` interrupt the named
+clone's runner (and start it again), so they need `-AllowDisruptive` and refuse when no job is running.
+`Drain` and `Force` start the runner again only after `Manage-WindowsRunner.ps1 -Action Stop` exited 0 **and** a fresh status
+shows the supervisor stopped and the job idle. If the stop failed, left either running, or the status cannot be read, the
+stage fails, never calls `Start` (which would end the maintenance hold a failed stop keeps), and still writes the report.
+`Timeout` accepts exit 1 only for the genuine drain-timeout outcome ("A job was still running after N minutes. Nothing was
+stopped; the runner takes jobs again (labels restored, maintenance cleared)") and verifies it from `Get-RunnerFacts.ps1`: the
+supervisor and job still run, maintenance is cleared in the status and in the maintenance record, and GitHub lists the same
+custom labels as before the stop. Any other exit 1 (for example a failed stop or a label restoration failure with maintenance
+retained), or maintenance or admission that cannot be read, fails the stage, and `Start` is never called for it.
+Not automated: provisioning a clean VM (run `Setup-WindowsRunners.ps1` there, then the stages above) and reboot or sign-out
+resume (restart the VM mid-setup, sign in, rerun the same setup command; the pending-action state must resume it).
+
+**3. Updater, separately.** Normal builds use published tooling (`BuildAgent.Tool` 2.1.0). `buildAgent.updater.version` stays
+`null` and `New-LinuxRunner.ps1 -Update` keeps its explicit refusal until a published `BuildAgent.Tool` contains
+Docker-BuildAgent PR #136; this repository does not duplicate the updater. After it is published, pin that exact version, then
+validate on Docker Desktop: a healthy update, restoration when the replacement fails its health check, and recovery of an
+interrupted update.
+
+`Test-WindowsRunnerBuildAgentEvidence.ps1`, `Test-WindowsRunnerBuildAgentDispatch.ps1` and `Test-WindowsHostAcceptance.ps1`
+test the checkers with synthetic evidence, a fake `gh` and fake clones (they accept a good run and reject injected defects).
+They prove the checkers, not a host or a GitHub job.
+
 ## Operating a Windows instance
 
 Run these from the instance's clone as the runner's user (`Manage-WindowsRunner.ps1 -Action ...`):
@@ -301,8 +384,9 @@ withdrawing the labels fails, no stop is attempted. A workflow that targets only
 | Fresh install (WinGet, Docker Desktop, tool, image) | Mocked in `Test-BuildAgentProvisioning.ps1` / `Test-WindowsRunnerHostSetup.ps1` | **Not collected**: needs a clean VM with Docker Desktop |
 | Resumable setup after restart or sign-out | State file and pending-action logic in `Test-BuildAgentProvisioning.ps1` | **Not collected** |
 | Two instances, distinct identity and workspace | `Test-WindowsRunnerInstances.ps1`, `Test-RunnerIntegration.ps1` | Setup with `-SmokeRepository` on the host |
-| BuildAgent build | Invocation, mapping and refusal cases; no daemon | **Not collected**: a real build of the owner's project on Docker Desktop |
-| Concurrent jobs | Smoke evidence checker with synthetic results | `-SmokeRepository` run on the host |
+| BuildAgent build | Invocation, mapping and refusal cases; no daemon. Acceptance checkers with synthetic evidence (`Test-WindowsRunnerBuildAgentEvidence.ps1`, `...Dispatch.ps1`, `Test-WindowsHostAcceptance.ps1`) | **Not collected**: runnable now (`Invoke-WindowsRunnerBuildAgentAcceptance.ps1`, `Invoke-WindowsHostAcceptance.ps1 -Stage Build`), but nothing has been run on Docker Desktop yet |
+| Two concurrent real builds, no cross-contamination | Same checkers: 44 injected evidence defects rejected, including missing, modified, wrong-length and wrong-hash site files and another slot's marker in the site while `report.json` is clean | **Not collected**: needs the workflow in an AbsoluteZeroDev repository the runners are registered for |
+| Concurrent jobs (overlap only; builds nothing) | Smoke evidence checker with synthetic results | `-SmokeRepository` run on the host |
 | Supervisor takeover (one listener, maintenance holds, orphan wait) | `Test-LifecycleRecovery.ps1`: the real supervisor script in a child process against a stand-in listener | Same test; no Task Scheduler involved |
 | Start confirms initialization, or fails | `Test-LifecycleRecovery.ps1`: early exit 23 (`Manage` Start and `Restart -Force`, `Start-Runners.ps1`: exit 1, Linux still started), alive-but-never-initializes within a 3 s bound (not killed, no second launch), stale `supervisor.json` of another pid, orphan listener alone | Real child processes only (a stub supervisor, a stand-in listener). Not a live runner |
 | Start launches one supervisor; a second Start finds it | `Test-LifecycleRecovery.ps1`: fake `Start-Process` (arguments, working directory, hidden, maintenance ended first, already running); real `Manage-WindowsRunner.ps1 -Action Start` twice against the real supervisor | Same test: a real `Start` launched the replacement of a killed supervisor, the second `Start` reported its pid and started nothing |
@@ -314,8 +398,9 @@ withdrawing the labels fails, no stop is attempted. A workflow that targets only
 | Legacy tasks are removed once, only this clone's | `Test-LifecycleRecovery.ps1`: real Task Scheduler and registry, in a throwaway task folder and Run key per case (this clone's removed, another clone's and unlisted kept, second run does nothing, a supervisor the task started keeps running); `Test-WindowsRunnerInstances.ps1`: instance-suffixed names | Same tests; the real tasks of this host are fingerprinted before and after and unchanged |
 | Task Scheduler restarts a killed or crashed supervisor (historical) | Simulated only, no longer applicable | **Collected, negative, and the reason the scheduler was dropped** (Windows 11 build 26200, 2026-11-07, throwaway tasks under `\SubZeroDev.Runners.Probe\`, restart 3-5 x 1 min): after `taskkill /T /F`, `Stop-Process`, `exit 0`, `exit 1`, `exit 3` and `throw`, the task launched once and was not restarted within 3 minutes. Kept as history; no scheduler infrastructure is built on it |
 | Config change reaches the registration | Registration plan cases (name, target, work folder, labels) | **Not collected** against GitHub |
-| Active-job drain, timeout and force | Mocked GitHub and processes in `Test-RunnerIntegration.ps1` | **Not collected** with a live job |
-| Linux updater success, unhealthy restore, refusal | Command construction and exit-code mapping only | **Blocked**: needs a published `BuildAgent.Tool` containing Docker-BuildAgent PR #136 |
+| Active-job drain, timeout and force | Mocked GitHub and processes in `Test-RunnerIntegration.ps1`; fake clones in `Test-WindowsHostAcceptance.ps1` (failed or unverified stops never reach `Start`; a real timeout is told apart from a failed stop) | **Not collected** with a live job (`Invoke-WindowsHostAcceptance.ps1 -Stage Drain,Timeout,Force -AllowDisruptive`) |
+| Adoption of the existing installation, legacy-startup cleanup, unchanged setup rerun | `Test-WindowsHostAcceptance.ps1` (fake clones) | **Not collected** (`-Stage Adoption`, `-Stage Rerun`) |
+| Linux updater success, unhealthy restore, refusal | Command construction and exit-code mapping only | **Blocked**: needs a published `BuildAgent.Tool` containing Docker-BuildAgent PR #136; `updater.version` stays `null` and the refusal stays until then |
 | Cleanup, retries, Docker-unavailable diagnostics | Locked-file, protected-path, retention and free-disk cases | **Not collected** under real Docker Desktop failure |
 
 Mocked and fixture results show the logic; they are not evidence that a host, a Docker daemon or a GitHub job behaved that way.
@@ -454,6 +539,8 @@ $remote | Select-Object id, name, status, busy | Format-Table
 `Manage-WindowsRunner.ps1 -Action Status` in each clone gives the same view and exits 1 when the supervisor is down. After a restart or sign-out the supervisors are down until `Manage-WindowsRunner.ps1 -Action Start` is run; that is expected, not a fault. The CI harness mocks process launch and registration; it does not prove registration on this machine.
 
 ## Safe concurrent-job smoke test
+
+This checks **concurrency only** (two runners, overlapping 90 s sleeps). It is not BuildAgent validation; see "BuildAgent acceptance (real builds)" above for that.
 
 Use a private, trusted repository **inside AbsoluteZeroDev** which its runner group permits. Copy `tests\windows-runner-smoke.yml` into that repository as `.github\workflows\windows-runner-smoke.yml`, review it, then commit and push it to the default branch. It is manual-only, requests no token permissions, checks out no repository code, uses no secrets or fixed ports, and only logs runner identity/timestamps and sleeps for 90 seconds. Reserve `subzerodev-windows-large` for these two runners during the test.
 
