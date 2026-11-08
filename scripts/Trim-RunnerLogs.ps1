@@ -7,6 +7,9 @@
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\Housekeeping.ps1"
 $problems = [Collections.Generic.List[string]]::new()
+# Stamped first, so a failing or slow run is not retried by every job that finishes: the job-completed hook reads this.
+try { [IO.Directory]::CreateDirectory($WindowsRunner) | Out-Null; Set-Content -LiteralPath $TrimStampFile -Value ([DateTime]::UtcNow.ToString('o')) }
+catch { Write-Warning "Could not record the trim time ($TrimStampFile): $($_.Exception.Message)" }
 
 try {
     $logs = Invoke-LogTrim -DiagnosticsDirectory (Join-Path $WindowsRunner '_diag'), (Join-Path $LinuxRunner '_diag')

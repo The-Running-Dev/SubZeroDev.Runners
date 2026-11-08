@@ -18,6 +18,7 @@ foreach ($step in @(
         $result = & $step.Run
         switch ($result.Outcome) {
             'timeout' { $kept++; Write-Warning "$($step.Label) runner kept running. $($result.Retained)" }
+            'failed' { $kept++; Write-Warning "$($step.Label) runner not stopped, maintenance kept: $(@($result.Failures) -join ' ')" }
             'forced' { Write-Output "$($step.Label) runner stopped without draining.$(if ($result.Cancelled) { " $($result.Cancelled)" })" }
             default { Write-Output "$($step.Label) runner stopped." }
         }

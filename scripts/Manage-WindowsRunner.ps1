@@ -1,13 +1,16 @@
 #Requires -Version 7.2
 # Per-instance control of the Windows runner, for Windows-only and combined installs alike. Run it from the instance's clone
-# (each instance has its own clone, supervisor, task and registration).
+# (each instance has its own clone, supervisor and registration).
+#
+# Nothing starts the supervisor at sign-in and nothing restarts it if it dies: Start is the only way it starts. If Status
+# reports it down, run Start. The supervisor restarts the runner process itself, with backoff; that part is automatic.
 #
 #   Status       one line each for supervisor, listener, job and GitHub. Exit 0 only when all are healthy.
 #   Start        end maintenance and start the supervisor.
 #   Stop         drain (stop taking jobs, wait for the running job), then stop. A job that outlasts -TimeoutMinutes is kept:
 #                nothing is stopped and the report says what is still running. -Force stops at once and cancels the job.
 #   Restart      Stop, then Start.
-#   Maintenance  drain and stop, then stay stopped (the sign-in task idles) until Start.
+#   Maintenance  drain and stop, then stay stopped until Start.
 #
 # Draining withdraws the runner's custom labels at GitHub while it waits, and restores them afterwards. A job that targets
 # only the default labels (self-hosted, Windows, X64) is not held back; the workflows for these runners use the subzerodev-* labels.
@@ -27,6 +30,7 @@ function Write-Outcome($Result) {
         'idle' { Write-Output 'Drained: no job was running; stopped.' }
         'forced' { Write-Output "Stopped without draining. $($Result.Cancelled)".Trim() }
         'timeout' { Write-Output $Result.Retained }
+        'failed' { [Console]::Error.WriteLine("The runner was not stopped; maintenance is kept (admission stays closed) so nothing restarts it. $(@($Result.Failures) -join ' ') Fix the cause and rerun, or end maintenance with: Manage-WindowsRunner.ps1 -Action Start") }
     }
     if ($Result.Admission -and $Result.Admission -ne 'closed') { Write-Warning "Admission: $($Result.Admission)" }
 }
@@ -37,6 +41,8 @@ switch ($Action) {
         if ($Json) { $state | ConvertTo-Json -Depth 6 }
         else {
             $detail = $state.SupervisorDetail
+            $recovery = $state.SupervisorRecovery
+            $warnings = 0
             $rows = [ordered]@{
                 Instance    = $state.Instance
                 Supervisor  = "$($state.Supervisor)$(if ($state.SupervisorState) { ", $($state.SupervisorState)" })"
@@ -44,29 +50,35 @@ switch ($Action) {
                 Job         = $state.Job
                 GitHub      = $state.GitHub
                 Maintenance = if ($state.Maintenance) { "$($state.Maintenance.phase) since $($state.Maintenance.sinceUtc) ($($state.Maintenance.reason))" } else { 'off' }
-                StartupTask = $state.StartupTask
                 LastExit    = if ($detail -and $null -ne $detail.lastExitCode) { "code $($detail.lastExitCode) at $($detail.lastExitUtc); $($detail.consecutiveQuickExits) quick exits; next retry $($detail.nextRetryUtc)" } else { 'none' }
+                Recovery    = if ($recovery.Recoveries) { "supervisor found dead and started again by hand $($recovery.Recoveries) times ($($recovery.ConsecutiveRecoveries) in a row), last at $($recovery.LastRecoveryUtc)" } else { 'supervisor never found dead' }
             }
+            foreach ($line in $recovery.Summary) { $rows["Warning$((++$warnings))"] = $line }
             $rows.GetEnumerator() | ForEach-Object { '{0,-12} {1}' -f $_.Key, $_.Value }
         }
         exit [int](-not $state.Healthy)
     }
-    'Start' { Write-Output (Start-WindowsRunner) }
+    'Start' {
+        # Start-WindowsRunner returns only once the supervisor confirmed it initialized; otherwise it throws.
+        try { Write-Output (Start-WindowsRunner) }
+        catch { [Console]::Error.WriteLine("Start failed: $($_.Exception.Message)"); exit 1 }
+    }
     'Stop' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop'
         Write-Outcome $result
-        exit [int]($result.Outcome -eq 'timeout')
+        exit [int]($result.Outcome -in 'timeout', 'failed')
     }
     'Restart' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'restart'
         Write-Outcome $result
-        if ($result.Outcome -eq 'timeout') { exit 1 }
-        Write-Output (Start-WindowsRunner)
+        if ($result.Outcome -in 'timeout', 'failed') { exit 1 }
+        try { Write-Output (Start-WindowsRunner) }
+        catch { [Console]::Error.WriteLine("Restart stopped the supervisor but the new one did not start: $($_.Exception.Message)"); exit 1 }
     }
     'Maintenance' {
         $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Hold -Reason 'maintenance'
         Write-Outcome $result
-        if ($result.Outcome -eq 'timeout') { exit 1 }
-        Write-Output 'Held in maintenance: the runner stays stopped, including after sign-in, until: Manage-WindowsRunner.ps1 -Action Start'
+        if ($result.Outcome -in 'timeout', 'failed') { exit 1 }
+        Write-Output 'Held in maintenance: the runner stays stopped until: Manage-WindowsRunner.ps1 -Action Start'
     }
 }
