@@ -96,16 +96,21 @@ execution; Docker Desktop/BuildAgent steps do not transparently convert Ubuntu w
 ### Executable setup without changing existing registrations
 
 On a **fresh x64 Windows machine/VM**, in normal Windows PowerShell, the existing bootstrap can
-install the FileManager pair. The guard below refuses existing `win01`/`win02` tasks; do not bypass it
-to repurpose an existing installation. `-SkipBuildAgent` installs native runners without the optional
+install the FileManager pair. The guards below refuse an existing install directory or active
+`win01`/`win02` instance mutex in this session; do not bypass them to repurpose an existing installation.
+Stopped installations elsewhere must be inspected separately. `-SkipBuildAgent` installs native runners without the optional
 Docker/tool/updater integration. This is a setup command to run deliberately, not a read-only check.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$tasks = @(Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -ErrorAction SilentlyContinue |
-    Where-Object { $_.TaskName -in @('Start Windows runner (win01)', 'Start Windows runner (win02)') })
-if ($tasks.Count) { throw 'win01/win02 already exist. Inspect them; this command will not change their registration.' }
 if (Test-Path C:\Actions-FileManager) { throw 'Choose a fresh install directory; inspect existing installs first.' }
+foreach ($id in 'win01', 'win02') {
+    $existingMutex = $null
+    if ([Threading.Mutex]::TryOpenExisting("Local\SubZeroDev.Runners.Windows.$id", [ref] $existingMutex)) {
+        $existingMutex.Dispose()
+        throw "Instance $id is already active in this session; inspect its installation first."
+    }
+}
 & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/The-Running-Dev/SubZeroDev.Runners/main/Setup-WindowsRunners.ps1'))) `
     -Count 2 -InstallRoot C:\Actions-FileManager `
     -GitHubUrl https://github.com/The-Running-Dev/SubZeroDev.FileManager `
@@ -119,7 +124,7 @@ automatically anyway. An organization setup instead supplies the actual **organi
 
 To add other repository pairs on that same host after the bootstrap has installed PowerShell/Git/gh,
 use a **normal PowerShell 7** window and unique IDs. Multiple bootstrap roots would reuse `win01`/`win02`
-task names and mutexes; they are not independent. The lower-level installer supports distinct IDs:
+instance IDs and mutexes; they are not independent. The lower-level installer supports distinct IDs:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -130,11 +135,15 @@ $plan = @(
 $root = 'C:\Actions-Additional'
 $source = (git -C C:\Actions-FileManager\_setup rev-parse HEAD)
 if ($LASTEXITCODE) { throw 'Cannot resolve the bootstrap source commit.' }
-# Validate the entire additive plan before installing anything. Existing clones/tasks are not adopted.
+# Validate the entire additive plan before installing anything. Existing clones or active instances are not adopted.
 foreach ($item in $plan) {
     foreach ($id in $item.Ids) {
         if (Test-Path (Join-Path $root $id)) { throw "Clone already exists for $id; inspect it first." }
-        if (Get-ScheduledTask -TaskPath '\SubZeroDev.Runners\' -TaskName "Start Windows runner ($id)" -ErrorAction SilentlyContinue) { throw "Task already exists for $id." }
+        $existingMutex = $null
+        if ([Threading.Mutex]::TryOpenExisting("Local\SubZeroDev.Runners.Windows.$id", [ref] $existingMutex)) {
+            $existingMutex.Dispose()
+            throw "Instance $id is already active in this session; inspect it first."
+        }
     }
 }
 New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -154,9 +163,14 @@ foreach ($item in $plan) {
 
 This adds four registrations, for six total including the FileManager pair; it does not share the two
 FileManager slots across repositories. It is an optional expansion, not something required to establish
-the first pair. Each pair has independent binaries, SDK/cache/workspace, tasks and credentials to maintain;
+the first pair. Each pair has independent binaries, SDK/cache/workspace, supervisor state and credentials to maintain;
 all instances still compete for the same CPU/RAM/disk. A separate VM per repository can reuse the
-one-command bootstrap because task/mutex namespaces are then separate (use unique computer names).
+one-command bootstrap because mutex namespaces are then separate (use unique computer names).
+
+Setup and these guards do not query Task Scheduler. Legacy startup entries from an older version are
+handled only by the installer's scoped migration, described below. The installer starts each supervisor
+directly; after a restart, sign-out or supervisor failure, run `Manage-WindowsRunner.ps1 -Action Start`
+in each clone. The supervisor retains its child-runner restart/backoff behavior.
 
 For a qualified Windows job, the proposed routing change is:
 
@@ -476,3 +490,4 @@ gh run view $runId --repo $smokeRepo --log
 The evidence checker requires successful jobs on both expected names, distinct GitHub runner IDs, and overlapping hold-step intervals. Two successful sequential jobs fail this check. A queued job usually means a missing label, unavailable runner, runner-group repository access, or another job occupying a slot; do not conclude concurrency passed from the dispatch alone. Cancel a stuck run with `gh run cancel $runId --repo $smokeRepo`.
 
 Only results collected from the target host and this actual workflow run establish that the two runners are online and execute jobs concurrently.
+
