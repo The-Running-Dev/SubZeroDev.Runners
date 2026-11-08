@@ -5,7 +5,8 @@
 # real BuildAgent builds through Invoke-BuildAgent.ps1 on both runner instances at once and keeps the evidence:
 #   build (x2)  a real Docusaurus build of a known-good project, one per runner instance, each stamped with its own marker
 #   failure     a deliberately failing build, which must fail its step with a BuildAgent failure code
-#   report      judges the evidence of all three and uploads the acceptance report
+#   report      judges the evidence of all three and uploads the acceptance report; it re-reads the uploaded site files
+#               (hash, length, markers) instead of trusting the per-job report.json
 # tests/Assert-WindowsRunnerBuildAgent.ps1 repeats the judgement from GitHub's own job records after the run completes.
 name: Windows runner BuildAgent acceptance
 run-name: Windows runner BuildAgent acceptance ${{ inputs.setup_id }}
@@ -173,6 +174,9 @@ jobs:
           $read = { param($n) $f = Join-Path $out $n; if (Test-Path -LiteralPath $f) { (Get-Content -LiteralPath $f -Raw).Trim() } }
           . (Join-Path $env:SZR_SCRIPTS 'Common.ps1')
           . (Join-Path $env:SZR_SCRIPTS 'BuildAgent.ps1')
+          $evaluator = Join-Path $env:SZR_SCRIPTS '..\tests\BuildAgentAcceptance.ps1'
+          if (-not (Test-Path -LiteralPath $evaluator)) { throw "$evaluator is missing: update this runner's SubZeroDev.Runners clone." }
+          . $evaluator
           $settings = Get-BuildAgentSettings $Config
           $marker = & $read 'marker.txt'
           $exit = & $read 'exit.txt'
@@ -182,14 +186,13 @@ jobs:
               $file = Join-Path $settings.Workspace $_
               if (Test-Path -LiteralPath $file -PathType Leaf) { [ordered]@{ path = ($_ -replace '\\', '/'); sha256 = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant(); bytes = (Get-Item -LiteralPath $file).Length } }
           })
-          # The whole site goes into the evidence; every marker in it must be this job's own.
+          # The whole site goes into the evidence, under $BuildAgentUploadedSiteDirectory (SITE_DIRECTORY maps to it; the report job
+          # re-reads these uploaded files). Every marker in it must be this job's own; the flags below are only a summary of that.
           $site = Join-Path $settings.Workspace $env:SITE_DIRECTORY
           $found = @()
           if (Test-Path -LiteralPath $site) {
-              Copy-Item -LiteralPath $site -Destination (Join-Path $out 'site') -Recurse -Force
-              $found = @(Get-ChildItem -LiteralPath $site -Recurse -File -Include *.html, *.js, *.json, *.txt, *.xml, *.css, *.md |
-                  ForEach-Object { [regex]::Matches((Get-Content -LiteralPath $_.FullName -Raw), 'acceptance-marker-r\d+-a\d+-slot\d+') } |
-                  ForEach-Object { $_.Value } | Select-Object -Unique)
+              Copy-Item -LiteralPath $site -Destination (Join-Path $out $BuildAgentUploadedSiteDirectory) -Recurse -Force
+              $found = @(Get-BuildAgentSiteMarkers $site)
           }
           [ordered]@{
               kind = 'build'; slot = [int]$env:SLOT
@@ -297,7 +300,8 @@ jobs:
           if ($env:EXPECTED_NAMES) { $expected = @($env:EXPECTED_NAMES | ConvertFrom-Json) }
           $result = Test-BuildAgentAcceptance -Builds $reports.Builds -Failure $reports.Failure -ExpectedRunnerNames $expected `
               -ExpectedComputerName $env:EXPECTED_COMPUTER -ExpectedToolVersion $env:EXPECTED_TOOL_VERSION -ExpectedImageDigest $env:EXPECTED_IMAGE_DIGEST `
-              -ExpectedArtifacts @($env:EXPECTED_ARTIFACTS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              -ExpectedArtifacts @($env:EXPECTED_ARTIFACTS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) `
+              -EvidenceDirectory $evidence -SiteDirectory $env:SITE_DIRECTORY -ExpectedRunId $env:GITHUB_RUN_ID
           $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           $markdown = Format-BuildAgentAcceptanceReport -Result $result -Builds $reports.Builds -Failure $reports.Failure -RunUrl $runUrl
           $reportDirectory = Join-Path $env:RUNNER_TEMP 'acceptance-report'

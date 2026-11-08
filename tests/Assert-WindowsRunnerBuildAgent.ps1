@@ -1,7 +1,9 @@
 #Requires -Version 7.2
 # Judge a completed windows-runner-buildagent.yml run from GitHub's own records: the job list (runner identities, step
 # timestamps, conclusions) and the artifacts the jobs uploaded (build logs, sites, per-job reports). It never infers success
-# from the workflow's colour. Needs an authenticated `gh` that can read the repository's Actions data.
+# from the workflow's colour, and it never takes a report's word for a file: the downloaded site files are re-hashed, re-measured
+# and searched for markers (the expected artifacts under -SiteDirectory map to the uploaded site/ folder).
+# Needs an authenticated `gh` that can read the repository's Actions data.
 #
 #   ./tests/Assert-WindowsRunnerBuildAgent.ps1 -Repository AbsoluteZeroDev/<repo> -RunId <id> -ComputerName <host>
 #
@@ -15,6 +17,7 @@ param(
     [string] $ExpectedToolVersion,
     [string] $ExpectedImageDigest,
     [string[]] $ExpectedArtifacts = @('docs/build/index.html'),
+    [string] $SiteDirectory = 'docs/build',
     [string] $ReportDirectory
 )
 $ErrorActionPreference = 'Stop'
@@ -39,7 +42,8 @@ if ($LASTEXITCODE) { throw 'Cannot download the acceptance run artifacts.' }
 
 $reports = Read-BuildAgentAcceptanceReports $download
 $result = Test-BuildAgentAcceptance -Builds $reports.Builds -Failure $reports.Failure -Jobs $jobs -ExpectedRunnerNames $expected `
-    -ExpectedComputerName $ComputerName -ExpectedToolVersion $ExpectedToolVersion -ExpectedImageDigest $ExpectedImageDigest -ExpectedArtifacts $ExpectedArtifacts
+    -ExpectedComputerName $ComputerName -ExpectedToolVersion $ExpectedToolVersion -ExpectedImageDigest $ExpectedImageDigest -ExpectedArtifacts $ExpectedArtifacts `
+    -EvidenceDirectory $download -SiteDirectory $SiteDirectory -ExpectedRunId "$RunId"
 $markdown = Format-BuildAgentAcceptanceReport -Result $result -Builds $reports.Builds -Failure $reports.Failure -RunUrl "https://github.com/$Repository/actions/runs/$RunId"
 if (-not $ReportDirectory) { $ReportDirectory = Join-Path $download 'report' }
 New-Item -ItemType Directory -Force $ReportDirectory | Out-Null

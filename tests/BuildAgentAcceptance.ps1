@@ -6,7 +6,41 @@
 # inside the workflow (report job) and outside it (Assert-WindowsRunnerBuildAgent.ps1, which adds GitHub's own job records).
 #
 # Passing requires evidence, not a green workflow: the pins, the exit codes, the artifacts, the per-instance isolation, the
-# marker each job stamped into its own source, and a real overlap between the two builds.
+# marker each job stamped into its own source, and a real overlap between the two builds. The artifacts and markers are not
+# taken from the reports: the uploaded files are re-read (length, SHA-256, markers), so a report that claims files the
+# download does not contain is rejected.
+
+# The workflow's collect step copies the instance's site directory (workspace-relative, e.g. docs/build) into this folder of the
+# uploaded buildagent-slot-N artifact. It is the one place the workspace-relative artifact paths are mapped to uploaded paths.
+$BuildAgentUploadedSiteDirectory = 'site'
+$BuildAgentMarkerPattern = 'acceptance-marker-r\d+-a\d+-slot\d+'
+
+# Maps a workspace-relative artifact path (docs/build/index.html) to its path inside the uploaded artifact (site/index.html).
+# Returns $null for a path outside the site directory (nothing uploaded stands for it) or one that climbs out of it.
+function Get-BuildAgentUploadedPath {
+    param(
+        [Parameter(Mandatory)] [string] $Artifact,
+        [Parameter(Mandatory)] [string] $SiteDirectory,
+        [string] $UploadedSiteDirectory = $BuildAgentUploadedSiteDirectory
+    )
+    $path = ($Artifact -replace '\\', '/').Trim('/')
+    $site = ($SiteDirectory -replace '\\', '/').Trim('/')
+    if (-not $site -or -not $path.StartsWith("$site/", [StringComparison]::Ordinal)) { return $null }
+    $relative = $path.Substring($site.Length + 1)
+    $segments = @($relative -split '/')
+    if (-not $relative -or $segments -contains '' -or $segments -contains '.' -or $segments -contains '..' -or $relative -match ':') { return $null }
+    "$UploadedSiteDirectory/$relative"
+}
+
+# Every distinct job marker found in any file under a site directory (the raw bytes are searched, so file type does not matter).
+function Get-BuildAgentSiteMarkers([Parameter(Mandatory)] [string] $Directory) {
+    $found = [Collections.Generic.HashSet[string]]::new()
+    foreach ($file in Get-ChildItem -LiteralPath $Directory -Recurse -File -Force) {
+        $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($file.FullName))
+        foreach ($match in [regex]::Matches($text, $BuildAgentMarkerPattern)) { [void]$found.Add($match.Value) }
+    }
+    @($found | Sort-Object)
+}
 
 # Reads buildagent-slot-* and buildagent-failure sub-folders of an artifact download directory.
 function Read-BuildAgentAcceptanceReports([Parameter(Mandatory)] [string] $Directory) {
@@ -24,6 +58,10 @@ function Read-BuildAgentAcceptanceReports([Parameter(Mandatory)] [string] $Direc
 
 # -Builds / -Failure: the report.json objects. -Jobs: optional GitHub job records (gh api .../jobs), checked in addition.
 # -ExpectedArtifacts: files (relative to the instance workspace) every build must have produced.
+# -EvidenceDirectory: the download directory holding each uploaded buildagent-slot-N artifact. A report only says what a job
+#   saw; the files are re-read from here: every expected artifact must exist (under -SiteDirectory, mapped to the uploaded
+#   -UploadedSiteDirectory), match its recorded length and SHA-256, and the site's markers are recounted from its bytes.
+# -ExpectedRunId: when given, each job's marker must belong to that run.
 # Returns { Passed; Checks = @{ Name; Passed; Detail } }.
 function Test-BuildAgentAcceptance {
     param(
@@ -34,6 +72,10 @@ function Test-BuildAgentAcceptance {
         [Parameter(Mandatory)] [string] $ExpectedToolVersion,
         [Parameter(Mandatory)] [string] $ExpectedImageDigest,
         [Parameter(Mandatory)] [string[]] $ExpectedArtifacts,
+        [Parameter(Mandatory)] [string] $EvidenceDirectory,
+        [string] $SiteDirectory = 'docs/build',
+        [string] $UploadedSiteDirectory = $BuildAgentUploadedSiteDirectory,
+        [string] $ExpectedRunId,
         $Jobs,
         [string] $BuildStepName = 'Run BuildAgent build'
     )
@@ -108,14 +150,46 @@ function Test-BuildAgentAcceptance {
     }
     Add-Check 'expected artifacts present' (-not $artifactProblems) $(if ($artifactProblems) { @($artifactProblems) -join '; ' } else { "Both builds produced: $($ExpectedArtifacts -join ', ')." })
 
-    # No cross-contamination: each site carries the marker stamped into that job's own source and none from the other job.
-    $markerProblems = foreach ($build in $builds) {
-        if (-not $build.marker) { "slot $($build.slot) has no marker" }
-        elseif (-not $build.markerFound) { "slot $($build.slot) marker $($build.marker) is not in its site" }
-        if (@($build.foreignMarkers).Count) { "slot $($build.slot) contains $(@($build.foreignMarkers) -join ', ')" }
+    # The uploaded files themselves: each expected artifact exists, is not empty, and has the length and SHA-256 the report records.
+    $fileProblems = [Collections.Generic.List[string]]::new()
+    foreach ($build in $builds) {
+        $root = Join-Path $EvidenceDirectory "buildagent-slot-$($build.slot)"
+        $rootFull = [IO.Path]::GetFullPath($root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        foreach ($expected in $ExpectedArtifacts) {
+            $uploaded = Get-BuildAgentUploadedPath $expected $SiteDirectory $UploadedSiteDirectory
+            if ($null -eq $uploaded) { $fileProblems.Add("slot $($build.slot) $expected is not inside the site directory $SiteDirectory, so no uploaded file stands for it"); continue }
+            $file = [IO.Path]::GetFullPath((Join-Path $root $uploaded))
+            if (-not $file.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { $fileProblems.Add("slot $($build.slot) uploaded no $uploaded for $expected"); continue }
+            $length = (Get-Item -LiteralPath $file).Length
+            if ($length -le 0) { $fileProblems.Add("slot $($build.slot) uploaded $uploaded is empty"); continue }
+            $entry = @($build.artifacts | Where-Object { (([string]$_.path) -replace '\\', '/') -eq $expected })
+            if ($entry.Count -ne 1) { $fileProblems.Add("slot $($build.slot) report has no entry for $expected"); continue }
+            if (($entry[0].bytes -as [long]) -ne $length) { $fileProblems.Add("slot $($build.slot) $expected is $length bytes, the report says $($entry[0].bytes)") }
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if (([string]$entry[0].sha256).ToLowerInvariant() -ne $hash) { $fileProblems.Add("slot $($build.slot) $expected has SHA-256 $($hash.Substring(0, 12)), the report says $(([string]$entry[0].sha256).Substring(0, [math]::Min(12, ([string]$entry[0].sha256).Length)))") }
+        }
     }
-    if (@($builds.marker | Select-Object -Unique).Count -ne 2) { $markerProblems = @($markerProblems) + 'both jobs used the same marker' }
-    Add-Check 'no cross-contamination' (-not $markerProblems) $(if ($markerProblems) { @($markerProblems) -join '; ' } else { 'Each site contains only its own marker.' })
+    Add-Check 'artifact files match the report' ($fileProblems.Count -eq 0) $(if ($fileProblems.Count) { $fileProblems -join '; ' } else { "Uploaded $($ExpectedArtifacts -join ', ') (from $SiteDirectory) re-read for both builds: length and SHA-256 match the reports." })
+
+    # No cross-contamination, from the uploaded site itself: it carries the marker stamped into that job's own source, and
+    # no other job's marker, whatever the report's flags say.
+    $markerProblems = [Collections.Generic.List[string]]::new()
+    foreach ($build in $builds) {
+        $marker = [string]$build.marker
+        if (-not $marker) { $markerProblems.Add("slot $($build.slot) has no marker") }
+        elseif ($marker -notmatch "^acceptance-marker-r\d+-a\d+-slot$($build.slot)$") { $markerProblems.Add("slot $($build.slot) marker $marker is not a slot $($build.slot) marker") }
+        elseif ($ExpectedRunId -and $marker -notmatch "^acceptance-marker-r$([regex]::Escape($ExpectedRunId))-a") { $markerProblems.Add("slot $($build.slot) marker $marker is not from run $ExpectedRunId") }
+        $site = Join-Path (Join-Path $EvidenceDirectory "buildagent-slot-$($build.slot)") $UploadedSiteDirectory
+        if (-not (Test-Path -LiteralPath $site -PathType Container)) { $markerProblems.Add("slot $($build.slot) uploaded no site to inspect"); continue }
+        $found = @(Get-BuildAgentSiteMarkers $site)
+        if ($marker -and $found -notcontains $marker) { $markerProblems.Add("slot $($build.slot) marker $marker is not in its uploaded site") }
+        $foreign = @($found | Where-Object { $_ -ne $marker })
+        if ($foreign.Count) { $markerProblems.Add("slot $($build.slot) uploaded site contains $($foreign -join ', ')") }
+        if (-not $build.markerFound) { $markerProblems.Add("slot $($build.slot) report says its marker is not in its site") }
+        if (@($build.foreignMarkers).Count) { $markerProblems.Add("slot $($build.slot) report lists $(@($build.foreignMarkers) -join ', ')") }
+    }
+    if (@($builds.marker | Select-Object -Unique).Count -ne 2) { $markerProblems.Add('both jobs used the same marker') }
+    Add-Check 'no cross-contamination' ($markerProblems.Count -eq 0) $(if ($markerProblems.Count) { $markerProblems -join '; ' } else { 'Each uploaded site contains its own marker and no other job''s.' })
 
     # A build that fails must fail the step, with a BuildAgent failure code (not 0, not the "daemon unavailable" 5 or "image missing" 125).
     if ($null -eq $Failure) { Add-Check 'failing build propagated' $false 'No buildagent-failure report.' }

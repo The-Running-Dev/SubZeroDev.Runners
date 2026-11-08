@@ -129,26 +129,50 @@ foreach ($mode in 'Drain', 'Timeout', 'Force') {
     $state = Get-RunnerState $clone
     if (-not $state -or "$($state.Job)" -notlike 'running*') { Add-Check $mode $clone 'a job is already running' $false "Job: $($state.Job). Start a long job on this runner first, then rerun this stage."; continue }
     $arguments = switch ($mode) { 'Drain' { @('-Action', 'Stop', '-TimeoutMinutes', '60') } 'Timeout' { @('-Action', 'Stop', '-TimeoutMinutes', "$TimeoutMinutes") } 'Force' { @('-Action', 'Stop', '-Force') } }
+    # The custom labels the runner carries before the stop: what a genuine timeout must have put back.
+    $labelsBefore = if ($mode -eq 'Timeout') { Get-Facts $clone }
     $stop = Invoke-Script $clone 'Manage-WindowsRunner.ps1' $arguments
     $after = Get-RunnerState $clone
+    $stopped = [bool]($after -and "$($after.Supervisor)" -eq 'stopped' -and "$($after.Job)" -eq 'idle')
     switch ($mode) {
         'Drain' {
             Add-Check $mode $clone 'Stop exits 0 once the job finished' ($stop.Exit -eq 0) "exit $($stop.Exit): $($stop.Output)"
-            Add-Check $mode $clone 'runner is stopped and idle afterwards' ([bool]($after -and "$($after.Supervisor)" -eq 'stopped' -and "$($after.Job)" -eq 'idle')) "Supervisor $($after.Supervisor); Job $($after.Job)"
+            Add-Check $mode $clone 'runner is stopped and idle afterwards' $stopped $(if ($after) { "Supervisor $($after.Supervisor); Job $($after.Job)" } else { 'status after the stop is unreadable' })
         }
         'Timeout' {
+            # Exit 1 alone is not a drain timeout: Stop also exits 1 when the labels could not be put back (maintenance stays on, and
+            # the runner and job are running just the same). The timeout is genuine only when its own outcome was reported and the
+            # state read back shows maintenance cleared and the custom labels the runner had before.
+            $after_facts = Get-Facts $clone
+            $kept = [bool]($after -and "$($after.Supervisor)" -like 'running*' -and "$($after.Job)" -like 'running*')
+            $reported = [bool]($stop.Output -match 'A job was still running after \d+ minutes\. Nothing was stopped; the runner takes jobs again' -and $stop.Output -notmatch 'maintenance is kept|was not stopped|could not be confirmed')
             Add-Check $mode $clone 'Stop exits 1 when the job outlasts the timeout' ($stop.Exit -eq 1) "exit $($stop.Exit): $($stop.Output)"
-            Add-Check $mode $clone 'supervisor and job are kept running' ([bool]($after -and "$($after.Supervisor)" -like 'running*' -and "$($after.Job)" -like 'running*')) "Supervisor $($after.Supervisor); Job $($after.Job)"
+            Add-Check $mode $clone 'Stop reports the drain timeout, not a failed stop' $reported "$($stop.Output)"
+            Add-Check $mode $clone 'supervisor and job are kept running' $kept $(if ($after) { "Supervisor $($after.Supervisor); Job $($after.Job)" } else { 'status after the stop is unreadable' })
+            $cleared = [bool]($after -and $null -eq $after.Maintenance -and $after_facts -and $after_facts.admission -and $null -eq $after_facts.admission.maintenance)
+            $hold = if (-not $after_facts -or -not $after_facts.admission) { 'facts after the stop are unreadable' } elseif ($after_facts.admission.maintenance) { "maintenance retained (phase $($after_facts.admission.maintenance.phase)): $($after_facts.admission.maintenance.failure)" } elseif (-not $after) { 'status after the stop is unreadable' } else { "Maintenance $($after.Maintenance)" }
+            Add-Check $mode $clone 'maintenance is cleared (no hold kept)' $cleared "$hold. A retained hold is left as it is; end it with Manage-WindowsRunner.ps1 -Action Start only once the cause is fixed."
+            $wanted = @($labelsBefore.admission.customLabels | Sort-Object)
+            $found = @($after_facts.admission.customLabels | Sort-Object)
+            $restored = [bool]($labelsBefore -and $labelsBefore.admission.gitHubKnown -and $wanted.Count -gt 0 -and $after_facts -and $after_facts.admission.gitHubKnown -and (($wanted -join ',') -ceq ($found -join ',')))
+            Add-Check $mode $clone 'custom labels are back at GitHub' $restored $(if (-not $labelsBefore -or -not $after_facts) { 'facts unreadable' } else { "before: $($wanted -join ', '); after: $($found -join ', ')" })
         }
         'Force' {
             Add-Check $mode $clone 'Stop -Force exits 0' ($stop.Exit -eq 0) "exit $($stop.Exit): $($stop.Output)"
-            Add-Check $mode $clone 'the running job was cancelled and the runner stopped' ([bool]($after -and $stop.Output -match 'cancelled' -and "$($after.Supervisor)" -eq 'stopped' -and "$($after.Job)" -eq 'idle')) "Supervisor $($after.Supervisor); Job $($after.Job)"
+            Add-Check $mode $clone 'the running job was cancelled and the runner stopped' ([bool]($stopped -and $stop.Output -match 'cancelled')) $(if ($after) { "Supervisor $($after.Supervisor); Job $($after.Job)" } else { 'status after the stop is unreadable' })
         }
     }
     if ($mode -ne 'Timeout') {
-        $start = Invoke-Script $clone 'Manage-WindowsRunner.ps1' @('-Action', 'Start')
-        $healthy = Invoke-Script $clone 'Manage-WindowsRunner.ps1' @('-Action', 'Status')
-        Add-Check $mode $clone 'Start restores a healthy runner' ($start.Exit -eq 0 -and $healthy.Exit -eq 0) "Start exit $($start.Exit); Status exit $($healthy.Exit)"
+        # Start ends maintenance, which would undo the hold an unsuccessful stop deliberately keeps. It runs only after a stop that
+        # exited 0 and whose state read back as stopped and idle; otherwise the stage fails and the hold is left for the operator.
+        if ($stop.Exit -eq 0 -and $stopped) {
+            $start = Invoke-Script $clone 'Manage-WindowsRunner.ps1' @('-Action', 'Start')
+            $healthy = Invoke-Script $clone 'Manage-WindowsRunner.ps1' @('-Action', 'Status')
+            Add-Check $mode $clone 'Start restores a healthy runner' ($start.Exit -eq 0 -and $healthy.Exit -eq 0) "Start exit $($start.Exit); Status exit $($healthy.Exit)"
+        }
+        else {
+            Add-Check $mode $clone 'Start withheld: the stop is not verified, maintenance is preserved' $false "Stop exit $($stop.Exit); stopped and idle: $stopped. Start was not run, so any maintenance hold is intact; fix the cause, then end it with Manage-WindowsRunner.ps1 -Action Start."
+        }
     }
 }
 

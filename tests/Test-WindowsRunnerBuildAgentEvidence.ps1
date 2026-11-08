@@ -3,10 +3,26 @@
 # checker accepts complete evidence and rejects each defect it exists to catch.
 $ErrorActionPreference = 'Stop'
 $checker = Join-Path $PSScriptRoot 'Assert-WindowsRunnerBuildAgent.ps1'
+. (Join-Path $PSScriptRoot 'BuildAgentAcceptance.ps1')
 $digest = 'sha256:cc13d62b66fab58e264eb583de5c47eb5f49a3ee8a2cdd48f0de0b1d0ba16556'
 $names = 'subzerodev.runner.windows.test-host.win01', 'subzerodev.runner.windows.test-host.win02'
 $reportDirectory = Join-Path ([IO.Path]::GetTempPath()) "buildagent-evidence-test-$PID"
 
+# The site each build uploads: small real files. The marker (run 1, attempt 1, as the checker is invoked) is this job's own.
+function New-Site([int] $Slot) {
+    [ordered]@{
+        'index.html'      = "<!doctype html><html><head><title>Fixture $Slot</title></head><body><h1>Docs</h1><p>acceptance-marker-r1-a1-slot$Slot</p></body></html>"
+        'docs/index.html' = "<html><body>Docs home for slot $Slot</body></html>"
+        'assets/app.js'   = "console.log('slot $Slot');"
+    }
+}
+function Get-TextBytes([string] $Text) { , [Text.UTF8Encoding]::new($false).GetBytes($Text) }
+function New-ArtifactEntry([string] $Text) {
+    $bytes = Get-TextBytes $Text
+    @{ path = 'docs/build/index.html'; sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$bytes)).ToLowerInvariant(); bytes = $bytes.Length }
+}
+# Re-records a slot's artifact in its report after a case changed that slot's site, so only the intended defect remains.
+function Update-Artifact([int] $Slot) { $fixture.Evidence.Builds[$Slot - 1].artifacts = @(New-ArtifactEntry $fixture.Evidence.Sites[$Slot]['index.html']) }
 function New-Build([int] $Slot, [string] $Start, [string] $End) {
     $instance = "win0$Slot"
     @{
@@ -19,8 +35,8 @@ function New-Build([int] $Slot, [string] $Start, [string] $End) {
         statusRows = @(
             @{ Item = 'tool'; State = 'ok'; Detail = 'BuildAgent.Tool 2.1.0 in C:\tool.' }, @{ Item = 'docker'; State = 'ok'; Detail = 'Linux' },
             @{ Item = 'image'; State = 'ok'; Detail = $digest }, @{ Item = 'updater'; State = 'missing'; Detail = 'blocked' })
-        exitCode = 0; marker = "acceptance-marker-r7-a1-slot$Slot"; markerFound = $true; foreignMarkers = @()
-        artifacts = @(@{ path = 'docs/build/index.html'; sha256 = ('a' * 63) + "$Slot"; bytes = 1234 })
+        exitCode = 0; marker = "acceptance-marker-r1-a1-slot$Slot"; markerFound = $true; foreignMarkers = @()
+        artifacts = @(New-ArtifactEntry ((New-Site $Slot)['index.html']))
     }
 }
 function New-Job([string] $Name, [string] $Runner, [int] $Id, [string] $Start, [string] $End) {
@@ -34,6 +50,7 @@ function New-Evidence {
             (New-Job 'Failure propagation' $names[0] 101 '2026-11-08T10:04:00Z' '2026-11-08T10:05:00Z'),
             (New-Job 'Acceptance report' $names[1] 102 '2026-11-08T10:05:10Z' '2026-11-08T10:05:20Z'))
         Builds = @((New-Build 1 '2026-11-08T10:00:01Z' '2026-11-08T10:03:00Z'), (New-Build 2 '2026-11-08T10:00:21Z' '2026-11-08T10:03:10Z'))
+        Sites = @{ 1 = (New-Site 1); 2 = (New-Site 2) }
         Failure = @{ kind = 'failure'; runnerName = $names[0]; buildType = 'node'; stepOutcome = 'failure'; exitCode = 1 }
     }
 }
@@ -47,6 +64,14 @@ function gh {
             $path = Join-Path $directory "buildagent-slot-$($build.slot)"
             New-Item -ItemType Directory -Force $path | Out-Null
             $build | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $path 'report.json')
+            # The uploaded site folder: exactly the bytes of the case's site files (workspace docs/build is uploaded as site/).
+            if ($fixture.Evidence.Sites.ContainsKey([int]$build.slot)) {
+                foreach ($entry in $fixture.Evidence.Sites[[int]$build.slot].GetEnumerator()) {
+                    $file = Join-Path (Join-Path $path 'site') $entry.Key
+                    New-Item -ItemType Directory -Force (Split-Path $file -Parent) | Out-Null
+                    [IO.File]::WriteAllBytes($file, (Get-TextBytes $entry.Value))
+                }
+            }
         }
         if ($fixture.Evidence.Failure) {
             $path = Join-Path $directory 'buildagent-failure'
@@ -74,6 +99,25 @@ $output = Invoke-Checker | Out-String
 if ($output -notmatch 'BuildAgent acceptance: PASS' -or $output -notmatch 'PASS: two distinct') { throw "Complete evidence was not accepted:`n$output" }
 foreach ($expected in 'docs/build/index.html', $names[0], $names[1], $digest) { if ($output -notlike "*$expected*") { throw "The report omits '$expected'." } }
 
+if ($output -notmatch '\| artifact files match the report \| pass \|') { throw "The passing report does not show the artifact files re-read:`n$output" }
+
+# The explicit mapping from workspace-relative artifact paths to uploaded paths.
+$mapping = [ordered]@{
+    'docs/build/index.html'       = 'site/index.html'
+    'docs\build\assets\app.js'    = 'site/assets/app.js'
+    'docs/other/index.html'       = $null   # outside the site directory: nothing uploaded stands for it
+    'docs/buildx/index.html'      = $null
+    'docs/build'                  = $null
+    'docs/build/../secret.txt'    = $null
+    'docs/build/a/./b.txt'        = $null
+    'docs/build//b.txt'           = $null
+    'docs/build/C:/Windows/x.txt' = $null
+}
+foreach ($pair in $mapping.GetEnumerator()) {
+    $actual = Get-BuildAgentUploadedPath -Artifact $pair.Key -SiteDirectory 'docs/build'
+    if ($actual -ne $pair.Value) { throw "Artifact '$($pair.Key)' mapped to '$actual', expected '$($pair.Value)'." }
+}
+
 # Each case starts from good evidence and breaks exactly one thing.
 $cases = [ordered]@{
     'only one build report'                    = @{ Reason = 'two build reports'; Break = { $fixture.Evidence.Builds = @($fixture.Evidence.Builds[0]) } }
@@ -99,8 +143,23 @@ $cases = [ordered]@{
     'artifact is a different file'             = @{ Reason = 'expected artifacts present'; Break = { $fixture.Evidence.Builds[1].artifacts[0].path = 'docs/build/404.html' } }
     'artifact is empty'                        = @{ Reason = 'expected artifacts present'; Break = { $fixture.Evidence.Builds[0].artifacts[0].bytes = 0 } }
     'marker not in the site'                   = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Builds[0].markerFound = $false } }
-    'other job marker in the site'             = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Builds[1].foreignMarkers = @('acceptance-marker-r7-a1-slot1') } }
+    'other job marker in the site (report)'    = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Builds[1].foreignMarkers = @('acceptance-marker-r1-a1-slot1') } }
     'both jobs stamped the same marker'        = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Builds[1].marker = $fixture.Evidence.Builds[0].marker } }
+    # The downloaded files, not the reports, are the evidence: in each case below the report still says everything is fine.
+    'report without site files'                = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Sites.Remove(2) } }
+    'site without the expected file'           = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Sites[1].Remove('index.html') } }
+    'expected file only in another folder'     = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Sites[2]['docs/other/index.html'] = $fixture.Evidence.Sites[2]['index.html']; $fixture.Evidence.Sites[2].Remove('index.html') } }
+    'expected file modified, same length'      = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Sites[1]['index.html'] = $fixture.Evidence.Sites[1]['index.html'].Replace('Docs', 'Dogs') } }
+    'expected file modified, longer'           = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Sites[2]['index.html'] += '<!-- tampered -->' } }
+    'recorded hash is not the file''s'         = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Builds[0].artifacts[0].sha256 = '0' * 64 } }
+    'recorded length is not the file''s'       = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Builds[1].artifacts[0].bytes += 1 } }
+    'uploaded file is empty'                   = @{ Reason = 'artifact files match the report'; Break = { $fixture.Evidence.Sites[1]['index.html'] = ''; Update-Artifact 1 } }
+    'own marker missing from the site'         = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Sites[1]['index.html'] = $fixture.Evidence.Sites[1]['index.html'].Replace('acceptance-marker-r1-a1-slot1', 'no marker'); Update-Artifact 1 } }
+    'no site to inspect'                       = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Sites.Remove(1) } }
+    'other slot marker in the expected file'   = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Sites[2]['index.html'] += '<!-- acceptance-marker-r1-a1-slot1 -->'; Update-Artifact 2 } }
+    'other slot marker in another site file'   = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Sites[2]['assets/app.js'] += "`n// acceptance-marker-r1-a1-slot1" } }
+    'stale marker from another run'            = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Builds[0].marker = 'acceptance-marker-r9-a1-slot1'; $fixture.Evidence.Sites[1]['index.html'] = $fixture.Evidence.Sites[1]['index.html'].Replace('r1-a1', 'r9-a1'); Update-Artifact 1 } }
+    'report marker is the other slot''s'       = @{ Reason = 'no cross-contamination'; Break = { $fixture.Evidence.Builds[1].marker = 'acceptance-marker-r1-a1-slot1' } }
     'failing build exited 0'                   = @{ Reason = 'failing build propagated'; Break = { $fixture.Evidence.Failure.exitCode = 0 } }
     'failing build never reached the tool (5)' = @{ Reason = 'failing build propagated'; Break = { $fixture.Evidence.Failure.exitCode = 5 } }
     'failing build image missing (125)'        = @{ Reason = 'failing build propagated'; Break = { $fixture.Evidence.Failure.exitCode = 125 } }
@@ -113,4 +172,4 @@ foreach ($case in $cases.GetEnumerator()) {
     Assert-Rejected $case.Key $case.Value.Reason
 }
 Remove-Item -LiteralPath $reportDirectory -Recurse -Force -ErrorAction SilentlyContinue
-Write-Output "PASS: synthetic BuildAgent evidence accepts a complete run and rejects $($cases.Count) defects (identity, pins, exit codes, overlap, isolation, artifacts, cross-contamination, failure propagation). No target-host execution performed."
+Write-Output "PASS: synthetic BuildAgent evidence accepts a complete run and rejects $($cases.Count) defects (identity, pins, exit codes, overlap, isolation, artifact files re-read for length and SHA-256, site markers, failure propagation). No target-host execution performed."
