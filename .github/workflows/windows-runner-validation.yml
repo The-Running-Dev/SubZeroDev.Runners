@@ -27,6 +27,9 @@ jobs:
       - name: Exercise automated host setup with isolated fixtures
         shell: pwsh
         run: ./tests/Test-WindowsRunnerHostSetup.ps1
+      - name: Verify intended repository scope before configuring runners
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerRepositoryScope.ps1
       - name: Exercise BuildAgent provisioning and resumable setup state with fixtures
         shell: pwsh
         run: ./tests/Test-BuildAgentProvisioning.ps1

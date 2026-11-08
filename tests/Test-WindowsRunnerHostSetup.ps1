@@ -60,6 +60,7 @@ try {
 . $functions
 $flow = @{ Auth = 0; Clones = @(); Installs = @(); Verified = 0; Smoke = @() }
 function Confirm-RunnerSetupAuthentication { param($Scope, $NonInteractive, $WithSmoke) $flow.Auth++ }
+function Confirm-RunnerSetupRepositories { param($Scope, $Repositories) $flow.TargetRepositories = @($Repositories); $Repositories }
 function Sync-RunnerSetupInstance { param($Clone, $InstanceId, $SourceCommit, $GitHubUrl) $flow.Clones += $Clone }
 function Install-RunnerSetupInstance { param($Clone, $InstanceId, $GitHubUrl, $Labels) $flow.Installs += [pscustomobject]@{ Id = $InstanceId; Labels = $Labels } }
 function Get-RunnerSetupEvidence {
@@ -70,9 +71,10 @@ function Confirm-RunnerSetupHost { param($Instances, $Scope) $flow.Verified = $I
 function Invoke-RunnerSetupSmoke { param($Repository, $Label, $SourceClone, $ExpectedRunnerNames) $flow.Smoke += [pscustomobject]@{ Repo = $Repository; Label = $Label; Names = $ExpectedRunnerNames } }
 $flow.BuildAgent = @(); $flow.BuildAgentExit = 0
 function Install-RunnerSetupBuildAgent { param($Clone, $InstallRoot) $flow.BuildAgent += [pscustomobject]@{ Clone = $Clone; InstallRoot = $InstallRoot }; $flow.BuildAgentExit }
-$options = @{ Count = 3; InstallRoot = 'C:\Fixtures'; GitHubUrl = 'https://github.com/AbsoluteZeroDev'; ExtraLabels = @('extra'); SourceCommit = ('a' * 40); SmokeRepository = 'AbsoluteZeroDev/RunnerSmoke'; NonInteractive = $true }
+$options = @{ Count = 3; InstallRoot = 'C:\Fixtures'; GitHubUrl = 'https://github.com/AbsoluteZeroDev'; ExtraLabels = @('extra'); TargetRepositories = @('AbsoluteZeroDev/RunnerSmoke'); SourceCommit = ('a' * 40); SmokeRepository = 'AbsoluteZeroDev/RunnerSmoke'; NonInteractive = $true }
 $outcome = Invoke-WindowsRunnerHostSetup @options | Select-Object -Last 1
 Assert ($flow.Auth -eq 1 -and $flow.Verified -eq 3 -and $flow.Installs.Count -eq 3) 'Host setup skipped authentication, instances or verification.'
+Assert ($flow.TargetRepositories[0] -eq 'AbsoluteZeroDev/RunnerSmoke' -and $outcome.ScopeValidatedRepositories[0] -eq 'AbsoluteZeroDev/RunnerSmoke') 'Intended repositories were not forwarded to preflight or reported separately.'
 # BuildAgent is provisioned once per host, from the first instance's clone, after the runners are verified.
 Assert ($flow.BuildAgent.Count -eq 1 -and $flow.BuildAgent[0].Clone -eq 'C:\Fixtures\win01' -and $flow.BuildAgent[0].InstallRoot -eq 'C:\Fixtures') 'BuildAgent was not provisioned once from win01.'
 Assert ($outcome.BuildAgentExitCode -eq 0 -and -not $outcome.ActionRequired -and $outcome.Runners -eq 3) 'A ready BuildAgent was reported as not ready.'
