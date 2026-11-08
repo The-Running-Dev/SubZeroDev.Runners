@@ -120,7 +120,7 @@ try {
     # Real lifecycle controller against API/process recorders: identity checks, cleanup, failed-stop journal.
     . $setup
     $f.WrongRunner = $false; $f.StopFails = $false; $f.LocalChecks = 0; $f.Correlation = ''; $f.RemoteDone = $false; $f.Cancel = 0
-    function Invoke-RunnerSetupGh {
+    Set-Item -Path Function:Invoke-RunnerSetupGh -Value {
         param($Arguments)
         $url = $Arguments[1]
         if ($url -eq 'repos/example/private') { return [pscustomobject]@{ default_branch = 'main' } }
@@ -131,13 +131,13 @@ try {
         if ($url -like '*/runs/81') { return [pscustomobject]@{ status = $(if ($f.RemoteDone) { 'completed' } else { 'in_progress' }); conclusion = 'success'; event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-lifecycle-acceptance.yml'; display_title = "Windows runner lifecycle acceptance $($f.Correlation)" } }
         throw "Unexpected API read: $url"
     }
-    function Send-RunnerSetupGh {
+    Set-Item -Path Function:Send-RunnerSetupGh -Value {
         param($Arguments, $Body)
         if ($Arguments -like '*/cancel') { $f.Cancel++; $f.RemoteDone = $true }
         else { $f.Correlation = $Body.inputs.correlation; $f.RemoteDone = $false }
     }
     function Get-RunnerAcceptanceStatus { param($Clone) [pscustomobject]@{ Job = 'running (worker pid 7)'; Maintenance = $null } }
-    function Invoke-RunnerAcceptanceProcess {
+    Set-Item -Path Function:Invoke-RunnerAcceptanceProcess -Value {
         param($Script, $Parameters)
         $f.LocalChecks++
         Assert ($Parameters.AllowDisruptive -and $Parameters.DisruptiveClone -eq $clones[0]) 'Lifecycle controller chose another clone or lost its disruptive flag.'
@@ -162,7 +162,7 @@ try {
     $f.Acceptance = 0; $f.BuildExit = 0; $f.Recover = 0; $f.Install = 0; $f.Private = $true; $f.AcceptFail = $false
     function Confirm-RunnerSetupAuthentication { param($Scope, $NonInteractive, $WithSmoke) $f.WorkflowAuth = $WithSmoke }
     function Confirm-RunnerSetupRepositories { param($Scope, $Repositories) $Repositories }
-    function Invoke-RunnerSetupGh { param($Arguments) [pscustomobject]@{ private = $f.Private } }
+    Set-Item -Path Function:Invoke-RunnerSetupGh -Value { param($Arguments) [pscustomobject]@{ private = $f.Private } }
     function Resume-RunnerSetupAcceptance { param($InstallRoot, $Repository, $Count) $f.Recover++; if ($f.Held) { throw 'maintenance held' } }
     function Sync-RunnerSetupInstance { param($Clone, $InstanceId, $SourceCommit, $GitHubUrl) }
     function Install-RunnerSetupInstance { param($Clone, $InstanceId, $GitHubUrl, $Labels) $f.Install++ }
