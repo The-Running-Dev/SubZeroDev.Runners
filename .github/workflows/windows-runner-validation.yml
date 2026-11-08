@@ -36,3 +36,6 @@ jobs:
       - name: Exercise configuration, BuildAgent invocation, registration, drain, housekeeping and Linux image guards
         shell: pwsh
         run: ./tests/Test-RunnerIntegration.ps1
+      - name: Exercise failed-stop handling, label recovery state and supervisor recovery (entry points and a real supervisor process)
+        shell: pwsh
+        run: ./tests/Test-LifecycleRecovery.ps1

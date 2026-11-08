@@ -43,9 +43,10 @@ $registered = Test-Path -LiteralPath (Join-Path $LinuxRunner '.runner')
 $maintenanceFile = Get-LinuxMaintenanceFile
 if ($registered) {
     $drain = Enter-RunnerMaintenance -StateFile $maintenanceFile -RunnerDirectory $LinuxRunner -IsBusy { Test-LinuxRunnerBusy } -Reason 'replace' -TimeoutMinutes $TimeoutMinutes -Force:$Force
-    if ($drain.Outcome -eq 'timeout') {
+    if ($drain.Outcome -in 'timeout', 'failed') {
         $built = if ($Build) { " The new image $($linux.image) is built; rerun this script to replace the container." }
-        [Console]::Error.WriteLine("Runner container kept. $($drain.Retained)$built")
+        $why = if ($drain.Outcome -eq 'failed') { @($drain.Failures) -join ' ' } else { $drain.Retained }
+        [Console]::Error.WriteLine("Runner container kept. $why$built")
         exit 1
     }
     if ($drain.Outcome -eq 'forced' -and (Test-LinuxRunnerBusy)) { Write-Warning 'A running job is cancelled by this replacement (-Force).' }
@@ -56,7 +57,10 @@ if ($Update) {
     $timeoutSeconds = 600 + [int]($Config.buildAgent.updater.healthTimeout -replace '[^0-9]', '')
     $run = Invoke-BoundedNative $invocation.FilePath $invocation.Arguments $timeoutSeconds $invocation.Environment
     if ($run.Output) { Write-Output $run.Output }
-    if ($registered) { Exit-RunnerMaintenance $maintenanceFile $LinuxRunner | Out-Null }
+    if ($registered) {
+        try { Exit-RunnerMaintenance $maintenanceFile $LinuxRunner | Out-Null }
+        catch { [Console]::Error.WriteLine("Maintenance not ended; the recovery record $maintenanceFile is kept: $($_.Exception.Message)"); exit 1 }
+    }
     $meaning = Get-BuildAgentUpdateExitMeaning $run.ExitCode
     if ($run.ExitCode) { [Console]::Error.WriteLine($meaning); exit 1 }
     Write-Output $meaning
@@ -71,15 +75,15 @@ if (Test-Path -LiteralPath $registration) {
         $settings | ConvertTo-Json | Set-Content $registration
     }
 }
-function Remove-Container([string] $Name) {
-    & $Docker container inspect $Name 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        & $Docker stop --timeout 60 $Name | Out-Null
-        & $Docker rm $Name | Out-Null
+# Each removal is verified (the container is gone afterwards). A container that cannot be stopped or removed stops this script
+# with the runner still in maintenance; nothing after it (the sidecar, a new container) is touched.
+foreach ($name in @($linux.container) + @(if ($sidecar) { $sidecar.container })) {
+    $removed = Remove-LinuxContainer $name
+    if ($removed.Result -eq 'failed') {
+        [Console]::Error.WriteLine("Container $name was not removed: $($removed.Detail) The runner stays in maintenance$(if ($registered) { " (record $maintenanceFile)" }); fix the cause and rerun this script.")
+        exit 1
     }
 }
-Remove-Container $linux.container
-if ($sidecar) { Remove-Container $sidecar.container }
 $dockerArgs = @()
 if ($DockerSidecar) {
     & $Docker network inspect $sidecar.network 2>$null | Out-Null
@@ -139,4 +143,7 @@ if ($LASTEXITCODE) {
     [Console]::Error.WriteLine('Container start failed. The runner stays in maintenance (labels withdrawn); fix the cause and rerun this script.')
     exit 1
 }
-if ($registered) { Exit-RunnerMaintenance $maintenanceFile $LinuxRunner | Out-Null }
+if ($registered) {
+    try { Exit-RunnerMaintenance $maintenanceFile $LinuxRunner | Out-Null }
+    catch { [Console]::Error.WriteLine("The container runs, but maintenance was not ended; the recovery record $maintenanceFile is kept: $($_.Exception.Message)"); exit 1 }
+}

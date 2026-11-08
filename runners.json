@@ -38,8 +38,7 @@
     "directory": "windows",
     "name": "subzerodev.runner.windows",
     "labels": ["subzerodev-windows"],
-    "workFolder": "_work",
-    "startup": "Logon"
+    "workFolder": "_work"
   },
   "linux": {
     "directory": "linux/runner",
@@ -71,12 +70,12 @@
     "restartDelaySeconds": 30,
     "quickExitSeconds": 300,
     "quickExitLimit": 3,
-    "backoffMaxSeconds": 600
+    "backoffMaxSeconds": 600,
+    "startTimeoutSeconds": 60
   },
   "logs": {
     "retentionDays": 14,
-    "maxMB": 512,
-    "trimAt": "04:00"
+    "maxMB": 512
   },
   "housekeeping": {
     "retries": 20,

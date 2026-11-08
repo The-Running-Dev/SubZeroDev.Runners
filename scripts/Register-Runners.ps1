@@ -24,14 +24,14 @@ $runners = @(
     @{
         Label = 'Windows'; Name = $Config.windows.name; Directory = $WindowsRunner; WorkFolder = $Config.windows.workFolder; WorkArgument = $null
         Labels = @(@($github.labels) + @($Config.windows.labels) | Select-Object -Unique); Configure = $null
-        Stop = { $stopped = Stop-WindowsRunner -Reason 'registration change'; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained } }
+        Stop = { $stopped = Stop-WindowsRunner -Reason 'registration change'; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained }; if ($stopped.Outcome -eq 'failed') { throw "The runner did not stop, so its registration was not changed. $(@($stopped.Failures) -join ' ')" } }
     }
     @{
         # The Linux runner is configured from a throwaway container of the same image, on the same /runner mount.
         Label = 'Linux'; Name = $Config.linux.name; Directory = $LinuxRunner; WorkFolder = $Config.linux.workFolder; WorkArgument = $Config.linux.workFolder
         Labels = @(@($github.labels) + @($Config.linux.labels) | Select-Object -Unique)
         Configure = { & $Docker run --rm --mount "type=bind,source=$LinuxRunner,target=/runner" $Config.linux.image configure @args }
-        Stop = { $stopped = Stop-LinuxRunners; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained } }
+        Stop = { $stopped = Stop-LinuxRunners; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained }; if ($stopped.Outcome -eq 'failed') { throw "The runner did not stop, so its registration was not changed. $(@($stopped.Failures) -join ' ')" } }
     }
 )
 

@@ -41,7 +41,7 @@ function Assert-RunnerConfig($Config) {
     }
     if ($Config.linux.baseImage) { Require (IsDigest $Config.linux.baseImage) 'linux.baseImage must be pinned by digest.' }
     Require ($Config.linux.docker.mode -in 'sidecar', 'dind') 'linux.docker.mode must be sidecar or dind.'
-    foreach ($key in 'drainTimeoutMinutes', 'pollSeconds', 'stopTimeoutSeconds', 'restartDelaySeconds', 'quickExitSeconds', 'quickExitLimit', 'backoffMaxSeconds') {
+    foreach ($key in 'drainTimeoutMinutes', 'pollSeconds', 'stopTimeoutSeconds', 'restartDelaySeconds', 'quickExitSeconds', 'quickExitLimit', 'backoffMaxSeconds', 'startTimeoutSeconds') {
         Require ([int]$Config.lifecycle.$key -gt 0) "lifecycle.$key must be a positive number."
     }
     Require ([int]$Config.logs.retentionDays -gt 0 -and [int]$Config.logs.maxMB -gt 0) 'logs.retentionDays and logs.maxMB must be positive.'

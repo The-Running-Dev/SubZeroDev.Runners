@@ -27,9 +27,9 @@ param(
 $settings = Get-BuildAgentSettings $Config
 if (-not $settings.Enabled) { throw 'buildAgent.enabled is false for this machine.' }
 Assert-BuildAgentMapping $settings $Root
-# `--` separates this script's parameters from the build-agent parameters.
-$arguments = @($BuildArguments | Where-Object { $_ -ne '--' })
-$invocation = Get-BuildAgentInvocation -Settings $settings -Type $Type -Arguments $arguments
+# Everything this script does not bind itself goes to build-agent unchanged, single-dash options included
+# (`-Type node-template -AppDir documentation`). PowerShell itself consumes a first `--` as the end of this script's parameters.
+$invocation = Get-BuildAgentInvocation -Settings $settings -Type $Type -Arguments @($BuildArguments)
 if ($Dry) {
     [pscustomobject]@{ FilePath = $invocation.FilePath; Arguments = $invocation.Arguments; WorkingDirectory = $invocation.WorkingDirectory; Image = $settings.Image; DockerHost = $settings.DockerHost } | ConvertTo-Json
     return
