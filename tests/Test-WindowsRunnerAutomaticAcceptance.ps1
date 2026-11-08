@@ -21,7 +21,11 @@ try {
     $argsSaved = Get-Content -Raw -LiteralPath $saved | ConvertFrom-Json
     Assert ($argsSaved.Clones.Count -eq 2 -and $argsSaved.Clones[0] -ceq "C:\a folder\Ben's runner" -and $argsSaved.Disruptive) 'Child bridge corrupted structured options.'
     'throw "synthetic child failure"' | Set-Content -LiteralPath $bridge
-    Assert-Throws { Invoke-RunnerAcceptanceProcess $bridge @{} } 'Child process failure was swallowed.'
+    # GitHub dot-sources this suite and exits with LASTEXITCODE afterwards. An expected native failure must not poison
+    # that outer status after its exception has been asserted; unexpected child failures still escape and fail the suite.
+    $exitBeforeExpectedFailure = $global:LASTEXITCODE
+    try { Assert-Throws { Invoke-RunnerAcceptanceProcess $bridge @{} } 'Child process failure was swallowed.' }
+    finally { $global:LASTEXITCODE = $exitBeforeExpectedFailure }
 
     $clones = @('win01', 'win02' | ForEach-Object { Join-Path $root $_ })
     foreach ($clone in $clones) {
