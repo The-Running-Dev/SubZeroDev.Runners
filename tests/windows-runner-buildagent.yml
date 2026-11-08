@@ -1,0 +1,318 @@
+# Copy to .github/workflows/windows-runner-buildagent.yml in an authorized AbsoluteZeroDev repository (the repository the
+# runners are registered for). Deliberately a template: this personal-account repository cannot use organization-scoped runners.
+#
+# BuildAgent acceptance. Unlike windows-runner-smoke.yml (a 90 s sleep that proves only that two runners overlap), this runs
+# real BuildAgent builds through Invoke-BuildAgent.ps1 on both runner instances at once and keeps the evidence:
+#   build (x2)  a real Docusaurus build of a known-good project, one per runner instance, each stamped with its own marker
+#   failure     a deliberately failing build, which must fail its step with a BuildAgent failure code
+#   report      judges the evidence of all three and uploads the acceptance report
+# tests/Assert-WindowsRunnerBuildAgent.ps1 repeats the judgement from GitHub's own job records after the run completes.
+name: Windows runner BuildAgent acceptance
+run-name: Windows runner BuildAgent acceptance ${{ inputs.setup_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      computer_name:
+        description: Windows COMPUTERNAME of the two-runner host
+        required: true
+        type: string
+      runner_label:
+        description: Label targeting the pair of runners being tested
+        default: subzerodev-windows-large
+        required: true
+        type: string
+      runner_names:
+        description: Optional JSON array of the two expected runner names
+        default: ''
+        type: string
+      setup_id:
+        description: Correlation ID used by automated setup
+        default: manual
+        type: string
+      expected_tool_version:
+        description: BuildAgent.Tool version pinned in runners.json
+        default: 2.1.0
+        type: string
+      expected_image_digest:
+        description: BuildAgent image digest pinned in runners.json
+        default: sha256:cc13d62b66fab58e264eb583de5c47eb5f49a3ee8a2cdd48f0de0b1d0ba16556
+        type: string
+      fixture_repository:
+        description: Repository holding the known-good project to build
+        default: The-Running-Dev/GitHub-ActionTemplates
+        type: string
+      fixture_ref:
+        description: Commit of the fixture repository (a full SHA, so the project cannot change under the evidence)
+        default: 1c3b5f76554aca455cd4a284c4e473edd21c0d72
+        type: string
+      fixture_path:
+        description: Directory of the project inside the fixture repository
+        default: tests/fixtures/docusaurus
+        type: string
+      marker_file:
+        description: File in the project that receives this job's marker (relative to the project)
+        default: docs/index.md
+        type: string
+      build_type:
+        description: The build-agent build type
+        default: node-template
+        type: string
+      build_arguments:
+        description: Arguments passed to the build unchanged (space separated)
+        default: -AppDir docs
+        type: string
+      site_directory:
+        description: Where the build leaves its site, relative to the instance build workspace
+        default: docs/build
+        type: string
+      expected_artifacts:
+        description: Comma separated files, relative to the instance build workspace, every build must produce
+        default: docs/build/index.html
+        type: string
+
+permissions: {}
+
+env:
+  EXPECTED_COMPUTER: ${{ inputs.computer_name }}
+  EXPECTED_NAMES: ${{ inputs.runner_names }}
+  EXPECTED_TOOL_VERSION: ${{ inputs.expected_tool_version }}
+  EXPECTED_IMAGE_DIGEST: ${{ inputs.expected_image_digest }}
+  EXPECTED_ARTIFACTS: ${{ inputs.expected_artifacts }}
+  BUILD_TYPE: ${{ inputs.build_type }}
+  BUILD_ARGUMENTS: ${{ inputs.build_arguments }}
+  SITE_DIRECTORY: ${{ inputs.site_directory }}
+  MARKER_FILE: ${{ inputs.marker_file }}
+  FIXTURE_PATH: ${{ inputs.fixture_path }}
+
+jobs:
+  build:
+    name: Build slot ${{ matrix.slot }}
+    runs-on: [self-hosted, Windows, '${{ inputs.runner_label }}']
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        slot: [1, 2]
+    env:
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - name: Check out the known-good project
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ inputs.fixture_repository }}
+          ref: ${{ inputs.fixture_ref }}
+          path: fixture
+          persist-credentials: false
+
+      - name: Verify host, pins and Docker daemon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:COMPUTERNAME -ine $env:EXPECTED_COMPUTER) { throw 'Job reached a different machine.' }
+          $expected = @('win01', 'win02') | ForEach-Object { "subzerodev.runner.windows.$($env:EXPECTED_COMPUTER.ToLowerInvariant()).$_" }
+          if ($env:EXPECTED_NAMES) { $expected = @($env:EXPECTED_NAMES | ConvertFrom-Json) }
+          if ($env:RUNNER_NAME -notin $expected) { throw "Unexpected runner: $env:RUNNER_NAME" }
+          if (-not $env:SZR_SCRIPTS -or -not (Test-Path -LiteralPath $env:SZR_SCRIPTS)) { throw 'SZR_SCRIPTS is not set: this job is not on a SubZeroDev runner.' }
+          $out = Join-Path $env:RUNNER_TEMP 'acceptance'
+          Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $out | Out-Null
+          # The status script is the one source for tool, runtime, mapping, daemon and image; it exits 1 on any row but the updater.
+          $json = & pwsh -NoProfile -File (Join-Path $env:SZR_SCRIPTS 'Get-BuildAgentStatus.ps1') -Json
+          $status = $LASTEXITCODE
+          $json | Set-Content -LiteralPath (Join-Path $out 'status.json') -Encoding utf8
+          $json | Write-Output
+          if ($status) { throw 'BuildAgent is not ready on this runner.' }
+          $rows = @($json | ConvertFrom-Json)
+          $tool = $rows | Where-Object Item -eq 'tool'
+          $image = $rows | Where-Object Item -eq 'image'
+          if ($tool.Detail -notlike "*$env:EXPECTED_TOOL_VERSION*") { throw "Tool is not $($env:EXPECTED_TOOL_VERSION): $($tool.Detail)" }
+          if ($image.Detail -notlike "*$env:EXPECTED_IMAGE_DIGEST*") { throw "Image is not $($env:EXPECTED_IMAGE_DIGEST): $($image.Detail)" }
+          # The dry run prints the invocation this runner would make, with the image it would use.
+          $dry = & pwsh -NoProfile -File (Join-Path $env:SZR_SCRIPTS 'Invoke-BuildAgent.ps1') -Type $env:BUILD_TYPE -Source (Join-Path $env:GITHUB_WORKSPACE 'fixture') -Dry | ConvertFrom-Json
+          if ($dry.Image -notlike "*$env:EXPECTED_IMAGE_DIGEST") { throw "Invocation would use $($dry.Image)." }
+
+      - name: Stamp this job's marker into its own source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $marker = "acceptance-marker-r$($env:GITHUB_RUN_ID)-a$($env:GITHUB_RUN_ATTEMPT)-slot$($env:SLOT)"
+          $file = Join-Path (Join-Path $env:GITHUB_WORKSPACE 'fixture') (Join-Path $env:FIXTURE_PATH $env:MARKER_FILE)
+          if (-not (Test-Path -LiteralPath $file)) { throw "$file does not exist in the fixture." }
+          Add-Content -LiteralPath $file -Value "`n`nAcceptance marker: $marker`n" -Encoding utf8
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'acceptance\marker.txt') -Value $marker -NoNewline -Encoding ascii
+          Write-Output "Marker $marker stamped into $file"
+
+      - name: Run BuildAgent build
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'acceptance'
+          $source = Join-Path (Join-Path $env:GITHUB_WORKSPACE 'fixture') $env:FIXTURE_PATH
+          $arguments = @($env:BUILD_ARGUMENTS -split '\s+' | Where-Object { $_ })
+          Set-Content -LiteralPath (Join-Path $out 'start.txt') -Value ([DateTime]::UtcNow.ToString('o')) -NoNewline -Encoding ascii
+          Write-Output "Runner=$env:RUNNER_NAME Computer=$env:COMPUTERNAME Slot=$env:SLOT Type=$env:BUILD_TYPE Arguments=$($arguments -join ' ')"
+          # The build type and its arguments reach build-agent unchanged; a failing build fails this step with the tool's own status.
+          & pwsh -NoProfile -File (Join-Path $env:SZR_SCRIPTS 'Invoke-BuildAgent.ps1') -Type $env:BUILD_TYPE -Source $source -CopyOutputTo (Join-Path $out 'output') @arguments 2>&1 |
+            Tee-Object -FilePath (Join-Path $out 'build.log')
+          $code = $LASTEXITCODE
+          Set-Content -LiteralPath (Join-Path $out 'end.txt') -Value ([DateTime]::UtcNow.ToString('o')) -NoNewline -Encoding ascii
+          Set-Content -LiteralPath (Join-Path $out 'exit.txt') -Value $code -NoNewline -Encoding ascii
+          exit $code
+
+      - name: Collect evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'acceptance'
+          $read = { param($n) $f = Join-Path $out $n; if (Test-Path -LiteralPath $f) { (Get-Content -LiteralPath $f -Raw).Trim() } }
+          . (Join-Path $env:SZR_SCRIPTS 'Common.ps1')
+          . (Join-Path $env:SZR_SCRIPTS 'BuildAgent.ps1')
+          $settings = Get-BuildAgentSettings $Config
+          $marker = & $read 'marker.txt'
+          $exit = & $read 'exit.txt'
+          $rows = @((& $read 'status.json') | ConvertFrom-Json)
+          # The expected artifacts, from this instance's own workspace, with their hashes.
+          $artifacts = @($env:EXPECTED_ARTIFACTS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object {
+              $file = Join-Path $settings.Workspace $_
+              if (Test-Path -LiteralPath $file -PathType Leaf) { [ordered]@{ path = ($_ -replace '\\', '/'); sha256 = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant(); bytes = (Get-Item -LiteralPath $file).Length } }
+          })
+          # The whole site goes into the evidence; every marker in it must be this job's own.
+          $site = Join-Path $settings.Workspace $env:SITE_DIRECTORY
+          $found = @()
+          if (Test-Path -LiteralPath $site) {
+              Copy-Item -LiteralPath $site -Destination (Join-Path $out 'site') -Recurse -Force
+              $found = @(Get-ChildItem -LiteralPath $site -Recurse -File -Include *.html, *.js, *.json, *.txt, *.xml, *.css, *.md |
+                  ForEach-Object { [regex]::Matches((Get-Content -LiteralPath $_.FullName -Raw), 'acceptance-marker-r\d+-a\d+-slot\d+') } |
+                  ForEach-Object { $_.Value } | Select-Object -Unique)
+          }
+          [ordered]@{
+              kind = 'build'; slot = [int]$env:SLOT
+              runnerName = $env:RUNNER_NAME; computerName = $env:COMPUTERNAME; instance = $settings.Instance
+              workspace = $settings.Workspace; cacheDirectory = $settings.CacheDirectory; outputDirectory = $settings.OutputDirectory
+              buildType = $env:BUILD_TYPE; buildArguments = $env:BUILD_ARGUMENTS
+              startUtc = (& $read 'start.txt'); endUtc = (& $read 'end.txt')
+              toolVersion = ($rows | Where-Object Item -eq 'tool' | ForEach-Object { if ($_.Detail -match '\b(\d+\.\d+\.\d+)\b') { $Matches[1] } })
+              imageDigest = $settings.ImageDigest
+              dockerState = ($rows | Where-Object Item -eq 'docker').State
+              statusRows = $rows
+              exitCode = $(if ($null -ne $exit -and $exit -ne '') { [int]$exit } else { -1 })
+              marker = $marker; markerFound = ($found -contains $marker); foreignMarkers = @($found | Where-Object { $_ -ne $marker })
+              artifacts = $artifacts
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'report.json') -Encoding utf8
+          Get-Content -LiteralPath (Join-Path $out 'report.json') | Write-Output
+
+      - name: Upload build log, site and report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: buildagent-slot-${{ matrix.slot }}
+          path: ${{ runner.temp }}/acceptance
+          if-no-files-found: error
+          retention-days: 14
+
+  failure:
+    name: Failure propagation
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: [self-hosted, Windows, '${{ inputs.runner_label }}']
+    timeout-minutes: 15
+    steps:
+      - name: Create a project whose build fails
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SZR_SCRIPTS) { throw 'SZR_SCRIPTS is not set: this job is not on a SubZeroDev runner.' }
+          $out = Join-Path $env:RUNNER_TEMP 'acceptance-failure'
+          Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force (Join-Path $out 'project') | Out-Null
+          '{"name":"acceptance-failure","version":"0.0.0","private":true,"scripts":{"build":"node -e \"process.exit(7)\"","build:prod":"node -e \"process.exit(7)\"","test":"node -e \"process.exit(7)\""}}' |
+            Set-Content -LiteralPath (Join-Path $out 'project\package.json') -Encoding ascii
+
+      - name: Run failing build
+        id: failing
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'acceptance-failure'
+          & pwsh -NoProfile -File (Join-Path $env:SZR_SCRIPTS 'Invoke-BuildAgent.ps1') -Type node -Source (Join-Path $out 'project') 2>&1 |
+            Tee-Object -FilePath (Join-Path $out 'build.log')
+          $code = $LASTEXITCODE
+          Set-Content -LiteralPath (Join-Path $out 'exit.txt') -Value $code -NoNewline -Encoding ascii
+          exit $code
+
+      - name: Require the failure to propagate
+        if: always()
+        shell: pwsh
+        env:
+          FAILING_OUTCOME: ${{ steps.failing.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'acceptance-failure'
+          $file = Join-Path $out 'exit.txt'
+          $code = if (Test-Path -LiteralPath $file) { [int](Get-Content -LiteralPath $file -Raw).Trim() } else { -1 }
+          [ordered]@{ kind = 'failure'; runnerName = $env:RUNNER_NAME; buildType = 'node'; stepOutcome = $env:FAILING_OUTCOME; exitCode = $code } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $out 'report.json') -Encoding utf8
+          Get-Content -LiteralPath (Join-Path $out 'report.json') | Write-Output
+          # 0 would mean the failure was swallowed; 5 (daemon) and 125 (image) mean the build never ran at all.
+          if ($env:FAILING_OUTCOME -ne 'failure' -or $code -notin 1, 255) { throw "The failing build did not fail as a build: step outcome '$($env:FAILING_OUTCOME)', exit code $code." }
+
+      - name: Upload failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: buildagent-failure
+          path: ${{ runner.temp }}/acceptance-failure
+          if-no-files-found: error
+          retention-days: 14
+
+  report:
+    name: Acceptance report
+    needs: [build, failure]
+    if: ${{ !cancelled() }}
+    runs-on: [self-hosted, Windows, '${{ inputs.runner_label }}']
+    timeout-minutes: 10
+    steps:
+      - name: Download the evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: buildagent-*
+          path: ${{ runner.temp }}/evidence
+
+      - name: Judge the evidence and write the acceptance report
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evaluator = Join-Path $env:SZR_SCRIPTS '..\tests\BuildAgentAcceptance.ps1'
+          if (-not (Test-Path -LiteralPath $evaluator)) { throw "$evaluator is missing: update this runner's SubZeroDev.Runners clone." }
+          . $evaluator
+          $evidence = Join-Path $env:RUNNER_TEMP 'evidence'
+          $reports = Read-BuildAgentAcceptanceReports $evidence
+          $expected = @('win01', 'win02') | ForEach-Object { "subzerodev.runner.windows.$($env:EXPECTED_COMPUTER.ToLowerInvariant()).$_" }
+          if ($env:EXPECTED_NAMES) { $expected = @($env:EXPECTED_NAMES | ConvertFrom-Json) }
+          $result = Test-BuildAgentAcceptance -Builds $reports.Builds -Failure $reports.Failure -ExpectedRunnerNames $expected `
+              -ExpectedComputerName $env:EXPECTED_COMPUTER -ExpectedToolVersion $env:EXPECTED_TOOL_VERSION -ExpectedImageDigest $env:EXPECTED_IMAGE_DIGEST `
+              -ExpectedArtifacts @($env:EXPECTED_ARTIFACTS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $markdown = Format-BuildAgentAcceptanceReport -Result $result -Builds $reports.Builds -Failure $reports.Failure -RunUrl $runUrl
+          $reportDirectory = Join-Path $env:RUNNER_TEMP 'acceptance-report'
+          New-Item -ItemType Directory -Force $reportDirectory | Out-Null
+          $markdown | Set-Content -LiteralPath (Join-Path $reportDirectory 'acceptance-report.md') -Encoding utf8
+          $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $reportDirectory 'acceptance-report.json') -Encoding utf8
+          $markdown | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          $markdown | Write-Output
+          if (-not $result.Passed) { throw 'BuildAgent acceptance failed.' }
+
+      - name: Upload the acceptance report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: buildagent-acceptance-report
+          path: ${{ runner.temp }}/acceptance-report
+          if-no-files-found: ignore
+          retention-days: 30
