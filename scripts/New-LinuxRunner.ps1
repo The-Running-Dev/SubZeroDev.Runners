@@ -18,8 +18,8 @@
 # -Force replaces at once and cancels whatever is running. A runner the owner held (Hold) stays held.
 #
 # -Update hands the replacement of the runner container to BuildAgent's updater (`build-agent update`: lock, update record,
-# health wait, restore of the original container). It is blocked until a published BuildAgent.Tool containing
-# Docker-BuildAgent PR #136 is configured (buildAgent.updater.version), because without it the updater refuses this runner.
+# health wait, restore of the original container). BuildAgent.Tool 2.2.0 contains Docker-BuildAgent #136.
+# The tool/updater/installed versions must match; sidecar mode also requires PR #17's live runtime isolation layout.
 # The updater restores the container, not what the replacement wrote to the mounted /runner (binaries, credentials) or
 # volumes; the runner's own mounted self-update is unchanged. The Docker sidecar has no health check, so it is always
 # replaced by this script, never by the updater. -Update refuses a compose container: the updater would restore the old
@@ -169,9 +169,16 @@ try {
         $settings = Get-BuildAgentSettings $Config
         $updater = Test-BuildAgentUpdater $settings
         if (-not $updater.Available) {
-            [Console]::Error.WriteLine($updater.Reason + ' To replace the container now without the updater, run this script without -Update (it drains the runner first).')
+            [Console]::Error.WriteLine($updater.Reason)
             exit 1
         }
+        $previousUpdate = Get-MaintenanceState (Get-LinuxMaintenanceFile)
+        if ($previousUpdate -and $previousUpdate.phase -in @('update-running', 'update-recovery-required')) {
+            [Console]::Error.WriteLine('A prior update has no verified recovery. Maintenance is kept; inspect the updater log, lock, prior container and mounted state, then explicitly end maintenance after approved recovery before retrying -Update.')
+            exit 1
+        }
+        $timeoutSeconds = Get-BuildAgentUpdateTimeoutSeconds $Config.buildAgent.updater.healthTimeout
+        Assert-LinuxUpdaterIsolation $Config $Docker
     }
 
     if ($composeSlots.Count) {
@@ -209,9 +216,24 @@ try {
     if ($Update) {
         # The updater replaces only the runner container, after the drain; the sidecar and its volumes are untouched.
         $invocation = Get-BuildAgentUpdateInvocation $settings $linux.container $linux.image $Config.buildAgent.updater.healthTimeout
-        $timeoutSeconds = 600 + [int]($Config.buildAgent.updater.healthTimeout -replace '[^0-9]', '')
-        $run = Invoke-BoundedNative $invocation.FilePath $invocation.Arguments $timeoutSeconds $invocation.Environment
+        # Persist before starting the child. A crash leaves this phase, so a later early refusal/already-current result
+        # cannot accidentally reopen admission for an earlier interrupted update that still needs operator recovery.
+        if ($registered) { Set-MaintenanceState $maintenanceFile @{ phase = 'update-running'; failure = $null } }
+        try { $run = Invoke-BoundedNative $invocation.FilePath $invocation.Arguments $timeoutSeconds $invocation.Environment }
+        catch {
+            [Console]::Error.WriteLine("Updater invocation failed; outcome unverified. Maintenance and its recovery record $maintenanceFile are kept. Inspect the updater log and containers before recovery. $($_.Exception.Message)")
+            exit 1
+        }
         if ($run.Output) { Write-Output $run.Output }
+        # Only a completed success, confirmed restore, or a refusal known to precede mutation may reopen admission.
+        # Lock/residue refusals may describe an earlier interrupted update; a timeout forcibly kills the child and
+        # cannot establish that upstream's graceful restore ran. Never clear locks/residue or fall back to recreation.
+        if (-not $run.Started -or $run.TimedOut -or $run.ExitCode -notin @(0, 10, 20, 23, 24, 30)) {
+            $meaning = if ($run.TimedOut) { 'Updater timed out and was terminated; restoration is unverified.' } else { Get-BuildAgentUpdateExitMeaning $run.ExitCode }
+            if ($registered) { Set-MaintenanceState $maintenanceFile @{ phase = 'update-recovery-required'; failure = $meaning } }
+            [Console]::Error.WriteLine("$meaning Maintenance and its recovery record $maintenanceFile are kept; inspect the updater log and containers before an approved recovery and rerun.")
+            exit 1
+        }
         if ($registered) {
             try { Exit-RunnerMaintenance $maintenanceFile $LinuxRunner | Out-Null }
             catch { [Console]::Error.WriteLine("Maintenance not ended; the recovery record $maintenanceFile is kept: $($_.Exception.Message)"); exit 1 }

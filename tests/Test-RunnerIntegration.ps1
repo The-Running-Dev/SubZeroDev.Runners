@@ -119,10 +119,11 @@ try {
     # --- updater gate (Docker-BuildAgent PR #136) ------------------------------------------------------------------
     function Get-BuildAgentInstalledVersion { param($Settings) $script:installedTool }
     $script:installedTool = '2.1.0'
-    $gate = Test-BuildAgentUpdater $settings
-    Assert (-not $gate.Available -and $gate.Reason -match '#136') "The updater is available without a version that has PR #136: $($gate.Reason)"
-    Assert ($Config.buildAgent.updater.version -eq $null) 'buildAgent.updater.version is set although no published artifact contains PR #136 (never claim 2.1.0 has it).'
-    $pinned = $settings.PSObject.Copy(); $pinned.UpdaterVersion = '2.2.0'
+    $disabled = $settings.PSObject.Copy(); $disabled.UpdaterVersion = $null
+    $gate = Test-BuildAgentUpdater $disabled
+    Assert (-not $gate.Available -and $gate.Reason -match 'disabled') 'A null updater pin was accepted.'
+    Assert ($Config.buildAgent.tool.version -eq '2.2.0' -and $Config.buildAgent.updater.version -eq '2.2.0') 'Tool/updater pins must coordinate on the published runner-settings release.'
+    $pinned = $settings.PSObject.Copy()
     $gate = Test-BuildAgentUpdater $pinned
     Assert (-not $gate.Available -and $gate.Reason -match '2\.2\.0' -and $gate.Reason -match '2\.1\.0') "A different installed tool still enabled the updater: $($gate.Reason)"
     $script:installedTool = '2.2.0'

@@ -12,7 +12,7 @@
     "enabled": true,
     "tool": {
       "package": "BuildAgent.Tool",
-      "version": "2.1.0",
+      "version": "2.2.0",
       "directory": "%LOCALAPPDATA%\\SubZeroDev\\BuildAgent\\tool"
     },
     "dotnetRuntime": {
@@ -35,7 +35,7 @@
       "maxGB": 20
     },
     "updater": {
-      "version": null,
+      "version": "2.2.0",
       "healthTimeout": "120s"
     },
     "estimate": {

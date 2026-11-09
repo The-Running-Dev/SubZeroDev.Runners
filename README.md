@@ -213,16 +213,38 @@ build context (Dockerfile, entrypoint, healthcheck, runner archive, `.dockerigno
 runner keeps its `docker run` path until it is migrated. `Get-LinuxRunnerStatus.ps1 [-Json]` reports per slot whether the
 container's image, the image's context hash and the compose definition are current; a check it cannot make says
 `not-checked`. `-Update` refuses a container compose manages. `-Update` instead delegates to BuildAgent's updater
-(`build-agent update`: locking, an update record, a wait for the replacement's own `HEALTHCHECK`, restore of the original
-container). Only a `BuildAgent.Tool` containing Docker-BuildAgent PR #136 can update this container (2.1.0 refuses a
-privileged container or one with CPU/memory limits), and that change has **no published artifact yet**, so
-`buildAgent.updater.version` is `null` and `-Update` stops with that reason; `Get-BuildAgentStatus.ps1` shows the same. Set
-the version only to an exact published release containing #136, never to `latest`; this repository does not duplicate the updater. After publication, validate a healthy update, restoration when the replacement fails its health check, and an interrupted update on Docker Desktop. Notes that hold once it is available:
+(`build-agent update`: locking, an update record, replacement health verification and restoration of the original).
+[BuildAgent.Tool v2.2.0](https://github.com/The-Running-Dev/Docker-BuildAgent/releases/tag/v2.2.0), published
+November 9, 2026, contains [#136](https://github.com/The-Running-Dev/Docker-BuildAgent/pull/136): privileged mode,
+CPU/memory limits, tmpfs, stop timeout and network aliases are carried over. `buildAgent.tool.version` and
+`buildAgent.updater.version` both pin **2.2.0**; `-Update` refuses unless the installed tool matches both exactly.
+A null updater pin disables integration. Status reports this version gate, not Docker Desktop acceptance.
+The BuildAgent **image digest is unchanged** and still passed explicitly to builds as `BUILD_AGENT_IMAGE`.
+Running setup/`Install-BuildAgent.ps1` after this source change can upgrade the shared host tool; review and approve
+that host action separately. Editing the pin does not install anything.
 
-- restore puts back the container, **not** what the replacement changed in the mounted `/runner` folder (runner binaries,
-  registration, credentials) or in volumes. The runner's own mounted self-update still works as before and is outside
-  the updater's rollback;
-- the `docker:dind` sidecar has no health check, so it is never updater-managed and keeps being recreated by the script.
+Sidecar mode also requires the live isolated runtime volume and refresh hook from
+[Runners #17](https://github.com/The-Running-Dev/SubZeroDev.Runners/pull/17). The preflight reads only mounts and an
+allowlisted hook marker; it refuses sidecar bind mounts, incorrect/missing projection mounts, volume aliases and an
+unverified hook **before drain**. This PR does not apply #17's creation changes. Existing containers need an approved
+recreation from #17's source first: an update preserves old mounts and cannot remove their credential exposure.
+DinD has no separate sidecar projection prerequisite.
+
+- The updater owns container replacement and its own lock/log. `-Update` never recreates the sidecar, clears a lock,
+  repairs residue or falls back to recreation. The non-Update path remains the separate creation/migration operation.
+- Exit 0 means healthy replacement **or already-current image** (the latter performs no new health verification).
+  Exit 10 means original container restored, including after graceful interruption. Both allow label restoration;
+  only exit 0 makes this script succeed. Refusals 20/23/24/30 also restore admission because this invocation did not
+  mutate the target. Other failures, lock/residue refusals, forced timeout and unverified invocation keep maintenance
+  and saved labels for operator recovery; label-restoration failure also keeps the record. A durable `update-running`
+  or `update-recovery-required` record blocks retries until explicit, approved operator recovery ends maintenance.
+- Restoration puts back the **container**, not writes to mounted runner binaries/registration/credentials or volumes.
+  Runner self-update and its mounted state remain outside rollback. The sidecar has no health check and is never
+  updater-managed.
+
+See [v2.2.0 integration and approval-gated host acceptance](docs/build-agent-2.2.0-updater.md) for the release
+contract, regression coverage, recovery boundaries and proposed commands. Healthy replacement, unhealthy restoration,
+interruption and real builds on Windows Docker Desktop remain separate acceptance work.
 
 After editing `runners.json` or `runners.local.json`: `New-LinuxRunner.ps1` for anything under `linux`,
 `Register-Runners.ps1` for `github` or a runner name; `logs` settings apply at the next run of `Trim-RunnerLogs.ps1`

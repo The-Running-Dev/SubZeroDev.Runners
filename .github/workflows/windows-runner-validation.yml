@@ -48,6 +48,9 @@ jobs:
       - name: Verify intended repository scope before configuring runners
         shell: pwsh
         run: ./tests/Test-WindowsRunnerRepositoryScope.ps1
+      - name: Verify guarded Linux updater with synthetic native calls and admission
+        shell: pwsh
+        run: ./tests/Test-LinuxRunnerUpdate.ps1
       - name: Verify Linux job-container mount creation with fake Docker
         shell: pwsh
         run: ./tests/Test-LinuxJobContainerMounts.ps1

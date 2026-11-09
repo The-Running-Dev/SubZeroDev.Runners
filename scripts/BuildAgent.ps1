@@ -200,14 +200,18 @@ function Get-BuildAgentInstalledVersion($Settings) {
     if (Test-Path -LiteralPath $store) { (Get-ChildItem -LiteralPath $store -Directory | Sort-Object Name | Select-Object -Last 1).Name }
 }
 
-# Whether `build-agent update` may be used on the Linux runner container. The runner and its Docker sidecar are started with
-# --privileged, --cpus, --memory, --tmpfs, --stop-timeout and --network-alias, which the 2.1.0 updater refuses (exit 20,
-# TargetShapeUnsupported); carrying them over is Docker-BuildAgent PR #136, which no published BuildAgent.Tool contains yet.
-# So the updater is used only when runners.json names (buildAgent.updater.version) an exact published version that contains
-# #136, and that exact version is the installed tool. Never 'latest', never inferred from 2.1.0.
+# The v2.2.0 release contains Docker-BuildAgent #136's runner settings support. Both configuration pins and
+# the installed tool must agree. A null updater pin deliberately disables integration; never infer it from the image.
 function Test-BuildAgentUpdater($Settings) {
     if (-not $Settings.UpdaterVersion) {
-        return [pscustomobject]@{ Available = $false; Reason = 'Updater integration is blocked: no published BuildAgent.Tool contains Docker-BuildAgent PR #136 (privileged, CPU, memory, tmpfs, stop timeout and network aliases carried over), and 2.1.0 refuses this runner. Set buildAgent.updater.version in runners.json to the first release that contains it.' }
+        return [pscustomobject]@{ Available = $false; Reason = 'Updater integration is disabled: buildAgent.updater.version is null. BuildAgent.Tool 2.2.0 contains Docker-BuildAgent #136; configure coordinated tool and updater pins only after reviewing that contract.' }
+    }
+    if ($Settings.Version -ne $Settings.UpdaterVersion) {
+        return [pscustomobject]@{ Available = $false; Reason = "Configured tool $($Settings.Version) and updater $($Settings.UpdaterVersion) differ; coordinate buildAgent.tool.version and buildAgent.updater.version." }
+    }
+    $releaseVersion = $null
+    if (-not [version]::TryParse($Settings.UpdaterVersion, [ref]$releaseVersion) -or $releaseVersion -lt [version]'2.2.0') {
+        return [pscustomobject]@{ Available = $false; Reason = 'Runner settings require a stable BuildAgent.Tool release from 2.2.0 (Docker-BuildAgent #136); the configured updater predates it or is not a stable release.' }
     }
     $installed = Get-BuildAgentInstalledVersion $Settings
     if ($installed -ne $Settings.UpdaterVersion) {
@@ -215,6 +219,54 @@ function Test-BuildAgentUpdater($Settings) {
         return [pscustomobject]@{ Available = $false; Reason = "The updater is configured from BuildAgent.Tool $($Settings.UpdaterVersion) but the installed tool is $have. Install exactly that version (buildAgent.tool.version) first." }
     }
     [pscustomobject]@{ Available = $true; Reason = $null }
+}
+
+# Seconds, s, m and h match v2.2.0's duration contract. Validate before drain; never strip a unit and shorten the wait.
+function Get-BuildAgentUpdateTimeoutSeconds([string] $HealthTimeout) {
+    if ($HealthTimeout -cnotmatch '^([1-9][0-9]*)(s|m|h)?$') { throw 'Updater healthTimeout must be positive seconds, or a duration such as 120s, 2m or 1h.' }
+    $scale = switch ($Matches[2]) { 'm' { 60 }; 'h' { 3600 }; default { 1 } }
+    $seconds = [double]$Matches[1] * $scale + 600
+    if ($seconds -gt [int]::MaxValue / 1000) { throw 'Updater healthTimeout exceeds the bounded process wait limit.' }
+    [int]$seconds
+}
+
+# An update preserves existing mounts; it cannot apply PR #17's isolation migration. Inspect only mounts and the
+# allowlisted hook marker (never the full environment/registration). Refuse an old or unverifiable sidecar before drain.
+# DinD has no separate daemon registration mount to migrate. Do not recreate anything from this preflight.
+function Assert-LinuxUpdaterIsolation($Config, [string] $DockerExe) {
+    if ($Config.linux.docker.mode -ne 'sidecar') { return }
+    $linux = $Config.linux
+    $sidecar = $linux.docker
+    $runtimeVolume = "$($linux.container)-runtimes"
+    if ($runtimeVolume -in @($linux.cacheVolume, $sidecar.dataVolume, $sidecar.certsVolume, $sidecar.workVolume, $sidecar.dindVolume)) {
+        throw 'The derived runtime volume must not alias a runner state, cache or workspace volume.'
+    }
+    $environment = @{}
+    if ($Config.buildAgent.docker.host) { $environment.DOCKER_HOST = $Config.buildAgent.docker.host }
+    foreach ($name in @($sidecar.container, $linux.container)) {
+        $read = Invoke-BoundedNative $DockerExe @('inspect', '--format', '{{json .Mounts}}', $name) 30 $environment
+        if ($read.ExitCode -ne 0 -or $read.TimedOut -or -not $read.Started) { throw "Cannot verify runtime isolation for $name; update refused before drain." }
+        try { $mounts = @($read.Output | ConvertFrom-Json -ErrorAction Stop) }
+        catch { throw "Cannot parse runtime mounts for $name; update refused before drain." }
+        if ($name -eq $sidecar.container) {
+            foreach ($mount in $mounts) {
+                if ($mount.Type -eq 'bind' -or
+                    ($mount.Destination -eq '/runner' -or ($mount.Destination -like '/runner/*' -and $mount.Destination -ne '/runner/externals'))) {
+                    throw 'The sidecar still exposes the runner installation. Apply PR #17 through an approved recreation before using -Update.'
+                }
+            }
+            $projection = @($mounts | Where-Object { $_.Type -eq 'volume' -and $_.Name -eq $runtimeVolume -and $_.Destination -eq '/runner/externals' -and $_.RW -eq $false })
+        }
+        else {
+            $projection = @($mounts | Where-Object { $_.Type -eq 'volume' -and $_.Name -eq $runtimeVolume -and $_.Destination -eq '/runner-runtime' -and $_.RW -eq $true })
+        }
+        if ($projection.Count -ne 1) { throw "PR #17 runtime projection is missing or incorrect on $name; an approved recreation is required before -Update." }
+    }
+    $hookFormat = '{{range .Config.Env}}{{if eq . "ACTIONS_RUNNER_HOOK_JOB_STARTED=/runner-hooks/Sync-LinuxRunnerRuntimes.sh"}}configured{{end}}{{end}}'
+    $hook = Invoke-BoundedNative $DockerExe @('inspect', '--format', $hookFormat, $linux.container) 30 $environment
+    if ($hook.ExitCode -ne 0 -or $hook.TimedOut -or -not $hook.Started -or $hook.Output.Trim() -cne 'configured') {
+        throw 'PR #17 runtime refresh hook is not verified; update refused before drain.'
+    }
 }
 
 # The documented update command, nothing else: build-agent update <container> --image <ref> --health-timeout <d>.
@@ -232,12 +284,17 @@ function Get-BuildAgentUpdateInvocation($Settings, [Parameter(Mandatory)] [strin
 # What the updater's documented exit statuses mean for the person reading the report.
 function Get-BuildAgentUpdateExitMeaning([int] $ExitCode) {
     switch ($ExitCode) {
-        0 { 'Updated (or already on that image). The replacement reported healthy.' }
-        10 { 'The replacement did not report healthy; the original container was restored.' }
-        11 { 'The replacement did not report healthy and was left in place (--no-restore).' }
-        20 { 'Refused before any change: the container has a setting the replacement cannot carry over. The container is untouched.' }
-        30 { 'The image could not be pulled and none is present. The container is untouched.' }
-        default { "build-agent update exited $ExitCode; see its output and the updater's update log." }
+        0 { 'Updated and healthy, or already on the requested image (no replacement or new health check).' }
+        10 { 'The replacement failed or the update was interrupted; the original container was restored. Mounted files and volumes were not rolled back.' }
+        11 { 'The unverified replacement was left in place (--no-restore). Manual recovery required; keep maintenance.' }
+        12 { 'The original container could not be restored. Manual recovery required; keep maintenance.' }
+        20 { 'Refused: target missing or unsupported container settings. This invocation left the container untouched.' }
+        21 { 'Refused: updater lock held. Verify its owner and recover the interrupted update; keep maintenance.' }
+        22 { 'Refused: updater residue or an unreadable update log. Manual recovery required; keep maintenance.' }
+        23 { 'Refused: prior image could not be pinned. This invocation left the container untouched.' }
+        24 { 'Refused: update log could not be written. This invocation left the container untouched.' }
+        30 { 'The image could not be obtained. This invocation left the container untouched.' }
+        default { "build-agent update exited $ExitCode; outcome unverified. Keep maintenance and inspect the updater log and container state." }
     }
 }
 
@@ -313,7 +370,8 @@ function Get-BuildAgentStatus([Parameter(Mandatory)] $Config, [string] $RunnerRo
         if ($image.ExitCode -eq 0) { Add-Row 'image' 'ok' "$($settings.ImageDigest) ($($image.Output))." } else { Add-Row 'image' 'missing' "$($settings.Image) is not pulled." }
     }
     else { Add-Row 'image' 'missing' 'Cannot check the image until the daemon is ready.' }
-    if ($settings.UpdaterVersion) { Add-Row 'updater' 'ok' "Updater from BuildAgent.Tool $($settings.UpdaterVersion)." }
-    else { Add-Row 'updater' 'missing' 'No published BuildAgent artifact containing the runner-settings updater (Docker-BuildAgent #136) is configured; the Linux update is blocked on it.' }
+    $updater = Test-BuildAgentUpdater $settings
+    if ($updater.Available) { Add-Row 'updater' 'ok' "BuildAgent.Tool $($settings.UpdaterVersion) version gate passed; runtime isolation is checked separately before -Update (host acceptance still required)." }
+    else { Add-Row 'updater' 'missing' $updater.Reason }
     $rows
 }
