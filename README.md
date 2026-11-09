@@ -55,7 +55,7 @@ package-installer elevation prompts and the first GitHub sign-in; the runners re
 After the runners are verified it provisions the [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent)
 integration once for the host: Docker Desktop (installed with WinGet if missing, switched to Linux containers, waited
 until the daemon answers), the net8.0 runtime, the pinned `BuildAgent.Tool` and the pinned image. `-SkipBuildAgent`
-leaves it out. Exit codes: **0** done; **1** the BuildAgent part failed (the runners are still set up and running);
+leaves it out. Exit codes: **0** done (and, with `-Repository`, verification passed); **1** the BuildAgent part or the requested verification failed (the runners are still set up and running);
 **2** you have to act first (restart Windows, sign out and in, finish Docker Desktop's first run, join `docker-users`).
 The steps are printed and saved in `<InstallRoot>\setup-state.json`; do them and run the same command again, finished
 steps are skipped. Setup never restarts Windows, signs you out or enables automatic sign-in.

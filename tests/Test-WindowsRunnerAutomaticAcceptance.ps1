@@ -195,6 +195,22 @@ try {
     Assert-Throws { Invoke-WindowsRunnerHostSetup @hostOptions } 'Single runner accepted for concurrent verification.'
     $hostOptions.Count = 2; $hostOptions.SkipBuildAgent = $true
     Assert-Throws { Invoke-WindowsRunnerHostSetup @hostOptions } 'Verification accepted disabled BuildAgent.'
+
+    # The real worker process must exit with the overall result (a failed acceptance is exit 1 even though BuildAgent exited 0),
+    # not with the BuildAgent exit code alone; the 5.1 entry point only treats 0 and 2 as non-fatal.
+    $workerDir = Join-Path $root 'exit-worker\scripts'
+    New-Item -ItemType Directory -Path $workerDir -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo 'scripts\Configure-WindowsRunners.ps1') -Destination $workerDir
+    $workerOptions = Join-Path $root 'exit-worker\options.json'
+    '{}' | Set-Content -LiteralPath $workerOptions
+    $pwshExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    foreach ($case in @(@{ Overall = 0; BuildAgent = 0 }, @{ Overall = 1; BuildAgent = 0 }, @{ Overall = 2; BuildAgent = 2 }, @{ Overall = 1; BuildAgent = 1 })) {
+        "function Invoke-WindowsRunnerHostSetup { param() [pscustomobject]@{ BuildAgentExitCode = $($case.BuildAgent); ExitCode = $($case.Overall) } }" | Set-Content -LiteralPath (Join-Path $workerDir 'WindowsRunnerSetup.ps1')
+        & $pwshExe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $workerDir 'Configure-WindowsRunners.ps1') -OptionsPath $workerOptions | Out-Null
+        $workerExit = $LASTEXITCODE
+        $global:LASTEXITCODE = 0
+        Assert ($workerExit -eq $case.Overall) "Worker exited $workerExit for overall result $($case.Overall) (BuildAgent $($case.BuildAgent))."
+    }
 } finally {
     $resolved = [IO.Path]::GetFullPath($root)
     $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
