@@ -316,6 +316,7 @@ function Get-LinuxSlots($Config, $Inventory, $Count = $Config.linux.count) {
                 DockerCerts = "$($docker.certsVolume)$suffix"
                 Work = "$($docker.workVolume)$suffix"
                 Dind = "$($docker.dindVolume)$suffix"
+                Runtimes = "$($Config.linux.container)-runtimes$suffix"
             }
             Labels = $labels
         }

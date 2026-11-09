@@ -42,22 +42,31 @@ try {
     if ($state.Output -ne 'true') { throw 'Configured Linux runner container is not running.' }
     # The resolved target is useful when a runner self-update has made externals a symlink.
     $report.externalsTarget = (Invoke-ProbeDocker @('exec', $runner, 'readlink', '-f', '/runner/externals')).Output
+    $isolationMounts = @()
+    if ($config.linux.docker.mode -eq 'sidecar') {
+        # An opt-in probe is not a GitHub job, so invoke the same pre-job refresh
+        # explicitly. Never start a runner or rewrite its registration here.
+        Invoke-ProbeDocker @('exec', $runner, '/bin/bash', '/runner-hooks/Sync-LinuxRunnerRuntimes.sh') | Out-Null
+        $isolationMounts = @('--mount', 'type=bind,source=/runner,target=/__runner,readonly', '--env', 'PROBE_RUNTIME_ISOLATION=1')
+    }
     $createdWork = $true
     Invoke-ProbeDocker @('exec', '--env', "PROBE_DIR=$work", '--env', "PROBE_MARKER=$id", $runner, '/bin/sh', '-c',
         'set -eu; mkdir -p "$PROBE_DIR/runner-layout/externals.fixture"; printf "%s" "$PROBE_MARKER" > "$PROBE_DIR/marker"; printf "%s" "$PROBE_MARKER" > "$PROBE_DIR/runner-layout/externals.fixture/marker"; ln -s externals.fixture "$PROBE_DIR/runner-layout/externals"') | Out-Null
     # Use the runner's own Docker connection/TLS environment. The daemon must resolve
     # both bind sources itself, exactly as it does when Actions creates a job container.
-    $run = Invoke-ProbeDocker @('exec', $runner, 'docker', 'run', '--rm', '--name', $name,
+    $probeArguments = @('exec', $runner, 'docker', 'run', '--rm', '--name', $name,
         '--network', 'none', '--cpus', '1', '--memory', '256m', '--read-only',
         '--mount', 'type=bind,source=/runner/externals,target=/__e,readonly',
         '--mount', "type=bind,source=$work,target=/__w,readonly", '--env', "PROBE_MARKER=$id",
-        '--mount', "type=bind,source=$work/runner-layout/externals,target=/__fixture,readonly",
+        '--mount', "type=bind,source=$work/runner-layout/externals,target=/__fixture,readonly") + $isolationMounts + @(
         '--entrypoint', '/bin/sh', $config.buildAgent.image, '-c',
-        'set -eu; test "$(cat /__w/marker)" = "$PROBE_MARKER"; test "$(cat /__fixture/marker)" = "$PROBE_MARKER"; /__e/node24/bin/node --version')
+        'set -eu; test "$(cat /__w/marker)" = "$PROBE_MARKER"; test "$(cat /__fixture/marker)" = "$PROBE_MARKER"; if [ "${PROBE_RUNTIME_ISOLATION:-}" = 1 ]; then test -z "$(find /__runner -mindepth 1 -maxdepth 1 ! -name externals -print -quit)"; test -z "$(find /__runner -name ".credentials*" -print -quit)"; fi; /__e/node24/bin/node --version')
+    $run = Invoke-ProbeDocker $probeArguments
     if ($run.Output -notmatch '^v24\.') { throw "Expected runner Node 24 runtime, got: $($run.Output)" }
     $report.nodeRuntime = $run.Output
     $report.workspaceMarkerVerified = $true
-    $report.selfUpdateSymlinkVerified = $true
+    $report.workspaceSymlinkFixtureVerified = $true
+    if ($config.linux.docker.mode -eq 'sidecar') { $report.sidecarRegistrationPathsAbsent = $true }
     $report.status = 'success'
 } catch { $failure = $_.Exception.Message; $report.error = $failure }
 finally {
@@ -74,4 +83,4 @@ finally {
     Write-Output "Probe evidence: $absolute"
 }
 if ($failure) { throw $failure }
-Write-Output 'PASS: nested job container sees the live runner Node 24 runtime, workspace marker and versioned symlink target.'
+Write-Output 'PASS: nested job container sees the live runner Node 24 runtime and workspace/symlink fixture; in sidecar mode its runner path exposes only the runtime projection.'

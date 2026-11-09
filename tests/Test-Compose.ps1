@@ -68,7 +68,7 @@ Test-Case 'The specs give `docker run` the arguments it always had, in sidecar a
         if ($mode -eq 'sidecar') {
             foreach ($entry in @("--network $($d.network)", '-e DOCKER_HOST=tcp://docker:2376', '-e DOCKER_TLS_VERIFY=1', '-e DOCKER_CERT_PATH=/certs/client',
                     '-e TESTCONTAINERS_HOST_OVERRIDE=docker', "--mount type=volume,source=$($d.certsVolume),target=/certs,readonly",
-                    "--mount type=volume,source=$($d.workVolume),target=$($linux.workFolder)")) { $expected.Add($entry) }
+                    "--mount type=volume,source=$($d.workVolume),target=$($linux.workFolder)", "--mount type=volume,source=$($linux.container)-runtimes,target=/runner-runtime,volume-nocopy", "-e ACTIONS_RUNNER_HOOK_JOB_STARTED=/runner-hooks/Sync-LinuxRunnerRuntimes.sh")) { $expected.Add($entry) }
         }
         else {
             foreach ($entry in @('--privileged', '-e BUILD_AGENT_DOCKERD=1', '--stop-timeout 60', "--mount type=volume,source=$($d.dindVolume),target=/var/lib/docker")) { $expected.Add($entry) }
@@ -81,7 +81,7 @@ Test-Case 'The specs give `docker run` the arguments it always had, in sidecar a
                 "--name $($d.container)", '--restart unless-stopped', '--privileged', "--cpus $($d.cpus)", "--memory $($d.memory)", "--network $($d.network)",
                 '--network-alias docker', '-e DOCKER_TLS_CERTDIR=/certs', '--tmpfs /tmp',
                 "--mount type=volume,source=$($d.dataVolume),target=/var/lib/docker", "--mount type=volume,source=$($d.certsVolume),target=/certs",
-                "--mount type=volume,source=$($d.workVolume),target=$($linux.workFolder)", "--mount type=bind,source=$runnerDir,target=/runner,readonly", "image $($d.image)") | Sort-Object -CaseSensitive
+                "--mount type=volume,source=$($d.workVolume),target=$($linux.workFolder)", "--mount type=volume,source=$($linux.container)-runtimes,target=/runner/externals,readonly,volume-nocopy", "image $($d.image)") | Sort-Object -CaseSensitive
             $actualSide = Get-Pairs (ConvertTo-DockerRunArguments $specs.Sidecar)
             Assert (($actualSide -join "`n") -ceq ($side -join "`n")) "Sidecar arguments changed.`nactual:`n$($actualSide -join "`n")"
         }
@@ -392,7 +392,7 @@ Test-Case 'Recreating slot 02 while slot 01 is busy touches nothing of slot 01' 
     Assert ($ups[1] -match '--no-deps --force-recreate linux-02$') "The runner was not recreated alone: $($ups[1])"
     $others = @($log | Where-Object { $_ -match '^compose' -and $_ -notmatch ' up ' -and $_ -notmatch ' config ' })
     Assert (-not $others.Count -and -not @($log | Where-Object { $_ -match '^(rm|stop|kill|down)\b| down( |$)' }).Count) "Something other than up ran: $($log -join ' | ')"
-    Assert (@($log | Where-Object { $_ -match '^volume create' }).Count -eq 4 -and -not @($log | Where-Object { $_ -match '^volume (rm|prune)|^network (rm|prune)' }).Count) 'Volumes were not created idempotently, or one was removed.'
+    Assert (@($log | Where-Object { $_ -match '^volume create' }).Count -eq 5 -and -not @($log | Where-Object { $_ -match '^volume (rm|prune)|^network (rm|prune)' }).Count) 'Volumes were not created idempotently, or one was removed.'
     $calls = @(Get-Content -LiteralPath (Join-Path $f.GhState 'calls.log') -ErrorAction SilentlyContinue)
     Assert (-not @($calls | Where-Object { $_ -match 'runners/8/' }).Count) 'GitHub was asked about slot 01.'
     Assert ('subzerodev-linux' -in (Get-CustomLabels $f 'subzerodev.runner.linux.testhost.01')) 'Slot 01 lost its labels.'
