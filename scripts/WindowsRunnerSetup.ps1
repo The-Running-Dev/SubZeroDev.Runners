@@ -14,7 +14,10 @@ function Invoke-RunnerSetupGh {
     param([string[]] $Arguments)
     $result = & gh @Arguments
     if ($LASTEXITCODE) { throw "GitHub operation failed (exit $LASTEXITCODE). Check authentication, permissions and network access." }
-    if ($result) { ($result -join "`n") | ConvertFrom-Json }
+    if (-not $result) { throw 'GitHub read returned no JSON; no absence or completion can be inferred.' }
+    $decoded = ($result -join "`n") | ConvertFrom-Json
+    if (($result -join "`n").Trim() -eq 'null') { throw 'GitHub read returned null instead of a resource.' }
+    $decoded
 }
 
 function Get-RunnerSetupScope([string] $GitHubUrl) {
@@ -254,6 +257,9 @@ function Invoke-WindowsRunnerHostSetup {
         [bool] $NonInteractive,
         [bool] $SkipBuildAgent
     )
+    # Dropping -Repository must not bypass an interrupted stop/dispatch and let the installer reopen maintenance.
+    $journal = Get-RunnerAcceptanceState $InstallRoot
+    if ($journal.activeRun -and (-not $VerificationRepository -or $journal.repository -ine $VerificationRepository)) { throw 'Interrupted acceptance requires its original -Repository before any runner can be installed or started.' }
     foreach ($pending in @(Get-SetupPendingAction $InstallRoot)) { Write-Host "Resuming; still pending from the last run: [$($pending.kind)] $($pending.message)" }
     $scope = Get-RunnerSetupScope $GitHubUrl
     if ($VerificationRepository) {

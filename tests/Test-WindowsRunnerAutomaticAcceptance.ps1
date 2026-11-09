@@ -47,7 +47,7 @@ try {
     function Sync-RunnerAcceptanceFixture { param($Directory) $f.Calls.Add('fixture'); Join-Path $Directory 'tests\fixtures\docusaurus' }
     function Install-RunnerAcceptanceWorkflow { param($Repository, $SourceClone) $f.Calls.Add('workflow') }
     function Invoke-RunnerAcceptanceLifecycle {
-        param($InstallRoot, $Repository, $SourceClone, $Clones, $Instances, $State, $Mode)
+        param($InstallRoot, $Repository, $SourceClone, $Clones, $Instances, $State, $Mode, $WorkflowBranch)
         $f.Calls.Add($Mode)
         if ($f.Fail -eq $Mode) { throw "Failure at $Mode" }
     }
@@ -61,11 +61,13 @@ try {
     Invoke-RunnerSetupAcceptance $root example/private $instances $options
     Assert (($f.Calls -join '|') -eq 'Readiness|fixture') 'Unchanged resume repeated completed disruptive stages or skipped live readiness.'
     # A changed registration, configuration or source invalidates historical checkpoints.
-    foreach ($change in 'registration', 'config', 'source') {
+    foreach ($change in 'registration', 'config', 'source', 'scope', 'instance-map') {
         switch ($change) {
             registration { $instances[1].AgentId = 23 }
             config { '{"pins":"two"}' | Set-Content -LiteralPath (Join-Path $clones[0] 'runners.json') }
             source { $options.SourceCommit = 'b' * 40 }
+            scope { $options.GitHubUrl = 'https://github.com/example' }
+            instance-map { $instances = @($instances[1], $instances[0]) }
         }
         $f.Calls.Clear()
         Invoke-RunnerSetupAcceptance $root example/private $instances $options
@@ -80,6 +82,8 @@ try {
     $f.Fail = ''; $f.Calls.Clear()
     Invoke-RunnerSetupAcceptance $root example/private $instances $options
     Assert ($f.Calls -contains 'Timeout' -and $f.Calls -contains 'Force' -and $f.Calls -notcontains 'Drain' -and $f.Calls -notcontains 'Builds') 'Resume did not continue at the failed checkpoint.'
+
+    $instances = @($instances[1], $instances[0])
 
     # Recovery runs BEFORE installation may start anything. A failed-stop hold is never cleared automatically.
     . $setup
@@ -112,7 +116,7 @@ try {
     $f.WrongRun = $true; $f.Writes = 0
     function Invoke-RunnerSetupGh {
         param($Arguments)
-        [pscustomobject]@{ event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-lifecycle-acceptance.yml'; display_title = $(if ($f.WrongRun) { 'somebody else' } else { 'Windows runner lifecycle acceptance own' }); status = 'completed' }
+        [pscustomobject]@{ id = 81; run_attempt = 1; event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-lifecycle-acceptance.yml'; display_title = $(if ($f.WrongRun) { 'somebody else' } else { 'Windows runner lifecycle acceptance own' }); status = 'completed' }
     }
     function Send-RunnerSetupGh { param($Arguments, $Body) $f.Writes++ }
     Assert-Throws { Stop-RunnerAcceptanceRun example/private @{ id = 81; correlation = 'own' } } 'Cancellation accepted another run.'
@@ -128,11 +132,11 @@ try {
         param($Arguments)
         $url = $Arguments[1]
         if ($url -eq 'repos/example/private') { return [pscustomobject]@{ default_branch = 'main' } }
-        if ($url -like '*runs?event=*') { return [pscustomobject]@{ workflow_runs = @(@{ id = 81; display_title = "Windows runner lifecycle acceptance $($f.Correlation)" }) } }
+        if ($url -like '*runs?event=*') { return [pscustomobject]@{ workflow_runs = @(@{ id = 81; event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-lifecycle-acceptance.yml'; run_attempt = 1; head_branch = 'main'; status = 'in_progress'; display_title = "Windows runner lifecycle acceptance $($f.Correlation)" }) } }
         if ($url -like '*/jobs?*') {
-            return [pscustomobject]@{ jobs = @(@{ id = 91; name = 'Controlled lifecycle job'; status = 'in_progress'; runner_name = 'runner-one'; runner_id = $(if ($f.WrongRunner) { 99 } else { 11 }); steps = @(@{ name = 'Hold controlled acceptance job'; status = 'in_progress' }) }) }
+            return [pscustomobject]@{ jobs = @(@{ id = 91; run_id = 81; run_attempt = 1; name = 'Controlled lifecycle job'; status = 'in_progress'; runner_name = 'runner-one'; runner_id = $(if ($f.WrongRunner) { 99 } else { 11 }); steps = @(@{ name = 'Hold controlled acceptance job'; status = 'in_progress' }) }) }
         }
-        if ($url -like '*/runs/81') { return [pscustomobject]@{ status = $(if ($f.RemoteDone) { 'completed' } else { 'in_progress' }); conclusion = 'success'; event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-lifecycle-acceptance.yml'; display_title = "Windows runner lifecycle acceptance $($f.Correlation)" } }
+        if ($url -like '*/runs/81') { return [pscustomobject]@{ id = 81; run_attempt = 1; head_branch = 'main'; status = $(if ($f.RemoteDone) { 'completed' } else { 'in_progress' }); conclusion = 'success'; event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-lifecycle-acceptance.yml'; display_title = "Windows runner lifecycle acceptance $($f.Correlation)" } }
         throw "Unexpected API read: $url"
     }
     Set-Item -Path Function:Send-RunnerSetupGh -Value {
@@ -140,6 +144,7 @@ try {
         if ($Arguments -like '*/cancel') { $f.Cancel++; $f.RemoteDone = $true }
         else { $f.Correlation = $Body.inputs.correlation; $f.RemoteDone = $false }
     }
+    function Get-RunnerAcceptanceFacts { param($Clone) [pscustomobject]@{ registered = $true; agentId = 11; agentName = 'runner-one' } }
     function Get-RunnerAcceptanceStatus { param($Clone) [pscustomobject]@{ Job = 'running (worker pid 7)'; Maintenance = $null } }
     Set-Item -Path Function:Invoke-RunnerAcceptanceProcess -Value {
         param($Script, $Parameters)
@@ -160,6 +165,8 @@ try {
     $f.WrongRunner = $false; $f.StopFails = $true
     Assert-Throws { Invoke-RunnerAcceptanceLifecycle -InstallRoot $root -Repository example/private -SourceClone $clones[0] -Clones $clones -Instances $instances -State $state -Mode Force } 'Failed stop swallowed.'
     Assert ((Get-RunnerAcceptanceState $root).activeRun.stopAttempted) 'Remote cleanup discarded a failed-stop journal.'
+
+    $state.activeRun = $null; Save-RunnerAcceptanceState $root $state
 
     # Real high-level setup: rejected targets and deferred Docker actions must not trigger acceptance or claim readiness.
     . $setup
@@ -213,7 +220,7 @@ try {
     }
 } finally {
     $resolved = [IO.Path]::GetFullPath($root)
-    $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     if (-not $resolved.StartsWith($temp, [StringComparison]::OrdinalIgnoreCase)) { throw 'Refusing cleanup outside temp.' }
     Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue
 }
