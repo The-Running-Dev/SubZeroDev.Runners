@@ -39,6 +39,9 @@ jobs:
       - name: Verify resumable automatic setup and controlled lifecycle checks
         shell: pwsh
         run: ./tests/Test-WindowsRunnerAutomaticAcceptance.ps1
+      - name: Verify acceptance ownership, interrupted dispatch and stale runner safeguards
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerAcceptanceSafeguards.ps1
       - name: Verify intended repository scope before configuring runners
         shell: pwsh
         run: ./tests/Test-WindowsRunnerRepositoryScope.ps1

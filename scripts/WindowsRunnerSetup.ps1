@@ -14,7 +14,10 @@ function Invoke-RunnerSetupGh {
     param([string[]] $Arguments)
     $result = & gh @Arguments
     if ($LASTEXITCODE) { throw "GitHub operation failed (exit $LASTEXITCODE). Check authentication, permissions and network access." }
-    if ($result) { ($result -join "`n") | ConvertFrom-Json }
+    if (-not $result) { throw 'GitHub read returned no JSON; no absence or completion can be inferred.' }
+    $decoded = ($result -join "`n") | ConvertFrom-Json
+    if (($result -join "`n").Trim() -eq 'null') { throw 'GitHub read returned null instead of a resource.' }
+    $decoded
 }
 
 function Get-RunnerSetupScope([string] $GitHubUrl) {
@@ -147,8 +150,15 @@ function Get-RunnerSetupEvidence {
 function Send-RunnerSetupGh {
     param([string[]] $Arguments, [object] $Body)
     $payload = $Body | ConvertTo-Json -Depth 10 -Compress
-    $result = $payload | & gh @Arguments --input -
-    if ($LASTEXITCODE) { throw 'GitHub write failed. A smoke workflow needs repository write access and workflow permission; existing credentials may need gh auth refresh --scopes repo,workflow.' }
+    $output = @($payload | & gh @Arguments --input - 2>&1)
+    if ($LASTEXITCODE) {
+        $exception = [Exception]::new('GitHub write failed. A smoke workflow needs repository write access and workflow permission; existing credentials may need gh auth refresh --scopes repo,workflow.')
+        # An HTTP 4xx answer proves GitHub refused the request, so nothing was created and a journaled intent can be discarded.
+        # Timeouts, 5xx and transport errors are ambiguous and are not marked: the request may have been processed.
+        if (($output | Out-String) -match '\(HTTP (4\d\d)\)' -and $Matches[1] -ne '408') { $exception.Data['Rejected'] = $true }
+        throw $exception
+    }
+    $result = @($output | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] })
     if ($result) { ($result -join "`n") | ConvertFrom-Json }
 }
 
@@ -254,6 +264,9 @@ function Invoke-WindowsRunnerHostSetup {
         [bool] $NonInteractive,
         [bool] $SkipBuildAgent
     )
+    # Dropping -Repository must not bypass an interrupted stop/dispatch and let the installer reopen maintenance.
+    $journal = Get-RunnerAcceptanceState $InstallRoot
+    if ($journal.activeRun -and (-not $VerificationRepository -or $journal.repository -ine $VerificationRepository)) { throw 'Interrupted acceptance requires its original -Repository before any runner can be installed or started.' }
     foreach ($pending in @(Get-SetupPendingAction $InstallRoot)) { Write-Host "Resuming; still pending from the last run: [$($pending.kind)] $($pending.message)" }
     $scope = Get-RunnerSetupScope $GitHubUrl
     if ($VerificationRepository) {
