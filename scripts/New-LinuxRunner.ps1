@@ -93,6 +93,8 @@ if ($DockerSidecar) {
     }
     # The daemon is privileged; the runner is not. Images and build cache stay in dataVolume across jobs.
     # The work folder is shared at the same path, so bind mounts of a checkout resolve inside the daemon too.
+    # Job containers also bind /runner/externals for JavaScript actions. The daemon must see the same runner tree,
+    # including the versioned directories targeted by runner self-update symlinks. Only the runner writes this tree.
     # dind mounts a tmpfs over /tmp unless /tmp is already a mount, which would hide the work folder; this one keeps it visible.
     & $Docker run -d --name $sidecar.container --restart unless-stopped --privileged --cpus $sidecar.cpus --memory $sidecar.memory `
         --network $sidecar.network --network-alias docker `
@@ -101,6 +103,7 @@ if ($DockerSidecar) {
         --mount "type=volume,source=$($sidecar.dataVolume),target=/var/lib/docker" `
         --mount "type=volume,source=$($sidecar.certsVolume),target=/certs" `
         --mount "type=volume,source=$($sidecar.workVolume),target=$($linux.workFolder)" `
+        --mount "type=bind,source=$LinuxRunner,target=/runner,readonly" `
         $sidecar.image | Out-Null
     if ($LASTEXITCODE) { throw 'Docker sidecar start failed.' }
     # The daemon writes the client certificates on its first start; the runner needs them.

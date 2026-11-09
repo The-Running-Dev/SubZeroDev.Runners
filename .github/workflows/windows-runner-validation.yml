@@ -45,6 +45,12 @@ jobs:
       - name: Verify intended repository scope before configuring runners
         shell: pwsh
         run: ./tests/Test-WindowsRunnerRepositoryScope.ps1
+      - name: Verify Linux job-container mount creation with fake Docker
+        shell: pwsh
+        run: ./tests/Test-LinuxJobContainerMounts.ps1
+      - name: Verify Linux consumer eligibility with fake GitHub inventory
+        shell: pwsh
+        run: ./scripts/docs-smoke/Test-Eligibility.ps1
       - name: Exercise BuildAgent provisioning and resumable setup state with fixtures
         shell: pwsh
         run: ./tests/Test-BuildAgentProvisioning.ps1
@@ -54,4 +60,16 @@ jobs:
       - name: Exercise failed-stop handling, label recovery state and supervisor recovery (entry points and a real supervisor process)
         shell: pwsh
         run: ./tests/Test-LifecycleRecovery.ps1
+
+  linux-smoke-fixtures:
+    name: Linux docs smoke fixtures (hosted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Verify manual smoke evidence with synthetic artifacts and jobs
+        run: node --test scripts/docs-smoke/smoke.test.mjs
+      - name: Verify opt-in probe against an external fake Docker executable
+        shell: pwsh
+        run: ./tests/Test-LinuxJobContainerProbe.ps1
 
