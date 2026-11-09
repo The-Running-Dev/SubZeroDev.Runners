@@ -60,4 +60,7 @@ function Invoke-FixtureDocker {
     $calls = @(Get-Content (Join-Path $temp 'docker.jsonl') | ForEach-Object { [pscustomobject]@{ Arguments=@($_ | ConvertFrom-Json) } })
     Assert (@($calls | Where-Object { $_.Arguments[0] -eq 'run' -and (Get-RunName $_.Arguments) -eq $config.linux.container }).Count -eq 0) 'Runner started after sidecar failure.'
     Write-Output 'PASS: real creation entry point, shared workspace/externals paths, spaces in source, read-only sidecar, writable runner, DinD unchanged, failed-sidecar refusal (Docker mocked).'
+    # The negative fixture deliberately set this to 1. GitHub's pwsh wrapper exits
+    # with LASTEXITCODE after the script returns, so report the successful test exit.
+    $global:LASTEXITCODE = 0
 } finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
