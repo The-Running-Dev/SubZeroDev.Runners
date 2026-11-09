@@ -208,18 +208,22 @@ function Sync-RunnerAcceptanceFixture {
 function Invoke-RunnerAcceptanceLifecycle {
     param([string] $InstallRoot, [string] $Repository, [string] $SourceClone, [string[]] $Clones, [object[]] $Instances, [hashtable] $State, [string] $Mode, [string] $WorkflowBranch)
     $correlation = [guid]::NewGuid().ToString('N')
+    # Read-only lookups come first: a failure here cannot have dispatched anything, so it must not leave a journal that blocks setup.
+    if (-not $WorkflowBranch) { $WorkflowBranch = (Invoke-RunnerSetupGh @('api', "repos/$Repository")).default_branch }
     # Persist correlation BEFORE dispatch; a crash before its response is recovered by listing this exact title on resume.
-    $State.activeRun = @{ id = 0; correlation = $correlation; workflow = 'windows-runner-lifecycle-acceptance.yml'; clone = ''; stopAttempted = $false }
-    Save-RunnerAcceptanceState $InstallRoot $State
-    $metadata = Invoke-RunnerSetupGh @('api', "repos/$Repository")
-    if (-not $WorkflowBranch) { $WorkflowBranch = $metadata.default_branch }
-    $State.activeRun.branch = $WorkflowBranch
+    $State.activeRun = @{ id = 0; correlation = $correlation; workflow = 'windows-runner-lifecycle-acceptance.yml'; branch = $WorkflowBranch; clone = ''; stopAttempted = $false }
     Save-RunnerAcceptanceState $InstallRoot $State
     $hold = if ($Mode -eq 'Drain') { 60 } else { 240 }
     try {
-        Send-RunnerSetupGh @('api', '-X', 'POST', "repos/$Repository/actions/workflows/windows-runner-lifecycle-acceptance.yml/dispatches") @{
-            ref = $WorkflowBranch; inputs = @{ correlation = $correlation; runner_label = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())"; hold_seconds = "$hold" }
-        } | Out-Null
+        try {
+            Send-RunnerSetupGh @('api', '-X', 'POST', "repos/$Repository/actions/workflows/windows-runner-lifecycle-acceptance.yml/dispatches") @{
+                ref = $WorkflowBranch; inputs = @{ correlation = $correlation; runner_label = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())"; hold_seconds = "$hold" }
+            } | Out-Null
+        } catch {
+            # A refused dispatch (HTTP 4xx) created no run, so keeping its journal would block every later setup with nothing to recover.
+            if ($_.Exception.Data['Rejected']) { $State.activeRun = $null; Save-RunnerAcceptanceState $InstallRoot $State }
+            throw
+        }
         $deadline = [DateTime]::UtcNow.AddMinutes(5)
         $job = @()
         do {
@@ -268,7 +272,7 @@ function Invoke-RunnerAcceptanceLifecycle {
     } finally {
         # Only clear the journal once cancellation/completion is confirmed. A failed stop keeps stopAttempted so that a later
         # setup cannot call the installer (which starts supervisors) before checking its maintenance hold.
-        if ($State.activeRun.id) {
+        if ($State.activeRun -and $State.activeRun.id) {
             Stop-RunnerAcceptanceRun $Repository $State.activeRun | Out-Null
             if (-not $State.activeRun.stopAttempted) { $State.activeRun = $null; Save-RunnerAcceptanceState $InstallRoot $State }
         }

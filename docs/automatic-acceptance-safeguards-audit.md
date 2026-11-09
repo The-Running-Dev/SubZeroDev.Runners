@@ -32,7 +32,7 @@ The cancellation checks protect against response inconsistency; they are not a c
 | Lifecycle dispatch and selection | Each Drain/Timeout/Force dispatch records a unique correlation before POST. Routing uses the host pair label; the actual clone is selected by runner name and numeric agent ID. Only an active controlled hold is eligible. The selected clone must belong to the requested installation. |
 | Maintenance and stop | `Stop-WindowsRunner` records maintenance before withdrawing custom labels. Drain waits for idle. Timeout must prove labels restored and maintenance cleared. Force can stop active processes. An unverified/failed stop retains maintenance; the host acceptance script withholds Start unless stop exited successfully and the runner is observed stopped/idle. These production lifecycle routines are unchanged by this patch. |
 | Cancellation | Cleanup addresses only the persisted run ID, revalidates the allowed workflow/correlation/branch/original attempt, and confirms completion. It does not enumerate and cancel arbitrary busy jobs. An unconfirmed cancellation retains the journal. |
-| Interrupted-run recovery | Wrong repository/outside-installation clone is refused. Missing ID is resolved through the persisted correlation. Unresolved identity now blocks, including an intent saved before a POST whose result was lost. `stopAttempted` requires readable maintenance facts and refuses a retained hold. A crash before a POST is indistinguishable from a lost response; this intentionally requires reconciliation if no run ever appears. |
+| Interrupted-run recovery | Wrong repository/outside-installation clone is refused. Missing ID is resolved through the persisted correlation. Unresolved identity now blocks, including an intent saved before a POST whose result was lost. `stopAttempted` requires readable maintenance facts and refuses a retained hold. A crash before a POST is indistinguishable from a lost response; this intentionally requires reconciliation if no run ever appears. Failures that provably created no run do not leave an intent: the default-branch read happens before the journal is written, and a dispatch GitHub refused with HTTP 4xx (other than 408) clears its own intent, so neither wedges later invocations. Timeouts, 5xx and transport errors stay ambiguous and keep the intent. |
 | Checkpoints | Successful stages are saved separately; a later failure does not mark that stage complete or erase earlier completed stages. Source/selection/configuration changes invalidate historical stage results. Checkpoints describe previous successful checks, not continuous health. |
 
 ## Remaining risks
@@ -52,7 +52,7 @@ Local runtime: PowerShell 7.5.4 on Linux. All GitHub and runner mutations in the
 
 | Check | Result |
 | --- | --- |
-| `Test-WindowsRunnerAcceptanceSafeguards.ps1` | PASS: 42 assertions. |
+| `Test-WindowsRunnerAcceptanceSafeguards.ps1` | PASS: 48 assertions. |
 | Same new suite against unmodified merged scripts, selecting Recovery, Cancellation, Disruption and Options separately | All four scenarios FAIL at the intended regression assertion. |
 | `Test-WindowsRunnerAutomaticAcceptance.ps1` | PASS, including child argument/exit handling, three lifecycle modes, maintenance holds, failure/resume, live readiness and expanded checkpoint invalidation. Its printed synthetic child exception is expected and asserted. |
 | `Test-WindowsRunnerBuildAgentDispatch.ps1` | PASS, including new lost-response/discovery/identity cases and existing installation/input/evidence checks. |

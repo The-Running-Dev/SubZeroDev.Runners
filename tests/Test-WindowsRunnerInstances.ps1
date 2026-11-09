@@ -25,7 +25,8 @@ foreach ($file in $files) {
         }
     }
     $functions = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)
-    if ($functions | Group-Object Name | Where-Object Count -gt 1) { throw "Duplicated functions in $($file.Name)." }
+    # Tests redefine their mocks inside separate scenario scopes by design; only shipped scripts must not duplicate functions.
+    if ($file.FullName -notlike "$PSScriptRoot*" -and ($functions | Group-Object Name | Where-Object Count -gt 1)) { throw "Duplicated functions in $($file.Name)." }
 }
 Write-Output 'PASS: complete PowerShell files parse; installer parameter order and ID validation retained.'
 $installer = Get-Content -Raw (Join-Path $repo 'scripts\Install-WindowsRunner.ps1')

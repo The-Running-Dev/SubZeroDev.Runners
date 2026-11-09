@@ -57,13 +57,19 @@ $pins = (Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 
 $journal.activeRun = @{ id = 0; correlation = $setupId; workflow = $workflowFile; branch = $branch; clone = ''; stopAttempted = $false }
 Save-RunnerAcceptanceState $StateDirectory $journal
 try {
-    Invoke-Gh @('api', '-X', 'POST', "repos/$Repository/actions/workflows/$workflowFile/dispatches") @{
-        ref = $branch
-        inputs = @{
-            computer_name = $ComputerName; runner_label = $RunnerLabel; runner_names = (ConvertTo-Json -InputObject @($ExpectedRunnerNames) -Compress); setup_id = $setupId
-            expected_tool_version = $pins.tool.version; expected_image_digest = ($pins.image -replace '^.*@', '')
-        }
-    } | Out-Null
+    try {
+        Send-RunnerSetupGh @('api', '-X', 'POST', "repos/$Repository/actions/workflows/$workflowFile/dispatches") @{
+            ref = $branch
+            inputs = @{
+                computer_name = $ComputerName; runner_label = $RunnerLabel; runner_names = (ConvertTo-Json -InputObject @($ExpectedRunnerNames) -Compress); setup_id = $setupId
+                expected_tool_version = $pins.tool.version; expected_image_digest = ($pins.image -replace '^.*@', '')
+            }
+        } | Out-Null
+    } catch {
+        # A refused dispatch (HTTP 4xx) created no run; only ambiguous failures keep the journal for recovery.
+        if ($_.Exception.Data['Rejected']) { $journal.activeRun = $null; Save-RunnerAcceptanceState $StateDirectory $journal }
+        throw
+    }
     Write-Output "Dispatched $workflowFile in $Repository for $ComputerName ($RunnerLabel), correlation $setupId."
 
     $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)

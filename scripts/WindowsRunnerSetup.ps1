@@ -150,8 +150,15 @@ function Get-RunnerSetupEvidence {
 function Send-RunnerSetupGh {
     param([string[]] $Arguments, [object] $Body)
     $payload = $Body | ConvertTo-Json -Depth 10 -Compress
-    $result = $payload | & gh @Arguments --input -
-    if ($LASTEXITCODE) { throw 'GitHub write failed. A smoke workflow needs repository write access and workflow permission; existing credentials may need gh auth refresh --scopes repo,workflow.' }
+    $output = @($payload | & gh @Arguments --input - 2>&1)
+    if ($LASTEXITCODE) {
+        $exception = [Exception]::new('GitHub write failed. A smoke workflow needs repository write access and workflow permission; existing credentials may need gh auth refresh --scopes repo,workflow.')
+        # An HTTP 4xx answer proves GitHub refused the request, so nothing was created and a journaled intent can be discarded.
+        # Timeouts, 5xx and transport errors are ambiguous and are not marked: the request may have been processed.
+        if (($output | Out-String) -match '\(HTTP (4\d\d)\)' -and $Matches[1] -ne '408') { $exception.Data['Rejected'] = $true }
+        throw $exception
+    }
+    $result = @($output | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] })
     if ($result) { ($result -join "`n") | ConvertFrom-Json }
 }
 

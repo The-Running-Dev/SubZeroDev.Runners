@@ -123,12 +123,12 @@ try {
         . $SetupPath
         $clones = @('win01', 'win02' | ForEach-Object { Join-Path $root $_ })
         $instances = @(@{ Instance = 'win01'; Name = 'runner-one'; AgentId = 11 }, @{ Instance = 'win02'; Name = 'runner-two'; AgentId = 22 })
-        $f = @{ Latest = 0; Change = ''; Correlation = ''; Done = $false; Processes = 0; Cancels = 0 }
+        $f = @{ Latest = 0; Change = ''; Correlation = ''; Done = $false; Processes = 0; Cancels = 0; ReadFails = $false; DispatchFails = ''; Dispatches = 0 }
         function Start-Sleep { param($Seconds) }
         function Invoke-RunnerSetupGh {
             param($Arguments)
             $url = $Arguments[1]
-            if ($url -eq 'repos/example/private') { return @{ default_branch = 'main' } }
+            if ($url -eq 'repos/example/private') { if ($f.ReadFails) { throw 'metadata unavailable' }; return @{ default_branch = 'main' } }
             $remote = @{ id = 81; event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-lifecycle-acceptance.yml'; display_title = "Windows runner lifecycle acceptance $($f.Correlation)"; status = $(if ($f.Done) { 'completed' } else { 'in_progress' }); run_attempt = 1; head_branch = 'main' }
             if ($url -like '*runs?event=*') { return @{ workflow_runs = @($remote) } }
             if ($url -like '*/runs/81') { return $remote }
@@ -152,7 +152,10 @@ try {
         function Send-RunnerSetupGh {
             param($Arguments, $Body)
             if ($Arguments -like '*/cancel') { $f.Done = $true; $f.Cancels++ }
-            else { $f.Correlation = $Body.inputs.correlation }
+            else {
+                $f.Dispatches++; $f.Correlation = $Body.inputs.correlation
+                if ($f.DispatchFails) { $e = [Exception]::new('dispatch failed'); if ($f.DispatchFails -eq 'rejected') { $e.Data['Rejected'] = $true }; throw $e }
+            }
         }
         function Get-RunnerAcceptanceFacts { param($Clone) @{ registered = $true; agentName = 'runner-one'; agentId = $(if ($f.Change -eq 'local') { 99 } else { 11 }) } }
         function Get-RunnerAcceptanceStatus { param($Clone) @{ Job = 'running (worker pid 7)'; Maintenance = $null } }
@@ -163,6 +166,18 @@ try {
             Reject { Invoke-RunnerAcceptanceLifecycle -InstallRoot $root -Repository example/private -SourceClone $clones[0] -Clones $clones -Instances $instances -State $state -Mode Force } "Disruption refuses stale $change observation"
             Assert ($f.Processes -eq 0 -and -not (Get-RunnerAcceptanceState $root).activeRun) "Stale $change observation stops no runner and cleans only its own run"
         }
+        # Dispatch failures: a read that fails before any dispatch, a refused dispatch and an ambiguous one.
+        $lifecycle = { $s = @{ version = 1; repository = 'example/private'; profile = ''; completed = @{}; activeRun = $null }; Invoke-RunnerAcceptanceLifecycle -InstallRoot $root -Repository example/private -SourceClone $clones[0] -Clones $clones -Instances $instances -State $s -Mode Force }
+        $f.Change = ''; $f.Processes = 0; $f.Dispatches = 0
+        $f.ReadFails = $true
+        Reject $lifecycle 'Failed default-branch read fails the lifecycle'
+        Assert ($f.Dispatches -eq 0 -and -not (Get-RunnerAcceptanceState $root).activeRun) 'Failed pre-dispatch read leaves no journal'
+        $f.ReadFails = $false; $f.DispatchFails = 'rejected'
+        Reject $lifecycle 'Refused dispatch fails the lifecycle'
+        Assert ($f.Dispatches -eq 1 -and -not (Get-RunnerAcceptanceState $root).activeRun) 'Refused dispatch clears its journal'
+        $f.DispatchFails = 'ambiguous'
+        Reject $lifecycle 'Ambiguous dispatch fails the lifecycle'
+        Assert ((Get-RunnerAcceptanceState $root).activeRun.correlation) 'Ambiguous dispatch keeps its intent for recovery'
     }
     }
     if ($Scenario -in 'All', 'Options') {

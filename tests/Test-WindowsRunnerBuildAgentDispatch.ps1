@@ -10,7 +10,7 @@ $checker = Join-Path $work 'checker.ps1'
 'param($Repository, $RunId, $ComputerName, $ExpectedRunnerNames, $ReportDirectory) Add-Content -LiteralPath $PSScriptRoot\checker.log "$Repository $RunId $ComputerName $($ExpectedRunnerNames -join ",")"' | Set-Content -LiteralPath $checker
 $fake = @{}
 function Reset-State([hashtable] $Overrides = @{}) {
-    $script:fake = @{ Private = $true; Workflow = $null; Conclusion = 'success'; Put = $null; Dispatch = $null; DispatchError = $false; ListError = $false; RefreshWrongId = $false; RunStatus = 'completed'; Cancels = 0; Calls = [Collections.Generic.List[string]]::new() }
+    $script:fake = @{ Private = $true; Workflow = $null; Conclusion = 'success'; Put = $null; Dispatch = $null; DispatchError = $false; DispatchRejected = $false; ListError = $false; RefreshWrongId = $false; RunStatus = 'completed'; Cancels = 0; Calls = [Collections.Generic.List[string]]::new() }
     foreach ($key in $Overrides.Keys) { $script:fake[$key] = $Overrides[$key] }
     Remove-Item -LiteralPath $checkerLog -ErrorAction SilentlyContinue
 }
@@ -32,7 +32,7 @@ function gh {
             return (@{ type = 'file'; encoding = 'base64'; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($fake.Workflow)) } | ConvertTo-Json)
         }
         '^api repos/.+/actions/workflows/[^/ ]+( --silent)?$' { return '{}' }
-        '-X POST repos/.+/dispatches' { $fake.Dispatch = ($body | ConvertFrom-Json); if ($fake.DispatchError) { $global:LASTEXITCODE = 1 }; return }
+        '-X POST repos/.+/dispatches' { $fake.Dispatch = ($body | ConvertFrom-Json); if ($fake.DispatchError) { $global:LASTEXITCODE = 1 }; if ($fake.DispatchRejected) { $global:LASTEXITCODE = 1; return "gh: Workflow does not have 'workflow_dispatch' trigger (HTTP 422)" }; return }
         '/runs\?event=workflow_dispatch' {
             if ($fake.ListError) { $global:LASTEXITCODE = 1; return }
             return (@{ workflow_runs = @(@{ id = 555; event = 'workflow_dispatch'; path = '.github/workflows/windows-runner-buildagent.yml'; run_attempt = 1; head_branch = 'main'; display_title = "Windows runner BuildAgent acceptance $($fake.Dispatch.inputs.setup_id)"; status = $fake.RunStatus; conclusion = $fake.Conclusion; html_url = 'https://example/run/555' }) } | ConvertTo-Json -Depth 5)
@@ -95,6 +95,14 @@ $oldCorrelation = $fake.Dispatch.inputs.setup_id
 $fake.DispatchError = $false
 & $script @common | Out-Null
 if ($fake.Dispatch.inputs.setup_id -ceq $oldCorrelation -or (Get-Content -Raw -LiteralPath $journalPath | ConvertFrom-Json).activeRun) { throw 'Retry failed to recover the old dispatch before starting a new one.' }
+
+# A dispatch GitHub refused (HTTP 4xx) created nothing: its journal must not block every later invocation.
+Remove-Item -LiteralPath $journalPath -ErrorAction SilentlyContinue
+Reset-State @{ Workflow = $template; DispatchRejected = $true }
+Assert-Throws { & $script @common } 'failed' 'refused dispatch'
+if ((Get-Content -Raw -LiteralPath $journalPath | ConvertFrom-Json).activeRun) { throw 'A refused dispatch left a journal that blocks later runs.' }
+$fake.DispatchRejected = $false
+& $script @common | Out-Null
 
 # An interrupted discovery also leaves its intent; a mutated refreshed run cannot redirect cancellation to another ID.
 Reset-State @{ Workflow = $template; ListError = $true }
