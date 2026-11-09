@@ -1,0 +1,77 @@
+# Copy this template to .github/workflows/self-hosted-docs-smoke.yml in the verified consumer.
+# Also copy scripts/docs-smoke and tests/fixtures/self-hosted-docs from this same revision.
+name: Self-hosted docs smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_runner_name:
+        description: Exact runner name from Get-SmokeEligibility.ps1
+        type: string
+        required: true
+      expected_runner_id:
+        description: Numeric GitHub runner ID from Get-SmokeEligibility.ps1
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: self-hosted-docs-smoke
+  cancel-in-progress: false
+
+jobs:
+  docs:
+    name: Docs smoke
+    # Required by the reusable workflow's contract, including its skipped Deploy job.
+    permissions: {contents: read, pages: write, id-token: write}
+    uses: The-Running-Dev/GitHub-ActionTemplates/.github/workflows/docs.yml@1c3b5f76554aca455cd4a284c4e473edd21c0d72 # v2.0.0
+    with:
+      runs-on: subzerodev-linux
+      image: ghcr.io/the-running-dev/build-agent@sha256:cc13d62b66fab58e264eb583de5c47eb5f49a3ee8a2cdd48f0de0b1d0ba16556
+      source: tests/fixtures/self-hosted-docs
+      builder: template
+      title: SubZeroDev self-hosted docs smoke
+      output: artifacts/self-hosted-docs-smoke
+      pre-build: scripts/docs-smoke/Before-Build.ps1
+      post-build: scripts/docs-smoke/After-Build.ps1
+      deploy: false
+      upload-builds: true
+      artifact-name: self-hosted-docs-site
+      retention-days: 1
+
+  verify:
+    name: Verify smoke evidence
+    needs: docs
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {contents: read, actions: read}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the actual Pages archive
+        id: site
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: self-hosted-docs-site
+          path: artifacts/docs-smoke-download
+      - name: Check archive and record the build job result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RUNNER_NAME: ${{ inputs.expected_runner_name }}
+          EXPECTED_RUNNER_ID: ${{ inputs.expected_runner_id }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          DOWNLOAD_RESULT: ${{ steps.site.outcome }}
+        run: node scripts/docs-smoke/smoke.mjs verify
+      - name: Keep execution evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: self-hosted-docs-result
+          path: artifacts/docs-smoke-result/
+          if-no-files-found: error
+          retention-days: 1

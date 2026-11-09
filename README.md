@@ -288,6 +288,13 @@ time. Sharing them across repositories needs an organization; see Later.
 
 ## Docker in Linux jobs
 
+Job-container workflows such as ActionTemplates `docs.yml` need the runner installation
+visible to the Docker daemon as well as the workspace. Sidecar mode shares `/runner`
+read-only with that daemon so `/runner/externals` and self-update targets resolve.
+Existing containers need recreation to acquire this mount. See the
+[Linux documentation smoke runbook](docs/linux-docs-smoke.md) for the opt-in nested
+container probe, eligible-consumer check and manual reusable-workflow acceptance.
+
 `linux.docker.mode` picks where the Linux jobs' Docker daemon runs. Switch it in `runners.local.json`
 (`{ "linux": { "docker": { "mode": "dind" } } }`), then run `New-LinuxRunner.ps1`.
 
