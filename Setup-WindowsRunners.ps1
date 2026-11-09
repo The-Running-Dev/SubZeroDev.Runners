@@ -10,6 +10,8 @@ GitHub authorization is reused or opened once in a browser. No token is accepted
 [CmdletBinding()]
 param(
     [ValidateRange(1, 16)] [int] $Count = 2,
+    # Opt in to end-to-end setup and verification in this existing private repository. Defaults registration to this repo.
+    [string] $Repository,
     [string] $InstallRoot = "$env:LOCALAPPDATA\SubZeroDev\Runners",
     [string] $GitHubUrl = 'https://github.com/AbsoluteZeroDev',
     [string[]] $ExtraLabels = @(),
@@ -150,8 +152,10 @@ function Sync-SetupCheckout {
 }
 
 function Start-WindowsRunnerSetup {
-    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string[]] $TargetRepositories, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive, [bool] $SkipBuildAgent)
+    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string[]] $TargetRepositories, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive, [bool] $SkipBuildAgent, [string] $Repository)
     $ErrorActionPreference = 'Stop'
+    if ($Repository -and ($Count -lt 2 -or $SkipBuildAgent)) { throw '-Repository verification requires at least two runners and BuildAgent enabled.' }
+    if ($Repository -and $Repository -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*/[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw '-Repository must be owner/repository.' }
     $PSNativeCommandUseErrorActionPreference = $false
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Use 64-bit PowerShell on x64 Windows 10/11 or a compatible Windows VM.' }
     $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -172,7 +176,7 @@ function Start-WindowsRunnerSetup {
     # This file contains options only. Credentials stay in gh's store or the inherited environment.
     $optionsPath = Join-Path ([IO.Path]::GetTempPath()) ("windows-runner-setup-" + [guid]::NewGuid().ToString('N') + '.json')
     try {
-        @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); TargetRepositories = @($TargetRepositories); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive; SkipBuildAgent = $SkipBuildAgent } |
+        @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); TargetRepositories = @($TargetRepositories); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive; SkipBuildAgent = $SkipBuildAgent; VerificationRepository = $Repository } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $optionsPath -Encoding UTF8
         # The worker's exit 2 is not a failure: the runners are set up and the person has to act (it printed what).
         Invoke-SetupNative -File $tools.pwsh -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-OptionsPath', $optionsPath) -AllowExitCode 0, 2
@@ -182,4 +186,6 @@ function Start-WindowsRunnerSetup {
     }
 }
 
-exit ([int](Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -TargetRepositories $TargetRepositories -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive) -SkipBuildAgent ([bool]$SkipBuildAgent) | Select-Object -Last 1))
+if ($Repository -and -not $PSBoundParameters.ContainsKey('GitHubUrl')) { $GitHubUrl = "https://github.com/$Repository" }
+exit ([int](Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -TargetRepositories $TargetRepositories -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive) -SkipBuildAgent ([bool]$SkipBuildAgent) -Repository $Repository | Select-Object -Last 1))
+

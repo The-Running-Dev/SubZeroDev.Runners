@@ -1,6 +1,7 @@
 #Requires -Version 7.2
 # Testable host orchestration. Dot-sourcing this file does not install or register anything.
 . "$PSScriptRoot\SetupState.ps1"
+. "$PSScriptRoot\WindowsRunnerAcceptance.ps1"
 
 function Invoke-RunnerSetupGit {
     param([string[]] $Arguments, [switch] $Capture)
@@ -249,16 +250,29 @@ function Invoke-WindowsRunnerHostSetup {
         [string[]] $TargetRepositories = @(),
         [ValidatePattern('^[0-9a-f]{40}$')] [string] $SourceCommit,
         [string] $SmokeRepository,
+        [string] $VerificationRepository,
         [bool] $NonInteractive,
         [bool] $SkipBuildAgent
     )
     foreach ($pending in @(Get-SetupPendingAction $InstallRoot)) { Write-Host "Resuming; still pending from the last run: [$($pending.kind)] $($pending.message)" }
     $scope = Get-RunnerSetupScope $GitHubUrl
+    if ($VerificationRepository) {
+        if ($Count -lt 2 -or $SkipBuildAgent) { throw 'Automated verification needs at least two runners and BuildAgent enabled.' }
+        if ($VerificationRepository -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*/[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw 'Repository must be owner/repository.' }
+        if (($scope.StartsWith('orgs/') -and $VerificationRepository.Split('/')[0] -ine $scope.Substring(5)) -or ($scope.StartsWith('repos/') -and $VerificationRepository -ine $scope.Substring(6))) { throw 'The verification repository must be in the runner registration scope.' }
+    }
     if ($SmokeRepository -and $Count -lt 2) { throw 'A concurrent-job smoke test requires at least two runners.' }
     if ($SmokeRepository -and $SmokeRepository -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*/[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw 'SmokeRepository must be owner/repository.' }
     if ($SmokeRepository -and (($scope.StartsWith('orgs/') -and $SmokeRepository.Split('/')[0] -ine $scope.Split('/')[1]) -or ($scope.StartsWith('repos/') -and $SmokeRepository -ine $scope.Substring(6)))) { throw 'The smoke repository must be within the runner organization, or match its repository-scoped target.' }
-    Confirm-RunnerSetupAuthentication -Scope $scope -NonInteractive $NonInteractive -WithSmoke ([bool]$SmokeRepository)
-    $validatedRepositories = @(Confirm-RunnerSetupRepositories -Scope $scope -Repositories $TargetRepositories)
+    Confirm-RunnerSetupAuthentication -Scope $scope -NonInteractive $NonInteractive -WithSmoke ([bool]($SmokeRepository -or $VerificationRepository))
+    $targets = @($TargetRepositories)
+    if ($VerificationRepository) { $targets += $VerificationRepository }
+    $validatedRepositories = @(Confirm-RunnerSetupRepositories -Scope $scope -Repositories $targets)
+    if ($VerificationRepository) {
+        $verificationTarget = Invoke-RunnerSetupGh -Arguments @('api', "repos/$VerificationRepository")
+        if (-not $verificationTarget.private) { throw 'Automated acceptance requires an existing private repository; its visibility will not be changed.' }
+        Resume-RunnerSetupAcceptance -InstallRoot $InstallRoot -Repository $VerificationRepository -Count $Count
+    }
     if ($validatedRepositories.Count) {
         Write-Host "Repository scope compatibility and Actions-enabled state verified: $($validatedRepositories -join ', ')."
         Write-Host 'These checks do not verify runner-group access, workflow runs-on routing or successful job execution.'
@@ -287,13 +301,27 @@ function Invoke-WindowsRunnerHostSetup {
     }
     if ($SmokeRepository) {
         Invoke-RunnerSetupSmoke -Repository $SmokeRepository -Label $pairLabel -SourceClone (Join-Path $InstallRoot 'win01') -ExpectedRunnerNames @($instances[0..1].Name)
-    } else {
+    } elseif (-not $VerificationRepository) {
         Write-Host 'Actual concurrent-job execution has not been tested. Add -SmokeRepository OWNER/REPO to run and verify it automatically.'
     }
-    switch ($buildAgentExit) {
+    $exitCode = $buildAgentExit
+    $verification = if ($VerificationRepository) { 'blocked' } else { 'not-requested' }
+    if ($VerificationRepository -and $buildAgentExit -eq 0) {
+        $setupOptions = @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = $ExtraLabels; TargetRepositories = $targets; SourceCommit = $SourceCommit; NonInteractive = $NonInteractive; SkipBuildAgent = $false }
+        try {
+            Invoke-RunnerSetupAcceptance -InstallRoot $InstallRoot -Repository $VerificationRepository -Instances $instances -SetupOptions $setupOptions
+            $verification = 'passed'
+        } catch {
+            $verification = 'failed'; $exitCode = 1
+            Write-Warning "Automatic acceptance failed: $($_.Exception.Message) Rerun the same setup command after fixing the cause; verified checkpoints are saved."
+        }
+    }
+    switch ($exitCode) {
         0 { Write-Host "Setup complete: $Count runner(s). The supervisors are running now. Nothing starts them at sign-in or restarts them if they die: run Manage-WindowsRunner.ps1 -Action Start in each clone." }
         2 { Write-Host "Runners are set up ($Count), but BuildAgent needs your action first (listed above). Rerun the same command afterwards; finished steps are skipped." -ForegroundColor Yellow }
-        default { Write-Warning "Runners are set up ($Count), but the BuildAgent integration failed (exit $buildAgentExit); see the messages above. The runners are not affected." }
+        default { Write-Warning "Setup is not verified (exit $exitCode; acceptance $verification). See the failure above; existing registrations are retained." }
     }
-    [pscustomobject]@{ Runners = $Count; BuildAgentExitCode = $buildAgentExit; ActionRequired = ($buildAgentExit -eq 2); Instances = $instances; ScopeValidatedRepositories = $validatedRepositories }
+    if ($VerificationRepository) { Write-Host "Automated acceptance: $verification. State: $(Join-Path $InstallRoot 'acceptance-state.json')" }
+    [pscustomobject]@{ Runners = $Count; BuildAgentExitCode = $buildAgentExit; ExitCode = $exitCode; Verification = $verification; ActionRequired = ($exitCode -eq 2); Instances = $instances; ScopeValidatedRepositories = $validatedRepositories }
 }
+

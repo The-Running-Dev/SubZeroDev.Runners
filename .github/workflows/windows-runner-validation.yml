@@ -36,6 +36,9 @@ jobs:
       - name: Exercise automated host setup with isolated fixtures
         shell: pwsh
         run: ./tests/Test-WindowsRunnerHostSetup.ps1
+      - name: Verify resumable automatic setup and controlled lifecycle checks
+        shell: pwsh
+        run: ./tests/Test-WindowsRunnerAutomaticAcceptance.ps1
       - name: Verify intended repository scope before configuring runners
         shell: pwsh
         run: ./tests/Test-WindowsRunnerRepositoryScope.ps1
@@ -48,3 +51,4 @@ jobs:
       - name: Exercise failed-stop handling, label recovery state and supervisor recovery (entry points and a real supervisor process)
         shell: pwsh
         run: ./tests/Test-LifecycleRecovery.ps1
+

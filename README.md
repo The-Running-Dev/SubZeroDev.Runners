@@ -34,6 +34,12 @@ Neither needs inbound ports.
 
 ## One-command Windows setup
 
+Add `-Repository OWNER/PRIVATE-REPO -Count 2` to provision and automatically verify BuildAgent and runner lifecycle behavior.
+Registration defaults to that repository; an explicit organization `-GitHubUrl` can share an organization pool. The command
+downloads the pinned fixture, installs acceptance workflows, runs builds and controlled lifecycle checks, and saves resumable
+checkpoints. See [the setup guide](docs/windows-two-runners.md#automatic-setup-recommended). Reporting and telemetry remain
+separate work.
+
 On a new x64 Windows machine or VM, open a **normal Windows PowerShell window** and paste:
 
 ```powershell
@@ -49,7 +55,7 @@ package-installer elevation prompts and the first GitHub sign-in; the runners re
 After the runners are verified it provisions the [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent)
 integration once for the host: Docker Desktop (installed with WinGet if missing, switched to Linux containers, waited
 until the daemon answers), the net8.0 runtime, the pinned `BuildAgent.Tool` and the pinned image. `-SkipBuildAgent`
-leaves it out. Exit codes: **0** done; **1** the BuildAgent part failed (the runners are still set up and running);
+leaves it out. Exit codes: **0** done (and, with `-Repository`, verification passed); **1** the BuildAgent part or the requested verification failed (the runners are still set up and running);
 **2** you have to act first (restart Windows, sign out and in, finish Docker Desktop's first run, join `docker-users`).
 The steps are printed and saved in `<InstallRoot>\setup-state.json`; do them and run the same command again, finished
 steps are skipped. Setup never restarts Windows, signs you out or enables automatic sign-in.
@@ -336,3 +342,4 @@ Jobs run code from the repositories that use these runners, with that repository
   Fits `windows\_work`, `windows\_nuget` and other caches; Microsoft advises keeping SDKs
   (here `windows\_tool\dotnet`) on the system drive. No gain for the Linux container, whose
   checkouts are already on a volume in Docker's VM. Works inside a VM too.
+

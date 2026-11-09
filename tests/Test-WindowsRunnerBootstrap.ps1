@@ -29,6 +29,23 @@ try {
 } finally { Remove-Item -LiteralPath $handoffFixture -Recurse -Force -ErrorAction SilentlyContinue }
 Write-Output 'PASS: actual Windows PowerShell 5.1 native exit handling and PowerShell 7 handoff with spaced paths (no installation or registration).'
 
+# -Repository is refused before any prerequisite, Docker or registration work when verification cannot run.
+$realPrerequisites = ${function:Install-SetupPrerequisites}
+$prerequisitesReached = $false
+function Install-SetupPrerequisites { $script:prerequisitesReached = $true; throw 'prerequisites reached' }
+foreach ($case in @(
+    @{ Count = 1; Skip = $false; Repository = 'owner/repo' },
+    @{ Count = 2; Skip = $true; Repository = 'owner/repo' },
+    @{ Count = 2; Skip = $false; Repository = 'not a repository' },
+    @{ Count = 2; Skip = $false; Repository = 'owner/repo/extra' }
+)) {
+    $refused = $false
+    try { Start-WindowsRunnerSetup -Count $case.Count -InstallRoot 'C:\NeverCreated' -GitHubUrl 'https://github.com/owner/repo' -SkipBuildAgent $case.Skip -Repository $case.Repository } catch { $refused = $_.Exception.Message -ne 'prerequisites reached' }
+    Assert $refused "Verification repository was accepted for Count $($case.Count), SkipBuildAgent $($case.Skip), '$($case.Repository)'."
+}
+Assert (-not $prerequisitesReached -and -not (Test-Path -LiteralPath 'C:\NeverCreated')) 'A refused verification request started setup work or created the install root.'
+Set-Item -Path Function:Install-SetupPrerequisites -Value $realPrerequisites
+
 $state = @{ Tools = @{}; Installs = [Collections.Generic.List[string]]::new(); Repairs = 0; Fail = $false }
 function Update-SetupPath { }
 function Find-SetupTool([string] $Name) { $state.Tools[$Name] }
