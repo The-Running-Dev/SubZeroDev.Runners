@@ -132,10 +132,15 @@ function Confirm-SmokeDownload([string] $Repository, $Expected, [string] $Direct
     $archive = Join-Path $Directory 'archive/artifact.tar'
     if ((Get-Item -LiteralPath $archive).Length -le 0) { throw 'Site archive is empty.' }
     $site = Join-Path $Directory 'site'; New-Item -ItemType Directory -Path $site | Out-Null
-    $entries = & tar -tf $archive
-    if ($LASTEXITCODE -ne 0 -or @($entries | Where-Object { $_ -match '(^/|^[A-Za-z]:|(^|[\\/])\.\.([\\/]|$))' }).Count) { throw 'Site archive listing is invalid.' }
-    & tar -xf $archive -C $site
-    if ($LASTEXITCODE -ne 0) { throw 'Site archive extraction failed.' }
+    # GNU tar on Windows interprets a C: archive path as a remote host. Relative
+    # archive/extraction paths work with both Git's GNU tar and Windows bsdtar.
+    Push-Location $Directory
+    try {
+        $entries = & tar -tf 'archive/artifact.tar'
+        if ($LASTEXITCODE -ne 0 -or @($entries | Where-Object { $_ -match '(^/|^[A-Za-z]:|(^|[\\/])\.\.([\\/]|$))' }).Count) { throw 'Site archive listing is invalid.' }
+        & tar -xf 'archive/artifact.tar' -C 'site'
+        if ($LASTEXITCODE -ne 0) { throw 'Site archive extraction failed.' }
+    } finally { Pop-Location }
     $index = Get-Content -Raw (Join-Path $site 'index.html')
     $second = @(Get-ChildItem $site -Recurse -File -Filter '*.html' | Where-Object { (Get-Content -Raw $_.FullName).Contains('SubZeroDev second-page smoke marker.') })
     if (-not $index.Contains('SubZeroDev Linux runner documentation smoke fixture.') -or -not $second.Count -or -not (Test-Path (Join-Path $site 'assets') -PathType Container)) { throw 'Downloaded site is missing rendered fixture pages/assets.' }

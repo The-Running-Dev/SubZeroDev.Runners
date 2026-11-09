@@ -13,6 +13,12 @@ Assert ($files.Count -eq 6) 'Consumer runtime manifest is not minimal.'
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('linux-controller-test-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temp|Out-Null
 $fixture=@{}
+$tarApplication=(Get-Command tar -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+function tar {
+    # Prove archive operands stay portable even on a Linux test machine.
+    Assert (-not [IO.Path]::IsPathRooted($args[1]) -and $args[1] -notmatch '^[A-Za-z]:') 'tar archive operand must be relative for Windows GNU tar.'
+    & $tarApplication @args
+}
 function Reset-Fixture {
     $fixture.Clear()
     $fixture.BaseFiles=@();$fixture.Branch=$false;$fixture.PR=$null;$fixture.Writes=@();$fixture.Run=$null
@@ -146,8 +152,11 @@ try {
         $(if($fixture.BadSite){'wrong site'}else{'<html>SubZeroDev Linux runner documentation smoke fixture.</html>'})|Set-Content (Join-Path $source 'index.html')
         '<html>SubZeroDev second-page smoke marker.</html>'|Set-Content (Join-Path $source 'second.html')
         $e|ConvertTo-Json -Depth 8|Set-Content (Join-Path $source 'smoke-evidence.json')
-        & tar -cf (Join-Path $Directory 'artifact.tar') -C $source .
-        if($LASTEXITCODE -ne 0){throw 'Fixture tar creation failed.'}
+        Push-Location $Directory
+        try {
+            & tar -cf 'artifact.tar' -C 'source' .
+            if($LASTEXITCODE -ne 0){throw 'Fixture tar creation failed.'}
+        } finally { Pop-Location }
     }
     &$realConfirm 'fixture/consumer' $expected (Join-Path $temp 'evidence-good') $image|Out-Null
     $fixture.BadSite=$true
