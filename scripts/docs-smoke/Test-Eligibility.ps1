@@ -15,10 +15,11 @@ try {
     @{gitHubUrl='https://github.com/fixture/consumer'; agentId=7; agentName='fixture-linux'} | ConvertTo-Json | Set-Content $registration
     $global:smokeFixtureStatus = 'online'
     $global:smokeFixtureId = 7
+    $global:smokeFixtureLabel = 'subzerodev-linux'
     function gh {
         $global:LASTEXITCODE = 0
         if ($args -contains 'repos/fixture/consumer/actions/runners?per_page=100' -or $args -contains 'orgs/fixture/actions/runners?per_page=100' -or $args -contains 'orgs/fixture/actions/runner-groups/77/runners?per_page=100') {
-            @(@{runners=@(@{id=$global:smokeFixtureId;name='fixture-linux';os='linux';status=$global:smokeFixtureStatus;busy=$false;labels=@(@{name='self-hosted'},@{name='Linux'},@{name='X64'},@{name='subzerodev-linux'})})}) | ConvertTo-Json -Depth 8 -AsArray
+            @(@{runners=@(@{id=$global:smokeFixtureId;name='fixture-linux';os='linux';status=$global:smokeFixtureStatus;busy=$false;labels=@(@{name='self-hosted'},@{name='Linux'},@{name='X64'},@{name=$global:smokeFixtureLabel})})}) | ConvertTo-Json -Depth 8 -AsArray
         } elseif ($args -contains 'repos/fixture/consumer') {
             @(@{id=99;full_name='fixture/consumer';private=$true;owner=@{type='Organization'};archived=$global:smokeFixtureArchived;disabled=$false}) | ConvertTo-Json -Depth 8 -AsArray
         } elseif ($args -contains 'repos/fixture/consumer/actions/permissions') {
@@ -42,7 +43,11 @@ try {
     $global:smokeFixtureId = 7; $global:smokeFixtureStatus = 'offline'; $rejected = $false
     try { & $checker -RunnerRegistration $registration | Out-Null } catch { $rejected = $true }
     if (-not $rejected) { throw 'Offline runner was reported available.' }
-    Write-Output 'Four synthetic eligibility cases pass: eligible, cross-repo refusal, ID mismatch refusal, offline refusal.'
+    $global:smokeFixtureStatus = 'online'; $global:smokeFixtureLabel = 'ubuntu-latest'; $rejected = $false
+    try { & $checker -RunnerRegistration $registration | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Runner without the subzerodev-linux label was accepted.' }
+    $global:smokeFixtureLabel = 'subzerodev-linux'
+    Write-Output 'Five synthetic eligibility cases pass: eligible, cross-repo refusal, ID mismatch refusal, offline refusal, missing-label refusal.'
     @{gitHubUrl='https://github.com/fixture'; agentId=7; agentName='fixture-linux'} | ConvertTo-Json | Set-Content $registration
     $global:smokeFixtureStatus = 'online'; $global:smokeFixtureRestricted=$false; $global:smokeFixtureRepoId=99
     $result = & $checker -RunnerRegistration $registration -Repository fixture/consumer | ConvertFrom-Json
