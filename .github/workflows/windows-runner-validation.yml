@@ -51,6 +51,9 @@ jobs:
       - name: Verify Linux consumer eligibility with fake GitHub inventory
         shell: pwsh
         run: ./scripts/docs-smoke/Test-Eligibility.ps1
+      - name: Verify Linux consumer PR and resumable dispatch controller with fake GitHub
+        shell: pwsh
+        run: ./tests/Test-LinuxDocsSmokeController.ps1
       - name: Exercise BuildAgent provisioning and resumable setup state with fixtures
         shell: pwsh
         run: ./tests/Test-BuildAgentProvisioning.ps1
@@ -72,4 +75,7 @@ jobs:
       - name: Verify opt-in probe against an external fake Docker executable
         shell: pwsh
         run: ./tests/Test-LinuxJobContainerProbe.ps1
+      - name: Verify consumer preparation, dispatch recovery and downloaded-site checks
+        shell: pwsh
+        run: ./tests/Test-LinuxDocsSmokeController.ps1
 

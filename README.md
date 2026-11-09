@@ -294,6 +294,9 @@ read-only with that daemon so `/runner/externals` and self-update targets resolv
 Existing containers need recreation to acquire this mount. See the
 [Linux documentation smoke runbook](docs/linux-docs-smoke.md) for the opt-in nested
 container probe, eligible-consumer check and manual reusable-workflow acceptance.
+On the registered host, `scripts/docs-smoke/Invoke-Smoke.ps1 -Action Prepare`
+opens the verified consumer's workflow PR; after its merge, `-Action Run` probes,
+dispatches, waits and downloads/verifies the site and exact runner evidence.
 
 `linux.docker.mode` picks where the Linux jobs' Docker daemon runs. Switch it in `runners.local.json`
 (`{ "linux": { "docker": { "mode": "dind" } } }`), then run `New-LinuxRunner.ps1`.
