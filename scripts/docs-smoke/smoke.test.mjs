@@ -64,7 +64,8 @@ for (const scenario of ['success', 'missing-artifact', 'failed-build', 'unexpect
       if (scenario !== 'missing-artifact') {
         const site = path.join(dir, 'source'); fixtureSite(site);
         const download = path.join(dir, 'artifacts/docs-smoke-download'); fs.mkdirSync(download, {recursive: true});
-        execFileSync('tar', ['-cf', path.join(download, 'artifact.tar'), '-C', site, '.']);
+        // Relative paths: GNU tar (Git for Windows) reads `C:` in an absolute path as a remote host.
+        execFileSync('tar', ['-cf', 'artifact.tar', '-C', path.relative(download, site).split(path.sep).join('/'), '.'], {cwd: download});
       }
       const child = spawn(process.execPath, [fileURLToPath(new URL('./smoke.mjs', import.meta.url)), 'verify'], {cwd: dir, env: {...process.env, GITHUB_STEP_SUMMARY: path.join(dir, 'summary.md'), GITHUB_REPOSITORY: 'fixture/consumer', GITHUB_SHA: 'fixture-sha', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', GITHUB_API_URL: `http://127.0.0.1:${server.address().port}`, GH_TOKEN: 'synthetic', EXPECTED_RUNNER_NAME: 'fixture-linux', EXPECTED_RUNNER_ID: scenario === 'unexpected-runner' ? '999' : '456', DOCS_RESULT: scenario === 'failed-build' ? 'failure' : 'success', DOWNLOAD_RESULT: scenario === 'missing-artifact' ? 'failure' : 'success'}, stdio: 'ignore'});
       const code = await new Promise((resolve, reject) => { child.on('exit', resolve); child.on('error', reject); });
