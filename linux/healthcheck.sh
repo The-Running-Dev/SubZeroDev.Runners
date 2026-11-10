@@ -11,6 +11,12 @@ fail() { echo "unhealthy: $*"; exit 1; }
 [ -f /runner/.runner ] || fail "the runner is not registered (/runner/.runner is missing); run Register-Runners.ps1"
 [ -f /runner/.credentials ] || fail "the runner has no credentials (/runner/.credentials is missing); run Register-Runners.ps1"
 
+# Held by the owner: the entrypoint waits and no listener is expected, so the container is healthy (BuildAgent's updater waits for it).
+if [ -e /runner/maintenance.json ]; then
+    echo "healthy: held in maintenance; no listener until the owner resumes"
+    exit 0
+fi
+
 # The listener, found without procps: the first word of an argv that ends in Runner.Listener.
 listener=0
 for cmdline in /proc/[0-9]*/cmdline; do

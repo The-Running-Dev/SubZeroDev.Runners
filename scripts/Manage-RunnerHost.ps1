@@ -577,7 +577,9 @@ function Invoke-Resume {
         if ((Get-MaintenanceState $file).phase -eq 'unreadable') { Exit-RunnerMaintenance $file $dir | Out-Null }
         # Containers first (a held entrypoint waits), the record last: exactly one listener starts, when the record goes.
         foreach ($container in @(@($record.containers | Where-Object { $_.role -ne 'runner' }) + @($record.containers | Where-Object { $_.role -eq 'runner' }))) {
-            if ((Get-ContainerState $container.name).State -eq 'stopped') {
+            $state = (Get-ContainerState $container.name).State
+            if ($state -in 'absent', 'unknown') { $script:HostFailed = $true; [Console]::Error.WriteLine("Resume stopped for ${Slot}: container $($container.name) is $state, so no listener would start. The record is kept; start Docker or run Apply, then Resume again."); return }
+            if ($state -eq 'stopped') {
                 $start = Invoke-Docker @('start', $container.name)
                 if ($start.ExitCode -ne 0) { $script:HostFailed = $true; [Console]::Error.WriteLine("Resume stopped for ${Slot}: docker start $($container.name) exited $($start.ExitCode): $($start.Output) The record is kept."); return }
             }
@@ -598,7 +600,7 @@ function Set-StartupEntry {
     if ($Config.windows.startAtSignIn -eq $true) {
         $worker = Join-Path $PSScriptRoot 'Manage-RunnerHost.ps1'
         New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
-        Write-FileAtomic $path "@echo off`r`nstart `"`" /min pwsh.exe -NoProfile -ExecutionPolicy Bypass -File `"$worker`" -Action AutoStart`r`n"
+        Write-FileAtomic $path "@echo off`r`nstart `"`" /min `"$Pwsh`" -NoProfile -ExecutionPolicy Bypass -File `"$worker`" -Action AutoStart`r`n"
         "windows.startAtSignIn is on: wrote $path."
     }
     elseif (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force; "windows.startAtSignIn is off: removed $path." }

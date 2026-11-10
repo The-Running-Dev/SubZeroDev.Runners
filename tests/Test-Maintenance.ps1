@@ -364,6 +364,21 @@ Test-Case 'An unreadable record is held: Resume refuses with the existing messag
     Assert (-not (Get-Log $fixture | Where-Object { $_ -match '^start ' })) 'A container was started under an unreadable record.'
 }
 
+Test-Case 'Resume refuses when a container is absent or Docker does not answer, keeping the record' {
+    $fixture = New-Fixture
+    Invoke-Manager $fixture @('-Action', 'Hold', '-Slot', 'linux-02') | Out-Null
+    $docker = Get-Docker $fixture; $docker.unavailable = $true; Set-Docker $fixture $docker
+    $run = Invoke-Manager $fixture @('-Action', 'Resume', '-Slot', 'linux-02')
+    Assert ($run.ExitCode -eq 1 -and $run.Output -match 'no listener would start. The record is kept') "Resume with Docker down: exit $($run.ExitCode).`n$($run.Output)"
+    Assert (Test-Path -LiteralPath (Get-Record $fixture)) 'The record was deleted although nothing started.'
+}
+
+Test-Case 'A held container is healthy: the healthcheck does not require a listener while the record exists' {
+    $text = [IO.File]::ReadAllText((Join-Path $repo 'linux\healthcheck.sh'))
+    $held = $text.IndexOf('/runner/maintenance.json')
+    Assert ($held -ge 0 -and $held -lt $text.IndexOf('Runner.Listener is not running') -and $held -gt $text.IndexOf('.credentials')) 'The held check is missing or out of order in healthcheck.sh.'
+}
+
 Test-Case 'Hold and Resume of a Windows slot go through its own Manage-WindowsRunner (Maintenance, then Start)' {
     $fixture = New-Fixture
     $hold = Invoke-Manager $fixture @('-Action', 'Hold', '-Slot', 'win01')
@@ -412,7 +427,7 @@ Test-Case 'windows.startAtSignIn writes a per-user Startup entry that runs host 
     $run = Use-Fixture $fixture { $env:SZR_STARTUP_DIRECTORY = $startup; $o = & $pwshPath -NoLogo -NoProfile -File (Join-Path $fixture.Clone 'scripts\Manage-RunnerHost.ps1') -Action Startup 2>&1 | ForEach-Object { "$_" }; [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($o -join "`n") } }
     Assert ($run.ExitCode -eq 0 -and (Test-Path -LiteralPath $entry)) "Startup exited $($run.ExitCode) and wrote no entry.`n$($run.Output)"
     $text = [IO.File]::ReadAllText($entry)
-    Assert ($text -match 'Manage-RunnerHost\.ps1" -Action AutoStart' -and $text -match 'pwsh\.exe -NoProfile') "The entry is: $text"
+    Assert ($text -match 'Manage-RunnerHost\.ps1" -Action AutoStart' -and $text -match '"[^"]*pwsh[^"]*" -NoProfile') "The entry is: $text"
     Assert ($text -notmatch 'schtasks|Register-ScheduledTask|sc\.exe') 'The entry uses a task or a service.'
     $settings = Get-Content -Raw -LiteralPath (Join-Path $fixture.Clone 'runners.local.json') | ConvertFrom-Json
     $settings.windows.startAtSignIn = $false
