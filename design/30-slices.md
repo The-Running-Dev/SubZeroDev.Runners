@@ -15,7 +15,7 @@ Acceptance: `scripts/HostState.ps1` and `scripts/Manage-RunnerHost.ps1` Init, Ad
 Out of scope: Apply, Hold, Resume.
 
 ## S3 — Automatic start keeps maintenance
-Status: todo
+Status: done
 Depends on: S2
 Acceptance: the entrypoint waits while held; `Manage-WindowsRunner -Action AutoStart`; host AutoStart; Hold and Resume with the C4 refusal; the `windows.startAtSignIn` Startup entry; the handoff's Maintenance acceptance tests pass.
 Out of scope: compose.

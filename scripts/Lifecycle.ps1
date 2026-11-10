@@ -379,9 +379,12 @@ function Wait-SupervisorInitialized {
 # initialization are verified the same way. Nothing starts it at sign-in and nothing restarts it if it dies: this is the only
 # way it starts. A supervisor found dead without a clean stop is recorded by the next supervisor (Get-SupervisorRecovery), so
 # starting it by hand keeps that history. A supervisor waiting for an orphaned listener says so; it starts no second listener.
+#
+# -KeepMaintenance (automatic start) leaves a maintenance record where it is: the supervisor then idles with no listener. Only an
+# explicit Start, or the host Resume, ends maintenance.
 function Start-WindowsRunner {
-    param([int] $TimeoutSeconds = $SupervisorStartTimeoutSeconds)
-    Exit-RunnerMaintenance $MaintenanceFile $WindowsRunner | Out-Null
+    param([int] $TimeoutSeconds = $SupervisorStartTimeoutSeconds, [switch] $KeepMaintenance)
+    if (-not $KeepMaintenance) { Exit-RunnerMaintenance $MaintenanceFile $WindowsRunner | Out-Null }
     $running = Get-SupervisorProcess
     if ($running) { $ready = Wait-SupervisorInitialized ([pscustomobject]@{ Id = $running.ProcessId }) ([datetime]::MinValue) $TimeoutSeconds }
     else {
