@@ -53,7 +53,7 @@ if ('Build' -in $Stage -and -not (Test-Path -LiteralPath $FixtureDirectory)) { t
 if ('Rerun' -in $Stage -and -not $SetupCommand) { throw '-SetupCommand is required for the Rerun stage.' }
 
 if ('Readiness' -in $Stage) {
-    $pinSets = foreach ($clone in $Clones) { $pins = Get-Pins $clone; "$($pins.tool.version)|$($pins.image)" }
+    $pinSets = foreach ($clone in $Clones) { $pins = Get-Pins $clone; "$($pins.tool.version)|$($pins.updater.version)|$($pins.image)" }
     Add-Check 'Readiness' 'all' 'clones carry the same pins' (@($pinSets | Select-Object -Unique).Count -eq 1) ($pinSets -join ' / ')
     foreach ($clone in $Clones) {
         $pins = Get-Pins $clone
@@ -68,9 +68,12 @@ if ('Readiness' -in $Stage) {
         $image = $rows | Where-Object Item -eq 'image' | Select-Object -First 1
         Add-Check 'Readiness' $clone 'tool version is the pin' ([bool]($tool -and "$($tool.Detail)" -like "*$($pins.tool.version)*")) "pin $($pins.tool.version)"
         Add-Check 'Readiness' $clone 'image digest is the pin' ([bool]($image -and "$($image.Detail)" -like "*$($pins.image -replace '^.*@', '')*")) "pin $($pins.image)"
-        # Not a failure: the updater is gated on a published BuildAgent.Tool containing Docker-BuildAgent PR #136.
+        # Version readiness only: this does not establish Linux mount isolation or Docker Desktop update acceptance.
         $updater = $rows | Where-Object Item -eq 'updater' | Select-Object -First 1
-        Add-Check 'Readiness' $clone 'updater stays gated (updater.version null)' ($null -eq $pins.updater.version) "updater row: $($updater.State) $($updater.Detail)"
+        $updaterReady = if ($pins.updater.version) {
+            $pins.updater.version -eq $pins.tool.version -and $updater -and $updater.State -eq 'ok'
+        } else { $updater -and $updater.State -eq 'missing' }
+        Add-Check 'Readiness' $clone 'updater configuration matches status' ([bool]$updaterReady) "pin $($pins.updater.version); updater row: $($updater.State) $($updater.Detail)"
     }
 }
 

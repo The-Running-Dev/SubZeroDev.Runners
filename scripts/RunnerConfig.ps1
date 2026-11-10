@@ -24,7 +24,7 @@ function Assert-RunnerConfig($Config) {
     Require ([bool]$Config.windows.workFolder) 'windows.workFolder is required.'
     $agent = $Config.buildAgent
     if ($agent) {
-        Require ($agent.tool.version -match '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') 'buildAgent.tool.version must be an exact version such as 2.1.0, never a range or latest.'
+        Require ($agent.tool.version -match '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') 'buildAgent.tool.version must be an exact version such as 2.2.0, never a range or latest.'
         Require ([bool]$agent.tool.package) 'buildAgent.tool.package is required.'
         Require ([bool]$agent.tool.directory) 'buildAgent.tool.directory is required.'
         Require ($agent.dotnetRuntime.channel -match '^\d+\.\d+$') 'buildAgent.dotnetRuntime.channel must be a channel such as 8.0.'

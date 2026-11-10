@@ -31,10 +31,10 @@ function New-Build([int] $Slot, [string] $Start, [string] $End) {
         cacheDirectory = "C:\Users\svc\AppData\Local\SubZeroDev\BuildAgent\workspaces\$instance\.cache"
         outputDirectory = "C:\Users\svc\AppData\Local\SubZeroDev\BuildAgent\workspaces\$instance\artifacts"
         buildType = 'node-template'; buildArguments = '-AppDir docs'; startUtc = $Start; endUtc = $End
-        toolVersion = '2.1.0'; imageDigest = $digest; dockerState = 'ok'
+        toolVersion = '2.2.0'; imageDigest = $digest; dockerState = 'ok'
         statusRows = @(
-            @{ Item = 'tool'; State = 'ok'; Detail = 'BuildAgent.Tool 2.1.0 in C:\tool.' }, @{ Item = 'docker'; State = 'ok'; Detail = 'Linux' },
-            @{ Item = 'image'; State = 'ok'; Detail = $digest }, @{ Item = 'updater'; State = 'missing'; Detail = 'blocked' })
+            @{ Item = 'tool'; State = 'ok'; Detail = 'BuildAgent.Tool 2.2.0 in C:\tool.' }, @{ Item = 'docker'; State = 'ok'; Detail = 'Linux' },
+            @{ Item = 'image'; State = 'ok'; Detail = $digest }, @{ Item = 'updater'; State = 'ok'; Detail = '2.2.0 version gate passed' })
         exitCode = 0; marker = "acceptance-marker-r1-a1-slot$Slot"; markerFound = $true; foreignMarkers = @()
         artifacts = @(New-ArtifactEntry ((New-Site $Slot)['index.html']))
     }

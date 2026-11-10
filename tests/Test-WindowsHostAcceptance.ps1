@@ -84,7 +84,7 @@ function New-FakeClone([string] $Root, [string] $Name) {
     Set-Content -LiteralPath (Join-Path $clone 'windows\.runner') -Value "runner $Name"
     Set-Content -LiteralPath (Join-Path $clone 'windows\.credentials') -Value "credentials $Name"
     Set-Content -LiteralPath (Join-Path $clone 'runners.local.json') -Value '{ "local": true }'
-    Save-Json @{ buildAgent = @{ tool = @{ version = '2.1.0' }; image = "ghcr.io/example/build-agent@$digest"; updater = @{ version = $null } } } (Join-Path $clone 'runners.json')
+    Save-Json @{ buildAgent = @{ tool = @{ version = '2.2.0' }; image = "ghcr.io/example/build-agent@$digest"; updater = @{ version = '2.2.0' } } } (Join-Path $clone 'runners.json')
     Save-Json @{
         instance = $Name; clone = $clone; windowsRunner = (Join-Path $clone 'windows'); registered = $true; agentId = 11; agentName = "runner.$Name"; credentials = $true
         localConfig = (Join-Path $clone 'runners.local.json')
@@ -95,9 +95,9 @@ function New-FakeClone([string] $Root, [string] $Name) {
         buildAgent = @{ workspace = (Join-Path $clone 'ws') }
     } (Join-Path $clone 'facts.json')
     Save-Json @(
-        @{ Item = 'tool'; State = 'ok'; Detail = 'BuildAgent.Tool 2.1.0 in C:\tool.' }, @{ Item = 'runtime'; State = 'ok'; Detail = '.NET 8' },
+        @{ Item = 'tool'; State = 'ok'; Detail = 'BuildAgent.Tool 2.2.0 in C:\tool.' }, @{ Item = 'runtime'; State = 'ok'; Detail = '.NET 8' },
         @{ Item = 'mapping'; State = 'ok'; Detail = 'mapped' }, @{ Item = 'docker'; State = 'ok'; Detail = 'Linux' },
-        @{ Item = 'image'; State = 'ok'; Detail = $digest }, @{ Item = 'updater'; State = 'missing'; Detail = 'blocked' }) (Join-Path $clone 'status.json')
+        @{ Item = 'image'; State = 'ok'; Detail = $digest }, @{ Item = 'updater'; State = 'ok'; Detail = '2.2.0 version gate passed' }) (Join-Path $clone 'status.json')
     Save-Json @{ buildStatusExit = 0; statusExit = 0; buildExit = 0; failExit = 1; writeSite = $true; startExit = 0
         stop = @{ exit = 0; output = 'Drained: no job was running; stopped.'; patch = @{ Supervisor = 'stopped'; Job = 'idle' }; factsPatch = @{}; statusUnreadable = $false; factsUnreadable = $false } } (Join-Path $clone 'behavior.json')
     Save-Json @{ Instance = $Name; Supervisor = 'running (pid 5)'; Job = 'running (worker pid 6)'; Maintenance = $null; Healthy = $true } (Join-Path $clone 'state.json')
@@ -132,6 +132,14 @@ Assert-Passes 'healthy host' $run
 if ($run.Report -notmatch 'NOT RUN \(no evidence collected\): Rerun, Drain, Timeout, Force') { throw "Unselected stages are not reported as NOT RUN:`n$($run.Report)" }
 foreach ($clone in $run.Clones) { if (-not ((Get-Content -Raw "$clone\calls.log") -match 'build node-template -AppDir docs')) { throw 'The build type and project arguments were not passed to Invoke-BuildAgent.ps1.' } }
 
+# Optional disabling remains supported for build-only readiness; it is not updater acceptance.
+$disabled = Invoke-Host 'Readiness' -Prepare {
+    param($c)
+    Update-Json "$($c[0])\runners.json" { param($r) $r.buildAgent.updater.version = $null }
+    Update-Json "$($c[0])\status.json" { param($rows) $rows[5].State = 'missing' }
+}
+Assert-Passes 'explicitly disabled updater' $disabled
+
 # --- Readiness / Build / Adoption defects -----------------------------------------------------------------------
 $defects = [ordered]@{
     'docker row missing'      = @{ Stage = 'Readiness'; Check = 'status: docker'; Prepare = { param($c) Update-Json "$($c[0])\status.json" { param($rows) $rows[3].State = 'missing' } } }
@@ -139,7 +147,8 @@ $defects = [ordered]@{
     'tool version differs'    = @{ Stage = 'Readiness'; Check = 'tool version is the pin'; Prepare = { param($c) Update-Json "$($c[0])\status.json" { param($rows) $rows[0].Detail = 'BuildAgent.Tool 2.0.9 in C:\tool.' } } }
     'image digest differs'    = @{ Stage = 'Readiness'; Check = 'image digest is the pin'; Prepare = { param($c) Update-Json "$($c[0])\status.json" { param($rows) $rows[4].Detail = 'sha256:' + ('0' * 64) } } }
     'pins differ per clone'   = @{ Stage = 'Readiness'; Check = 'clones carry the same pins'; Count = 2; Prepare = { param($c) Update-Json "$($c[1])\runners.json" { param($r) $r.buildAgent.tool.version = '2.0.0' } } }
-    'updater version set'     = @{ Stage = 'Readiness'; Check = 'updater stays gated (updater.version null)'; Prepare = { param($c) Update-Json "$($c[0])\runners.json" { param($r) $r.buildAgent.updater.version = '2.2.0' } } }
+    'updater version mismatch' = @{ Stage = 'Readiness'; Check = 'updater configuration matches status'; Prepare = { param($c) Update-Json "$($c[0])\runners.json" { param($r) $r.buildAgent.updater.version = '2.3.0' } } }
+    'updater status missing' = @{ Stage = 'Readiness'; Check = 'updater configuration matches status'; Prepare = { param($c) Update-Json "$($c[0])\status.json" { param($rows) $rows[5].State = 'missing' } } }
     'build exits non-zero'    = @{ Stage = 'Build'; Check = 'project build exits 0 (node-template)'; Prepare = { param($c) Update-Json "$($c[0])\behavior.json" { param($b) $b.buildExit = 1 } } }
     'site not produced'       = @{ Stage = 'Build'; Check = "expected artifact docs\build\index.html exists in this instance's workspace"; Prepare = { param($c) Update-Json "$($c[0])\behavior.json" { param($b) $b.writeSite = $false } } }
     'failing build exits 0'   = @{ Stage = 'Build'; Check = 'a failing build propagates failure'; Prepare = { param($c) Update-Json "$($c[0])\behavior.json" { param($b) $b.failExit = 0 } } }

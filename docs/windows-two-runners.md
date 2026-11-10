@@ -231,7 +231,7 @@ integration (`scripts\Install-BuildAgent.ps1`, once per host, shared by every in
    with `docker info`, not assumed.
 3. The net8.0 runtime (`buildAgent.dotnetRuntime`) that `BuildAgent.Tool` runs on, installed beside the tool. The instances'
    private SDK 10 is not used for this and no second host toolchain is installed.
-4. The pinned `BuildAgent.Tool` (`buildAgent.tool.version`, 2.1.0) in `buildAgent.tool.directory`, shared by all instances.
+4. The pinned `BuildAgent.Tool` (`buildAgent.tool.version`, 2.2.0) in `buildAgent.tool.directory`, shared by all instances.
 5. The pinned image, pulled by digest (`buildAgent.image`), or a different digest set as `buildAgent.image` in
    `runners.local.json`; a tag or `:latest` is rejected by validation. Every build receives it as `BUILD_AGENT_IMAGE`.
 
@@ -348,11 +348,13 @@ retained), or maintenance or admission that cannot be read, fails the stage, and
 Not automated: provisioning a clean VM (run `Setup-WindowsRunners.ps1` there, then the stages above) and reboot or sign-out
 resume (restart the VM mid-setup, sign in, rerun the same setup command; the pending-action state must resume it).
 
-**3. Updater, separately.** Normal builds use published tooling (`BuildAgent.Tool` 2.1.0). `buildAgent.updater.version` stays
-`null` and `New-LinuxRunner.ps1 -Update` keeps its explicit refusal until a published `BuildAgent.Tool` contains
-Docker-BuildAgent PR #136; this repository does not duplicate the updater. After it is published, pin that exact version, then
-validate on Docker Desktop: a healthy update, restoration when the replacement fails its health check, and recovery of an
-interrupted update.
+**3. Updater, separately.** [BuildAgent.Tool v2.2.0](https://github.com/The-Running-Dev/Docker-BuildAgent/releases/tag/v2.2.0)
+contains Docker-BuildAgent #136. Tool and updater pins are both `2.2.0`; the installed tool must match exactly.
+The image digest stays unchanged. Sidecar `-Update` also requires #17's live isolated runtime layout, which must first
+be applied by a separately approved recreation. No installation, recreation or update happens merely by changing source.
+See [the integration/acceptance runbook](build-agent-2.2.0-updater.md) before host changes. Docker Desktop acceptance still
+requires a healthy update, restoration after a failed replacement and interrupted-update recovery; existing Windows
+BuildAgent job checks do not establish these behaviors.
 
 `Test-WindowsRunnerBuildAgentEvidence.ps1`, `Test-WindowsRunnerBuildAgentDispatch.ps1` and `Test-WindowsHostAcceptance.ps1`
 test the checkers with synthetic evidence, a fake `gh` and fake clones (they accept a good run and reject injected defects).
@@ -430,7 +432,7 @@ withdrawing the labels fails, no stop is attempted. A workflow that targets only
 | Config change reaches the registration | Registration plan cases (name, target, work folder, labels) | **Not collected** against GitHub |
 | Active-job drain, timeout and force | Mocked GitHub and processes in `Test-RunnerIntegration.ps1`; fake clones in `Test-WindowsHostAcceptance.ps1` (failed or unverified stops never reach `Start`; a real timeout is told apart from a failed stop) | **Not collected** with a live job (`Invoke-WindowsHostAcceptance.ps1 -Stage Drain,Timeout,Force -AllowDisruptive`) |
 | Adoption of the existing installation, legacy-startup cleanup, unchanged setup rerun | `Test-WindowsHostAcceptance.ps1` (fake clones) | **Not collected** (`-Stage Adoption`, `-Stage Rerun`) |
-| Linux updater success, unhealthy restore, refusal | Command construction and exit-code mapping only | **Blocked**: needs a published `BuildAgent.Tool` containing Docker-BuildAgent PR #136; `updater.version` stays `null` and the refusal stays until then |
+| Linux updater success, restore, refusal and interruption recovery | `Test-LinuxRunnerUpdate.ps1`: real entry point/maintenance with synthetic Docker and GitHub; version and isolation gates, duration units, exit outcomes, label failures, timeout/crash and cross-process recovery | **Not collected**: v2.2.0 is published/pinned; approved tool installation, #17 activation and Docker Desktop acceptance remain required |
 | Cleanup, retries, Docker-unavailable diagnostics | Locked-file, protected-path, retention and free-disk cases | **Not collected** under real Docker Desktop failure |
 
 Mocked and fixture results show the logic; they are not evidence that a host, a Docker daemon or a GitHub job behaved that way.
