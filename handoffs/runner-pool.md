@@ -1,104 +1,226 @@
 # Handoff: per-host runner pool (N Linux slots, N Windows slots)
 
 For this repository, SubZeroDev.Runners. The design is [docs/runner-pool-plan.md](../docs/runner-pool-plan.md);
-read it first. Follow this repository's own conventions: settings through `RunnerConfig.ps1`, drains through
-`Lifecycle.ps1`, registrations through `Register-Runners.ps1`/`Registration.ps1`, a `tests/Test-*.ps1` with a fake
-Docker/GitHub for every script that changes, and a line in `windows-runner-validation.yml` for each new test.
+read it first. Its "Decided" section is binding, and its "Open owner decisions" (D1–D4) are not yours to settle: build
+the mechanism, leave the answer to a setting or switch. Follow this repository's conventions:
+
+- settings through `RunnerConfig.ps1`;
+- drains through `Lifecycle.ps1`;
+- registrations through `Registration.ps1`;
+- for every script that changes, a `tests/Test-*.ps1` with a fake Docker and GitHub, and a line in
+  `windows-runner-validation.yml`.
 
 ## Goal
 
-Each host runs `linux.count` BuildAgent-based Linux runners and `windows.count` native Windows runners, both set in
-that host's `runners.local.json` (default 2 each). Raising a count adds slots; lowering it drains the highest-numbered
-slots and deregisters them. After a reboot with auto sign-in, every slot comes back without anyone touching it.
-BuildAgent is not changed.
+Each host runs `linux.count` BuildAgent-based Linux slots and `windows.count` native Windows slots, owned through a
+host inventory and changed only by journaled operations under one host lock. An automatic start (Docker restart,
+sign-in, Apply) never ends maintenance. Existing hosts keep exactly what they have until a count is set. BuildAgent
+is not changed.
 
 ## Who uses the runners today (must keep working)
 
-- **The Linux runner** `subzerodev.runner.linux` (container `subzerodev-runner-linux`, registration in `linux/runner`),
-  used by `tests/linux-runner-docs-smoke.yml` through ActionTemplates `docs.yml` with `runs-on: subzerodev-linux`.
-- **The Windows instances** `win01`, `win02` from `Setup-WindowsRunners.ps1`, and `Install-WindowsRunner.ps1` on
-  machines with no Docker.
-- **[AbsoluteZeroDev/SubZeroDev.HollowMoon#4](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/pull/4)**:
-  `runs-on: [self-hosted, subzerodev, Windows]`, calls `"$env:SZR_SCRIPTS\Invoke-BuildAgent.ps1" -Type node
-  -CopyOutputTo "$env:RUNNER_TEMP\buildagent"`. `SZR_SCRIPTS`, `Invoke-BuildAgent.ps1`'s parameters and the labels
-  `subzerodev`, `subzerodev-linux`, `subzerodev-windows` do not change.
-- **SubZeroDev.Dashboard telemetry v1**, which reads `Manage-WindowsRunner.ps1 -Action Status -Json` and
-  `Get-BuildAgentStatus.ps1 -Json`. Their output shapes do not change.
+- **The Linux runner** `subzerodev.runner.linux` (container `subzerodev-runner-linux`, registration in
+  `linux/runner`). It becomes slot 01 under the legacy mapping, with the same name and registration.
+- **The Windows instances** from `Setup-WindowsRunners.ps1` (`win<nn>`), and the single-clone layout from
+  `Install-WindowsRunner.ps1`, which beast still runs (`subzerodev.runner.windows`, offline).
+- **Every org workflow.** They target `[self-hosted, subzerodev, Linux|Windows]` or `subzerodev-windows`, and none
+  changes. That includes [AbsoluteZeroDev/SubZeroDev.HollowMoon#4](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/pull/4),
+  which calls `"$env:SZR_SCRIPTS\Invoke-BuildAgent.ps1" -Type node -CopyOutputTo …`.
+- **SubZeroDev.Dashboard telemetry v1.** It reads `Manage-WindowsRunner.ps1 -Action Status -Json` and
+  `Get-BuildAgentStatus.ps1 -Json`; both stay byte for byte.
+- **`Manage-WindowsRunner.ps1 -Action Start`**, which keeps ending maintenance (explicit resume).
 
 ## What to build (one PR per slice, in order)
 
-1. **Settings.** Add `hostId` (default: lower-cased computer name), `linux.count` and `windows.count` (default 2,
-   range 0–16) and `windows.startAtSignIn` (default false) to `runners.json` and `Assert-RunnerConfig`. Add name
-   templates resolved per slot: Linux runner `subzerodev.runner.linux.<hostId>.<nn>`, container
-   `subzerodev-runner-linux-<nn>`, directory `linux/runner-<nn>`, every volume name suffixed `-<nn>`. One helper,
-   `Get-LinuxSlots $Config`, returns the resolved slots; every script uses it instead of reading `linux.container`,
-   `linux.directory` or the volume names directly. With `linux.count` 1 and no `hostId` nothing is renamed yet.
-2. **Linux slots in compose.** `New-LinuxRunner.ps1` writes `linux/compose.local.yaml` (add it to `.gitignore` and
-   `dropbox-ignore.txt`) with one service per slot (and one sidecar per slot in sidecar mode), `restart: always`,
-   the same mounts, environment, limits and privileged/dind settings that its `docker run` lines use today, and runs
-   `docker compose -p subzerodev-runners up -d`. `-Slot <nn>` limits a replace to one slot; the drain, label
-   withdrawal and restore stay per slot through `Enter-RunnerMaintenance`/`Exit-RunnerMaintenance`, and the replace is
-   `docker compose up -d --no-deps --force-recreate <service>`. `Stop-Runners.ps1`, `Start-Runners.ps1`,
-   `Test-LinuxRunnerBusy` and housekeeping loop over the slots. `-Update` keeps using `build-agent update`, one slot
-   at a time.
-3. **Migrate the single runner.** When `linux/runner/.runner` exists and `linux/runner-01` does not: drain it, stop the
-   old container, move the registration to `linux/runner-01`, keep its volumes as slot 01's (rename by copying into
-   the `-01` volumes, or map slot 01 to the old names — say which), then `Register-Runners.ps1` re-registers it under
-   the new name as it does for any name change. The old container is removed only after slot 01 is online.
-4. **Register N Linux slots.** `Register-Runners.ps1` registers every slot in `Get-LinuxSlots`, each from a throwaway
-   container on its own `/runner` mount, as it does for the single runner now. A slot above `linux.count` is drained,
-   deregistered and its container removed, highest number first; its directory and volumes are kept until
-   `-Prune`.
-5. **Windows scale-down and sign-in start.** Lowering `windows.count` drains the highest-numbered instances through
-   `Manage-WindowsRunner.ps1`, deregisters them and stops their supervisors; their clones stay until `-Prune`. With
-   `windows.startAtSignIn` a per-user Startup entry (no elevation, no scheduled task, no service) runs
-   `Manage-RunnerHost.ps1 -Action Start`, which waits for `docker info` up to `buildAgent.docker.readyTimeoutSeconds`
-   and then starts each instance; held instances stay held. Remove the entry when the setting goes back to false.
-6. **Host manager.** `scripts/Manage-RunnerHost.ps1 -Action Plan|Apply|Status|Start [-Prune] [-Json]` as described in
-   the plan. Plan changes nothing and exits 0 (nothing to do) or 3 (changes pending). Apply only calls the scripts
-   above and `Setup-WindowsRunners.ps1 -Count`. Plan warns when the Linux slots' `memory` plus one BuildAgent
-   container per Windows slot exceeds the WSL2 memory cap read from `%UserProfile%\.wslconfig` (or Docker's own
-   total when there is no file). It never edits `.wslconfig`, auto sign-in or Docker Desktop settings.
-7. **Linux status and telemetry.** `scripts/Get-LinuxRunnerStatus.ps1 -Json`: one row per slot in the shape of the
-   Windows status rows, `instanceId` `linux-<nn>`. `Manage-RunnerHost.ps1 -Action Status -Json` returns both sides.
-   Point the Dashboard sender at it only if its v1 schema accepts these rows as they are; if it does not, stop and
-   write a handoff for SubZeroDev.Dashboard instead of changing the shape here.
-8. **Docs.** README: the per-host settings, the host manager, the slot names, the reboot sequence. Update
-   `docs/windows-two-runners.md` for scale-down and sign-in start.
+1. **Settings and resolution.**
+   - Add to `runners.json` and `Assert-RunnerConfig`:
+     - `hostId` (default: the lower-cased computer name; pattern `^[a-z0-9][a-z0-9-]{0,30}$`);
+     - `linux.count` and `windows.count` (null or 0–16; **no numeric default**);
+     - `windows.startAtSignIn` (false);
+     - `github.runnerGroup` (`{ "name": "Default", "repositories": null }`);
+     - `housekeeping.minFreeGB` (null);
+     - `buildAgent.estimate.memory` (`8g`).
+   - `Get-LinuxSlots $Config $Inventory` and `Get-WindowsSlots $Config $Inventory` return resolved slots. These are
+     names, directories, volumes, containers, services and labels, with slot 01 mapped to the legacy names when the
+     inventory marks it `legacy`. No script reads `linux.container`, `linux.directory` or volume names directly after
+     this slice.
+   - `New-InstanceSettings $Config $Slot` builds a Windows clone's `runners.local.json` from the allowlist in the plan
+     (github, hostId, labels, buildAgent, windows.workFolder, instance identity) and its `generated.hash`.
+   - `Setup-WindowsRunners.ps1` gains `-HostId`, which defaults to the computer name, so labels and names are unchanged
+     when it is omitted.
+2. **Host state: inventory, journal, lock, Init/Adopt, Plan/Status.**
+   - New `scripts/HostState.ps1`:
+     - reads and writes `inventory.json` and `operation.json` under `%LOCALAPPDATA%\SubZeroDev\Runners\host\`, with
+       `schema` and `version`, atomically (reuse the `Set-MaintenanceState` write);
+     - an unreadable file is a distinct state, never treated as empty;
+     - `Use-HostLock` takes `Local\SubZeroDev.Runners.Host`, or joins it when `SZR_HOST_OPERATION` matches the
+       journal's operation id.
+   - The existing mutating scripts take the lock when run directly.
+   - `scripts/Manage-RunnerHost.ps1`:
+     - `Init` writes counts (default 2/2) and `hostId` into `runners.local.json`.
+     - `Adopt` records only what is proven (the plan's rules) and writes nothing else. It refuses an unreadable
+       inventory without `-ReplaceUnreadable`.
+     - `Plan [-Json]` and `Status [-Json]` take no lock and make no write calls. Plan prints a `planHash` and exits
+       0 (no changes) or 3 (changes).
+   - Status reports drift: image, compose config hash, compose file hash, clone settings hash, clone commit, runner
+     group. It also reports any unfinished operation.
+   - Runner-group verification: expected group exists, `allows_public_repositories` false, visibility and allowlist,
+     every slot's runner in the group.
+3. **Automatic start keeps maintenance.**
+   - `linux/entrypoint.sh`: while `/runner/maintenance.json` exists, log once and check again every 15 s; `exec
+     /runner/run.sh` only once it is gone. `configure` is unchanged.
+   - `Manage-WindowsRunner.ps1 -Action AutoStart` starts the supervisor without `Exit-RunnerMaintenance`, and does
+     nothing if the supervisor is already running (its mutex).
+   - `Manage-RunnerHost.ps1 -Action AutoStart` waits for `docker info` up to `buildAgent.docker.readyTimeoutSeconds`,
+     then runs AutoStart in each `active` Windows instance.
+   - `-Action Hold -Slot` and `-Action Resume -Slot` run under the lock. Resume is the only new path to
+     `Exit-RunnerMaintenance`; for Linux it starts a stopped container first.
+   - `windows.startAtSignIn` adds or removes a per-user Startup entry that runs host AutoStart: no elevation, no
+     scheduled task, no service.
+4. **Compose and the image context hash.**
+   - `New-LinuxRunner.ps1` writes `linux/compose.local.yaml` (add it to `.gitignore` and `dropbox-ignore.txt`) from
+     `Get-LinuxSlots`. Each slot gets a service, plus a sidecar in sidecar mode, with:
+     - the same mounts, environment, limits and privileged/dind settings as today's `docker run` lines;
+     - `restart: always`;
+     - labels `dev.subzerodev.runners.host`/`.slot`.
+   - Every compose call names its services and uses `--no-deps`; there is no `down`.
+   - A per-slot change is hold or idle, then `up -d --no-deps --force-recreate <slot services>`, then end maintenance.
+   - The build context hash covers `.dockerignore`, each file it admits, and `BASE_IMAGE`/`RUNNER_VERSION`/`RUNNER_SHA256`.
+     It is stored as image label `dev.subzerodev.runners.context`, and the image is rebuilt on a mismatch.
+   - `-Update` refuses a container with a `com.docker.compose.project` label.
+   - `scripts/Get-LinuxRunnerStatus.ps1 -Json`: one row per slot, `schema`/`version`, `instanceId` `linux-<nn>`.
+5. **Legacy Linux migration.**
+   - The journaled operation `migrate-legacy-linux`, exactly as the plan's table: hold, stop, and `docker update
+     --restart=no`, then compose `linux-01` on the legacy directory and volumes, Resume, verify the same `runnerId`
+     online, and commit the inventory.
+   - The legacy container is kept for rollback until `Apply -Prune`.
+   - `-Rollback` restores the legacy container while the operation is before its verification step.
+   - `-RenameLegacy` is not part of this slice.
+6. **Add and retire slots.**
+   - Apply takes the lock, finishes an unfinished operation, recomputes the plan (`-ExpectPlan` refuses on
+     difference), then runs one journaled operation per slot change:
+     - add: `provisioning` → registered (runnerId recorded) → service or instance created → online → `active`;
+     - retire: the plan's seven steps, highest-numbered slot first.
+   - Surplus slots are retired only with `-Retire` (D2 (b)); without it they are reported and Apply exits 3.
+   - Windows: Setup is called with 1–16 only; count 0 retires every active instance through the retire operation.
+   - Unset count: no change on that side.
+   - The beast single-clone registration is retired only after `win01` is online.
+   - `-Prune` removes `retired` slots' directories, volumes and clones, and the kept legacy container, each verified
+     by recorded identity.
+   - Apply refuses to register into a group that allows public repositories, and adds no slot below
+     `housekeeping.minFreeGB`.
+7. **Updates and resources.**
+   - `Manage-RunnerHost.ps1 -Action Update` resolves the BuildAgent release digest, writes it into the host's
+     `runners.local.json`, then runs Apply, which recreates one slot at a time under drain.
+   - Plan reports:
+     - per-slot `docker system df -v`;
+     - free space on Docker's data drive;
+     - the Linux slots' limits plus `buildAgent.estimate.memory` × Windows slots against the `.wslconfig` cap.
+       The Windows-side figure is labelled advisory.
+   - It never edits `.wslconfig`, auto sign-in or Docker Desktop settings.
+8. **Docs and target-host acceptance.**
+   - README: settings, host manager actions, slot names, held/resume semantics, reboot sequence.
+   - Update `docs/windows-two-runners.md` for AutoStart, Retire and Prune.
+   - Run L3 on beast (below) and record it in the PR.
 
 ## Contract
 
 | Item | Value |
 | --- | --- |
-| Per-host file | `runners.local.json` (git-ignored), merged over `runners.json` |
-| Counts | `linux.count`, `windows.count`: 0–16, default 2, 0 = that side off |
-| Host | `hostId`, default the lower-cased computer name |
-| Linux slot `nn` | runner `subzerodev.runner.linux.<hostId>.<nn>`, container `subzerodev-runner-linux-<nn>`, directory `linux/runner-<nn>`, volumes `…-<nn>` |
-| Windows instance | `win<nn>`, as `Setup-WindowsRunners.ps1` names them today |
-| Labels | unchanged: `subzerodev` + `subzerodev-linux` / `subzerodev-windows` + any custom labels, identical on every slot of a side |
-| Compose | project `subzerodev-runners`, file `linux/compose.local.yaml`, `restart: always` |
-| Scale-down order | highest-numbered slot first, drained before deregistration |
-| Host manager | `scripts/Manage-RunnerHost.ps1 -Action Plan\|Apply\|Status\|Start [-Prune] [-Json]` |
-| Unchanged | `Invoke-BuildAgent.ps1` parameters, `SZR_SCRIPTS`, both existing `-Json` status shapes, digests pinned, never `:latest` |
+| Desired state | `runners.json` < host `runners.local.json` < generated clone `runners.local.json` (hash-checked) |
+| Host state | `%LOCALAPPDATA%\SubZeroDev\Runners\host\inventory.json`, `operation.json`, schema + version, atomic writes |
+| Host lock | `Local\SubZeroDev.Runners.Host`; joined through `SZR_HOST_OPERATION` |
+| Counts | `linux.count`, `windows.count`: null (keep what exists) or 0–16; `Init` writes 2/2 |
+| Linux slot `nn` | runner `subzerodev.runner.linux.<hostId>.<nn>`, container `subzerodev-runner-linux-<nn>`, directory `linux/runner-<nn>`, volumes `…-<nn>`; slot 01 legacy: `subzerodev.runner.linux`, `linux/runner`, existing volumes, container `subzerodev-runner-linux-01` |
+| Windows instance | `win<nn>`, runner `subzerodev.runner.windows.<hostId>.win<nn>` |
+| Held | the maintenance record exists (unreadable included); no listener while held |
+| Ends maintenance | only `Manage-RunnerHost -Action Resume` and `Manage-WindowsRunner -Action Start` |
+| Compose | project `subzerodev-runners`, file `linux/compose.local.yaml`, `restart: always`, always with service names and `--no-deps` |
+| Deletion | only by recorded identity (runner ID + scope, container + labels), never by name or prefix; unknown ≠ absent |
+| Labels | unchanged: `subzerodev` + `subzerodev-linux` / `subzerodev-windows` + custom; host labels from `hostId` |
+| Unchanged | `Invoke-BuildAgent.ps1` parameters, `SZR_SCRIPTS`, both existing `-Json` shapes, `Manage-WindowsRunner -Action Start`, `Setup-WindowsRunners -Count` range, pinned digests, never `:latest` |
 
-## Tests
+## Tests (L0, fakes; reported separately from L1–L3)
 
-- Settings: defaults, per-host override, count 0, 17 refused, bad `hostId` refused, slot names resolved for 1, 2, 16.
-- Compose file: generated from fake settings for both Docker modes and compared with the `docker run` arguments the
-  current script uses (mounts, environment, limits, privileged, `restart: always`), including paths with spaces.
-- Drain per slot with a fake Docker and GitHub: a busy slot 02 blocks only slot 02; timeout keeps it; `-Force` replaces.
-- Migration: existing `linux/runner` becomes slot 01 with its registration; nothing is removed when a step fails.
-- Scale 2→3→1 on each side: the new slot registers; slots 03 then 02 drain and deregister in that order; files kept;
-  `-Prune` removes them.
-- Sign-in start: waits for a fake `docker info`, times out with a message, leaves a held instance held.
-- Plan is read-only (no fake Docker/GitHub write calls) and its exit codes; the memory warning.
-- Status `-Json` for both sides; the existing Windows and BuildAgent status outputs byte-for-byte unchanged.
-- On beast, recorded in the PR: Apply with counts 2/2, both Linux slots and both Windows instances online in the org,
-  a reboot with auto sign-in brings all four back, and HollowMoon's `build.yml` passes on a Windows slot while a
-  Linux slot runs `tests/linux-runner-docs-smoke.yml`.
+- **Settings:**
+  - defaults; null count; 0, 16 and 17 (refused); bad `hostId`;
+  - slot names for 1, 2 and 16;
+  - legacy mapping for slot 01;
+  - the generated clone file carries every allowlisted key and nothing else;
+  - a hand-edited clone file is reported as drift and is not overwritten without `-Force`;
+  - `-HostId` omitted gives today's labels.
+- **Host state:**
+  - atomic write survives a kill between temp write and move;
+  - unreadable or unknown-version inventory makes Apply, Resume, Hold and Prune refuse;
+  - Adopt records only proven resources: a container with a matching name but no matching registration is not
+    adopted;
+  - `-ReplaceUnreadable` keeps the old file.
+- **Unknown is not absent:** with fake Docker or GitHub returning a timeout or 500 at each step, nothing is deleted,
+  the journal is kept, and the slot is not reported as gone.
+- **Failure injection, retire:** kill after each of steps 1–7 in turn, then rerun Apply. Each retry finishes the
+  operation, issues no second DELETE for a 404 ID, never registers, never recreates the retiring slot in compose, and
+  makes no call against another slot's resources.
+- **Failure injection, add:**
+  - kill after registration but before `.runner` was read: the retry records the ID;
+  - kill after GitHub accepted but before `.runner` was written: the retry reports the orphan and registers with
+    `--replace`.
+- **Failure injection, migration:**
+  - kill after each step, then retry; the legacy container never runs while `linux-01` runs;
+  - rollback before verification brings back the legacy runner with the same ID;
+  - the legacy container is not removed before verification, and is removed only by `-Prune`.
+- **Concurrency:**
+  - two Apply processes: the second waits for the lock and recomputes; with `-ExpectPlan` it refuses;
+  - Hold racing Resume on one slot;
+  - Hold racing AutoStart: when Hold returns, no listener is running and the record exists;
+  - `New-LinuxRunner.ps1` run directly while Apply holds the lock waits;
+  - a script called by Apply with `SZR_HOST_OPERATION` joins the lock instead of deadlocking.
+- **Maintenance acceptance:**
+  - hold → fake Docker restart → the entrypoint runs no `run.sh`;
+  - hold → sign-in AutoStart → the supervisor idles with no listener;
+  - hold → Apply three times → still held, labels still withdrawn;
+  - Resume → labels restored, exactly one listener;
+  - unreadable record → held, and Resume refuses with the existing message;
+  - `Manage-WindowsRunner -Action Start` still ends maintenance.
+- **Compose:**
+  - generated file compared with today's `docker run` arguments for both modes, including paths with spaces;
+  - every compose call carries service names;
+  - **with slot 01 busy, updating or recreating slot 02 makes no call that touches slot 01** (no recreate, no label
+    change);
+  - changing each of the Dockerfile, `entrypoint.sh`, `healthcheck.sh`, the runner archive, `.dockerignore`, and a
+    build argument triggers a rebuild;
+  - a file `.dockerignore` admits but the hash does not cover fails the test;
+  - `-Update` refuses a compose container.
+- **Updates:** Update writes the digest before any recreate. An Apply after a successful Update makes no change. An
+  Apply with a stale digest in settings is reported as a downgrade, not silently applied.
+- **Scale:**
+  - 2→3→1 on each side, with and without `-Retire`;
+  - Windows count 0 never calls Setup with 0;
+  - a host with no Linux registration and an unset `linux.count` plans no Linux change;
+  - Prune removes only retired resources.
+- **Runner group:** `Default` as today passes; a group allowing public repositories is drift and blocks
+  registration; allowlist mismatch is reported.
+- **Plan is read-only:** no fake write calls at all; exit codes 0 and 3; `planHash` is stable for the same state.
+- **Status:** `-Json` with `schema`/`version`; the two existing outputs are byte for byte unchanged.
+
+## Target-host acceptance (L3, on beast, recorded in slice 8's PR)
+
+1. Adopt, then Plan; review the plan.
+2. Migrate the legacy Linux runner: same runner ID online as `linux-01`.
+3. Set counts 2/2, then Apply: `linux-01`, `linux-02`, `win01` and `win02` online; the single-clone Windows
+   registration retired.
+4. Hold `linux-02` and `win02`, then reboot with auto sign-in. All four containers and supervisors come back. The two
+   held slots have no listener and stay held. Resume each: one listener each.
+5. With a job running on `linux-01`, Update or recreate `linux-02`: the job on `linux-01` finishes untouched.
+6. At the same time:
+   - HollowMoon's `build.yml` passes on a Windows slot (L2 for PR #4);
+   - `tests/linux-runner-docs-smoke.yml` passes on a Linux slot;
+   - record the WSL memory peak against the plan's estimate.
+7. Lower `windows.count` to 1 and Apply without `-Retire`: reported, nothing removed. With `-Retire`: `win02` drained
+   and deregistered. Then `-Prune`.
 
 ## Release
 
-Merge slice by slice through this repository's PR flow. Beast moves to the pool by setting `hostId` and the counts in
-its `runners.local.json` and running `Manage-RunnerHost.ps1 -Action Plan`, then `Apply`. Repositories move to the
-runners one PR at a time in the order in the plan, each in its own repository.
+Merge slice by slice through this repository's PR flow. Beast moves when slices 1–6 are merged: Adopt, Plan, migrate,
+Apply. No repository needs a workflow change for the pool. Moving a stage of a repository's job into BuildAgent is
+separate work in that repository, done job by job after that project reaches L1 and L2. Release jobs move last and
+keep `environment: release`.
