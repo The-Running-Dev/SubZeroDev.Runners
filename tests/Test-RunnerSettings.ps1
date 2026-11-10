@@ -55,6 +55,10 @@ try {
     Assert-Throws { Read-RunnerConfig (Use-Root @{ buildAgent = @{ estimate = @{ memory = 'lots' } } }) } 'A bad memory estimate was accepted.' 'estimate\.memory'
     $nullFree = Read-RunnerConfig (Use-Root @{ housekeeping = @{ minFreeGB = $null } })
     Assert ($null -eq $nullFree.housekeeping.minFreeGB) 'A null minFreeGB (no free-space check) was refused.'
+    # The earlier check accepted a numeric string, so a runners.local.json written for it must still load.
+    $stringFree = Read-RunnerConfig (Use-Root @{ housekeeping = @{ minFreeGB = '5' } })
+    Assert ([double]$stringFree.housekeeping.minFreeGB -eq 5) 'A numeric-string minFreeGB from an existing runners.local.json was refused.'
+    Assert-Throws { Read-RunnerConfig (Use-Root @{ housekeeping = @{ minFreeGB = 'lots' } }) } 'A non-numeric minFreeGB was accepted.' 'minFreeGB'
 
     # Slot names for 1, 2 and 16 slots on both platforms, on an empty inventory.
     foreach ($count in 1, 2, 16) {

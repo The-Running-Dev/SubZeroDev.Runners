@@ -288,6 +288,8 @@ function Invoke-RunnerSetupAcceptance {
     $pairLabel = "subzerodev-pair-$(if ($SetupOptions.HostId) { $SetupOptions.HostId } else { $env:COMPUTERNAME.ToLowerInvariant() })"
     $state = Get-RunnerAcceptanceState $InstallRoot
     $material = @($Repository, $SetupOptions.SourceCommit, $SetupOptions.GitHubUrl, $SetupOptions.Count, $clones, $Instances.Instance, $Instances.Name, $Instances.AgentId)
+    # Only when set, so profiles recorded before -HostId existed stay valid; a changed ID re-verifies against its pair label.
+    if ($SetupOptions.HostId) { $material += "hostId=$($SetupOptions.HostId)" }
     foreach ($clone in $clones) { foreach ($file in 'runners.json', 'runners.local.json') { $material += (Get-FileHash -LiteralPath (Join-Path $clone $file) -Algorithm SHA256).Hash } }
     $profile = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($material | ConvertTo-Json -Depth 5 -Compress))))
     if ($state.activeRun) { throw 'A previous controlled run needs cleanup before acceptance can continue.' }

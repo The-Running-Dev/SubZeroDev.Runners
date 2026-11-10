@@ -24,7 +24,8 @@ param(
     [switch] $SkipBuildAgent,
     # The host's name in new runner names and the host labels (subzerodev-host-<id>, subzerodev-pair-<id>). Omitted, the
     # lower-cased computer name is used, as before. Runners already installed keep their names.
-    [ValidatePattern('^[a-z0-9][a-z0-9-]{0,30}$')] [string] $HostId
+    # -cmatch: ValidatePattern ignores case, and an upper-case ID would name runners that the hostId setting refuses.
+    [ValidateScript({ $_ -cmatch '^[a-z0-9][a-z0-9-]{0,30}$' })] [string] $HostId
 )
 
 # Exit codes of this script: 0 done, 1 failed, 2 the person has to act first (restart Windows, sign out, start Docker Desktop...);

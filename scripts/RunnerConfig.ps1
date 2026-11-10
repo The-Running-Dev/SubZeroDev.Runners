@@ -47,7 +47,12 @@ function Assert-RunnerConfig($Config) {
     Require ([int]$Config.logs.retentionDays -gt 0 -and [int]$Config.logs.maxMB -gt 0) 'logs.retentionDays and logs.maxMB must be positive.'
     Require ([int]$Config.housekeeping.retries -gt 0 -and [int]$Config.housekeeping.retryDelaySeconds -ge 0) 'housekeeping.retries must be positive; retryDelaySeconds must not be negative.'
     $minFree = $Config.housekeeping.minFreeGB
-    Require ($null -eq $minFree -or (($minFree -is [int] -or $minFree -is [long] -or $minFree -is [double] -or $minFree -is [decimal]) -and $minFree -ge 0)) 'housekeeping.minFreeGB must be null (no free-space check) or a number of GB, not negative.'
+    # A numeric string ("5") was accepted before null meant "no check"; existing runners.local.json files keep working.
+    $minFreeNumber = 0.0
+    $isNumber = $minFree -is [int] -or $minFree -is [long] -or $minFree -is [double] -or $minFree -is [decimal]
+    if ($isNumber) { $minFreeNumber = [double]$minFree }
+    elseif ($minFree -is [string]) { $isNumber = [double]::TryParse($minFree, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$minFreeNumber) }
+    Require ($null -eq $minFree -or ($isNumber -and $minFreeNumber -ge 0)) 'housekeeping.minFreeGB must be null (no free-space check) or a number of GB, not negative.'
     if ($null -ne $Config.hostId) { Require ("$($Config.hostId)" -cmatch '^[a-z0-9][a-z0-9-]{0,30}$') 'hostId must be 1-31 lower-case letters, digits or hyphens, starting with a letter or digit.' }
     foreach ($platform in 'linux', 'windows') {
         $count = $Config.$platform.count

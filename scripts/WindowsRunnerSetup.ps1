@@ -123,7 +123,10 @@ function Install-RunnerSetupInstance {
     $savedName = $null
     if (Test-Path -LiteralPath $localPath) {
         $saved = Get-Content -Raw -LiteralPath $localPath | ConvertFrom-Json
-        $Labels = @(@($saved.windows.labels) + $Labels | Where-Object { $_ } | Select-Object -Unique)
+        # Setup passes the current host and pair labels; saved ones from an earlier host name or -HostId would otherwise stay
+        # on the registration and keep routing pair jobs to it.
+        $kept = @($saved.windows.labels | Where-Object { $_ -and $_ -notmatch '^subzerodev-(host|pair)-' })
+        $Labels = @($kept + $Labels | Where-Object { $_ } | Select-Object -Unique)
         $savedName = $saved.windows.name
     }
     # -HostId names new runners after the host ID. A runner already installed keeps its saved name: renaming a registration
@@ -271,7 +274,8 @@ function Invoke-WindowsRunnerHostSetup {
         [bool] $NonInteractive,
         [bool] $SkipBuildAgent,
         # The host's name in runner names and host labels; empty keeps the lower-cased computer name.
-        [ValidatePattern('^([a-z0-9][a-z0-9-]{0,30})?$')] [string] $HostId
+        # -cmatch: ValidatePattern ignores case, and the hostId setting is lower case only.
+        [ValidateScript({ $_ -cmatch '^([a-z0-9][a-z0-9-]{0,30})?$' })] [string] $HostId
     )
     # Dropping -Repository must not bypass an interrupted stop/dispatch and let the installer reopen maintenance.
     $journal = Get-RunnerAcceptanceState $InstallRoot
