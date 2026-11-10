@@ -4,7 +4,7 @@ Each slice is one pull request. Build notes and tests for each are in
 [handoffs/runner-pool.md](../handoffs/runner-pool.md) under the same number.
 
 ## S1 — Settings and resolution
-Status: todo
+Status: done
 Acceptance: new settings with validation (`hostId`, `linux.count`, `windows.count`, `windows.startAtSignIn`, `github.runnerGroup`, `housekeeping.minFreeGB`, `buildAgent.estimate.memory`); `Get-LinuxSlots` and `Get-WindowsSlots`; `New-HostSettings` and `Test-HostSettingsDrift`; the `runners.host.json` layer in `Read-RunnerConfig`, an absent file resolving exactly as today; `Setup-WindowsRunners.ps1 -HostId`; the handoff's Settings tests pass in CI.
 Out of scope: inventory, journal and lock; any host mutation.
 

@@ -117,13 +117,23 @@ function Sync-RunnerSetupInstance {
 }
 
 function Install-RunnerSetupInstance {
-    param([string] $Clone, [string] $InstanceId, [string] $GitHubUrl, [string[]] $Labels)
+    param([string] $Clone, [string] $InstanceId, [string] $GitHubUrl, [string[]] $Labels, [string] $Name)
     $localPath = Join-Path $Clone 'runners.local.json'
+    $install = @{ InstanceId = $InstanceId; GitHubUrl = $GitHubUrl }
+    $savedName = $null
     if (Test-Path -LiteralPath $localPath) {
         $saved = Get-Content -Raw -LiteralPath $localPath | ConvertFrom-Json
-        $Labels = @(@($saved.windows.labels) + $Labels | Where-Object { $_ } | Select-Object -Unique)
+        # Setup passes the current host and pair labels; saved ones from an earlier host name or -HostId would otherwise stay
+        # on the registration and keep routing pair jobs to it.
+        $kept = @($saved.windows.labels | Where-Object { $_ -and $_ -notmatch '^subzerodev-(host|pair)-' })
+        $Labels = @($kept + $Labels | Where-Object { $_ } | Select-Object -Unique)
+        $savedName = $saved.windows.name
     }
-    & (Join-Path $Clone 'scripts\Install-WindowsRunner.ps1') -InstanceId $InstanceId -GitHubUrl $GitHubUrl -ExtraLabels $Labels
+    # -HostId names new runners after the host ID. A runner already installed keeps its saved name: renaming a registration
+    # is a separate decision, not a side effect of rerunning setup.
+    if ($Name -and -not $savedName) { $install.Name = $Name }
+    $install.ExtraLabels = $Labels
+    & (Join-Path $Clone 'scripts\Install-WindowsRunner.ps1') @install
 }
 
 function Get-RunnerSetupEvidence {
@@ -262,7 +272,10 @@ function Invoke-WindowsRunnerHostSetup {
         [string] $SmokeRepository,
         [string] $VerificationRepository,
         [bool] $NonInteractive,
-        [bool] $SkipBuildAgent
+        [bool] $SkipBuildAgent,
+        # The host's name in runner names and host labels; empty keeps the lower-cased computer name.
+        # -cmatch: ValidatePattern ignores case, and the hostId setting is lower case only.
+        [ValidateScript({ $_ -cmatch '^([a-z0-9][a-z0-9-]{0,30})?$' })] [string] $HostId
     )
     # Dropping -Repository must not bypass an interrupted stop/dispatch and let the installer reopen maintenance.
     $journal = Get-RunnerAcceptanceState $InstallRoot
@@ -290,9 +303,9 @@ function Invoke-WindowsRunnerHostSetup {
         Write-Host "Repository scope compatibility and Actions-enabled state verified: $($validatedRepositories -join ', ')."
         Write-Host 'These checks do not verify runner-group access, workflow runs-on routing or successful job execution.'
     }
-    $computer = $env:COMPUTERNAME.ToLowerInvariant()
-    $hostLabel = "subzerodev-host-$computer"
-    $pairLabel = "subzerodev-pair-$computer"
+    $hostName = if ($HostId) { $HostId } else { $env:COMPUTERNAME.ToLowerInvariant() }
+    $hostLabel = "subzerodev-host-$hostName"
+    $pairLabel = "subzerodev-pair-$hostName"
     $instances = @(for ($number = 1; $number -le $Count; $number++) {
         $id = 'win{0:D2}' -f $number
         $clone = Join-Path $InstallRoot $id
@@ -300,7 +313,9 @@ function Invoke-WindowsRunnerHostSetup {
         Sync-RunnerSetupInstance -Clone $clone -InstanceId $id -SourceCommit $SourceCommit -GitHubUrl $GitHubUrl
         $labels = @($ExtraLabels) + @($hostLabel)
         if ($number -le 2) { $labels += $pairLabel }
-        Install-RunnerSetupInstance -Clone $clone -InstanceId $id -GitHubUrl $GitHubUrl -Labels $labels | Out-Host
+        $install = @{ Clone = $clone; InstanceId = $id; GitHubUrl = $GitHubUrl; Labels = $labels }
+        if ($HostId) { $install.Name = "subzerodev.runner.windows.$HostId.$id" }
+        Install-RunnerSetupInstance @install | Out-Host
         Get-RunnerSetupEvidence -Clone $clone -InstanceId $id
     })
     Confirm-RunnerSetupHost -Instances $instances -Scope $scope
@@ -321,6 +336,7 @@ function Invoke-WindowsRunnerHostSetup {
     $verification = if ($VerificationRepository) { 'blocked' } else { 'not-requested' }
     if ($VerificationRepository -and $buildAgentExit -eq 0) {
         $setupOptions = @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = $ExtraLabels; TargetRepositories = $targets; SourceCommit = $SourceCommit; NonInteractive = $NonInteractive; SkipBuildAgent = $false }
+        if ($HostId) { $setupOptions.HostId = $HostId }
         try {
             Invoke-RunnerSetupAcceptance -InstallRoot $InstallRoot -Repository $VerificationRepository -Instances $instances -SetupOptions $setupOptions
             $verification = 'passed'

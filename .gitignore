@@ -6,3 +6,4 @@
 /downloads/
 *.log
 /runners.local.json
+/runners.host.json

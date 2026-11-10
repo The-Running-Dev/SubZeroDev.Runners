@@ -62,7 +62,7 @@ $flow = @{ Auth = 0; Clones = @(); Installs = @(); Verified = 0; Smoke = @() }
 function Confirm-RunnerSetupAuthentication { param($Scope, $NonInteractive, $WithSmoke) $flow.Auth++ }
 function Confirm-RunnerSetupRepositories { param($Scope, $Repositories) $flow.TargetRepositories = @($Repositories); $Repositories }
 function Sync-RunnerSetupInstance { param($Clone, $InstanceId, $SourceCommit, $GitHubUrl) $flow.Clones += $Clone }
-function Install-RunnerSetupInstance { param($Clone, $InstanceId, $GitHubUrl, $Labels) $flow.Installs += [pscustomobject]@{ Id = $InstanceId; Labels = $Labels } }
+function Install-RunnerSetupInstance { param($Clone, $InstanceId, $GitHubUrl, $Labels, $Name) $flow.Installs += [pscustomobject]@{ Id = $InstanceId; Labels = $Labels; Name = $Name } }
 function Get-RunnerSetupEvidence {
     param($Clone, $InstanceId)
     [pscustomobject]@{ Instance = $InstanceId; Name = "custom-$InstanceId"; AgentId = [int]$InstanceId.Substring(3); Workspace = "$Clone\work"; SupervisorPid = 100 + [int]$InstanceId.Substring(3) }
@@ -82,6 +82,19 @@ Assert (($flow.Installs.Id -join ',') -eq 'win01,win02,win03') 'Instance IDs wer
 $pair = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())"
 Assert ($flow.Installs[0].Labels -contains $pair -and $flow.Installs[1].Labels -contains $pair -and $flow.Installs[2].Labels -notcontains $pair) 'Smoke targeting did not select only the first two instances.'
 Assert (($flow.Smoke[0].Names -join ',') -eq 'custom-win01,custom-win02') 'Smoke ignored actual persisted identities.'
+Assert (-not ($flow.Installs | Where-Object Name)) 'Setup passed a runner name without -HostId; the installer default must stay unchanged.'
+Assert ($flow.Smoke[0].Label -eq $pair) 'Smoke without -HostId did not target the computer-name pair label.'
+# -HostId names the host labels and new runner names; the pair label still covers win01 and win02 only.
+$flow.Installs = @(); $flow.Smoke = @(); $flow.BuildAgent = @()
+Invoke-WindowsRunnerHostSetup @options -HostId 'beast-2' | Out-Null
+Assert (($flow.Installs | Where-Object { $_.Labels -contains 'subzerodev-host-beast-2' }).Count -eq 3) 'The hostId host label was not applied to every instance.'
+Assert ($flow.Installs[0].Labels -contains 'subzerodev-pair-beast-2' -and $flow.Installs[1].Labels -contains 'subzerodev-pair-beast-2' -and $flow.Installs[2].Labels -notcontains 'subzerodev-pair-beast-2') 'The hostId pair label did not select only the first two instances.'
+Assert (($flow.Installs.Name -join ',') -eq 'subzerodev.runner.windows.beast-2.win01,subzerodev.runner.windows.beast-2.win02,subzerodev.runner.windows.beast-2.win03') 'Runner names were not built from hostId.'
+Assert ($flow.Smoke[0].Label -eq 'subzerodev-pair-beast-2') 'Smoke did not target the hostId pair label.'
+Assert-Throws { Invoke-WindowsRunnerHostSetup @options -HostId 'Beast_2' } 'An invalid hostId was accepted.'
+# ValidatePattern ignores case; an upper-case ID would register names and labels the hostId setting refuses.
+Assert-Throws { Invoke-WindowsRunnerHostSetup @options -HostId 'BEAST' } 'An upper-case hostId was accepted.'
+$flow.Installs = @(); $flow.Smoke = @(); $flow.BuildAgent = @()
 $flow.BuildAgent = @()
 $skipped = Invoke-WindowsRunnerHostSetup @options -SkipBuildAgent $true | Select-Object -Last 1
 Assert ($flow.BuildAgent.Count -eq 0 -and $skipped.BuildAgentExitCode -eq 0) '-SkipBuildAgent still provisioned BuildAgent.'
@@ -106,6 +119,25 @@ Assert ($flow.Smoke.Count -eq 0) 'Setup dispatched a smoke test without a reques
 # test never run, no success is reported, and the worker process exits non-zero. The real Install-RunnerSetupInstance runs a
 # throwaway installer that throws the real migration failure text; everything that would reach GitHub or the host is a recorder.
 . $functions
+# The real Install-RunnerSetupInstance with a recording installer: host and pair labels saved under an earlier host name are
+# replaced by the current ones, other saved labels stay, and a saved runner name is never replaced by the -HostId name.
+$labelRoot = Join-Path ([IO.Path]::GetTempPath()) ('host-setup-labels-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $labelRoot 'scripts') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $labelRoot 'scripts\Install-WindowsRunner.ps1') "param([string] `$InstanceId, [string] `$GitHubUrl, [string[]] `$ExtraLabels, [string] `$Name)`n[pscustomobject]@{ Labels = `$ExtraLabels; Name = `$Name; NameGiven = `$PSBoundParameters.ContainsKey('Name') }"
+    $localFile = Join-Path $labelRoot 'runners.local.json'
+    @{ windows = @{ name = 'saved-name'; labels = @('custom', 'subzerodev-host-oldpc', 'subzerodev-pair-oldpc') } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $localFile
+    $install = @{ Clone = $labelRoot; InstanceId = 'win01'; GitHubUrl = 'https://github.com/AbsoluteZeroDev'; Labels = @('subzerodev-host-beast', 'subzerodev-pair-beast'); Name = 'subzerodev.runner.windows.beast.win01' }
+    $installed = Install-RunnerSetupInstance @install
+    $labels = (@($installed.Labels) | Sort-Object) -join ','
+    Assert ($labels -eq 'custom,subzerodev-host-beast,subzerodev-pair-beast') "Saved host or pair labels from an earlier host name were kept: $labels"
+    Assert (-not $installed.NameGiven) 'Setup replaced a saved runner name with the hostId name.'
+    Remove-Item -LiteralPath $localFile
+    $installed = Install-RunnerSetupInstance @install
+    Assert ($installed.NameGiven -and $installed.Name -eq 'subzerodev.runner.windows.beast.win01') 'A new runner was not given the hostId name.'
+} finally {
+    Remove-Item -LiteralPath $labelRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 $failure = Join-Path ([IO.Path]::GetTempPath()) ('host-setup-fail-' + [guid]::NewGuid().ToString('N'))
 try {
     $migrationFailure = "An earlier version's startup entry for instance win01 could not be removed or verified gone, so the install stopped before any registration change; nothing was started or stopped and no migration is recorded:`n - \SubZeroDev.Runners\Start Windows runner (win01): access denied`nRemove the task in Task Scheduler (taskschd.msc), or repair the Task Scheduler service, then rerun Install-WindowsRunner.ps1 (or scripts\Remove-LegacyTasks.ps1)."
