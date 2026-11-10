@@ -63,6 +63,9 @@ jobs:
       - name: Exercise failed-stop handling, label recovery state and supervisor recovery (entry points and a real supervisor process)
         shell: pwsh
         run: ./tests/Test-LifecycleRecovery.ps1
+      - name: Verify host state, lock, Adopt, Plan and Status
+        shell: pwsh
+        run: ./tests/Test-HostState.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)

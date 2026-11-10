@@ -207,7 +207,9 @@ try {
     # not with the BuildAgent exit code alone; the 5.1 entry point only treats 0 and 2 as non-fatal.
     $workerDir = Join-Path $root 'exit-worker\scripts'
     New-Item -ItemType Directory -Path $workerDir -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $repo 'scripts\Configure-WindowsRunners.ps1') -Destination $workerDir
+    foreach ($file in 'Configure-WindowsRunners.ps1', 'RunnerConfig.ps1', 'HostState.ps1') { Copy-Item -LiteralPath (Join-Path $repo "scripts\$file") -Destination $workerDir }
+    $savedLocalAppData = $env:LOCALAPPDATA
+    $env:LOCALAPPDATA = Join-Path $root 'exit-worker\LocalAppData'
     $workerOptions = Join-Path $root 'exit-worker\options.json'
     '{}' | Set-Content -LiteralPath $workerOptions
     $pwshExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
@@ -218,6 +220,7 @@ try {
         $global:LASTEXITCODE = 0
         Assert ($workerExit -eq $case.Overall) "Worker exited $workerExit for overall result $($case.Overall) (BuildAgent $($case.BuildAgent))."
     }
+    $env:LOCALAPPDATA = $savedLocalAppData
 } finally {
     $resolved = [IO.Path]::GetFullPath($root)
     $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar

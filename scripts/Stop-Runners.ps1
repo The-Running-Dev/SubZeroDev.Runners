@@ -9,20 +9,24 @@ param([int] $TimeoutMinutes, [switch] $Force)
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
 if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
-$kept = 0
-foreach ($step in @(
-        @{ Label = 'Windows'; Run = { Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop' } }
-        @{ Label = 'Linux'; Run = { Stop-LinuxRunners -TimeoutMinutes $TimeoutMinutes -Force:$Force } }
-    )) {
-    try {
-        $result = & $step.Run
-        switch ($result.Outcome) {
-            'timeout' { $kept++; Write-Warning "$($step.Label) runner kept running. $($result.Retained)" }
-            'failed' { $kept++; Write-Warning "$($step.Label) runner not stopped, maintenance kept: $(@($result.Failures) -join ' ')" }
-            'forced' { Write-Output "$($step.Label) runner stopped without draining.$(if ($result.Cancelled) { " $($result.Cancelled)" })" }
-            default { Write-Output "$($step.Label) runner stopped." }
+# The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
+Enter-HostLock -Kind 'Stop-Runners'
+try {
+    $kept = 0
+    foreach ($step in @(
+            @{ Label = 'Windows'; Run = { Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop' } }
+            @{ Label = 'Linux'; Run = { Stop-LinuxRunners -TimeoutMinutes $TimeoutMinutes -Force:$Force } }
+        )) {
+        try {
+            $result = & $step.Run
+            switch ($result.Outcome) {
+                'timeout' { $kept++; Write-Warning "$($step.Label) runner kept running. $($result.Retained)" }
+                'failed' { $kept++; Write-Warning "$($step.Label) runner not stopped, maintenance kept: $(@($result.Failures) -join ' ')" }
+                'forced' { Write-Output "$($step.Label) runner stopped without draining.$(if ($result.Cancelled) { " $($result.Cancelled)" })" }
+                default { Write-Output "$($step.Label) runner stopped." }
+            }
         }
+        catch { $kept++; Write-Warning "$($step.Label) runner not stopped: $($_.Exception.Message)" }
     }
-    catch { $kept++; Write-Warning "$($step.Label) runner not stopped: $($_.Exception.Message)" }
-}
-exit [int]($kept -gt 0)
+    exit [int]($kept -gt 0)
+} finally { Exit-HostLock }

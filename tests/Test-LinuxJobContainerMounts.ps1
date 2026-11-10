@@ -17,6 +17,8 @@ $Config = Get-Content -Raw (Join-Path $Root 'config.json') | ConvertFrom-Json
 $LinuxRunner = Join-Path $Root 'runner installation with spaces'
 $DockerSidecar = if ($Config.linux.docker.mode -eq 'sidecar') { $Config.linux.docker.container }
 $Docker = 'Invoke-FixtureDocker'
+function Enter-HostLock { param($Kind, [switch] $Joinable) }
+function Exit-HostLock { }
 function Get-LinuxMaintenanceFile { Join-Path $Root 'maintenance.json' }
 function Remove-LinuxContainer { param($Name) [pscustomobject]@{ Result='removed' } }
 function Invoke-FixtureDocker {

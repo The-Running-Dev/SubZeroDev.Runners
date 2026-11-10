@@ -6,9 +6,13 @@
 # gone; only a verified result is recorded (legacy-migration.json), which is what setup verification looks for.
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\LegacyCleanup.ps1"
-$cleanup = Remove-LegacyStartupTasks
-foreach ($line in @($cleanup.Removed) + @($cleanup.Kept)) { Write-Output $line }
-foreach ($line in $cleanup.Failed) { [Console]::Error.WriteLine($line) }
-if (-not ($cleanup.Removed.Count -or $cleanup.Kept.Count -or $cleanup.Failed.Count)) { Write-Output 'No legacy startup tasks to remove.' }
-if (-not $cleanup.Failed.Count) { Save-LegacyMigration 'manual' @($cleanup.Removed) @($cleanup.Kept) }
-exit [int]($cleanup.Failed.Count -gt 0)
+# The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
+Enter-HostLock -Kind 'Remove-LegacyTasks'
+try {
+    $cleanup = Remove-LegacyStartupTasks
+    foreach ($line in @($cleanup.Removed) + @($cleanup.Kept)) { Write-Output $line }
+    foreach ($line in $cleanup.Failed) { [Console]::Error.WriteLine($line) }
+    if (-not ($cleanup.Removed.Count -or $cleanup.Kept.Count -or $cleanup.Failed.Count)) { Write-Output 'No legacy startup tasks to remove.' }
+    if (-not $cleanup.Failed.Count) { Save-LegacyMigration 'manual' @($cleanup.Removed) @($cleanup.Kept) }
+    exit [int]($cleanup.Failed.Count -gt 0)
+} finally { Exit-HostLock }

@@ -28,6 +28,14 @@ param(
     [ValidateScript({ $_ -cmatch '^[a-z0-9][a-z0-9-]{0,30}$' })] [string] $HostId
 )
 
+# Once the host manager owns this host (it wrote an inventory), slots are added and changed only by it: this loop would
+# install every instance up to -Count again, held or retired ones included.
+$hostInventory = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'SubZeroDev\Runners\host\inventory.json' }
+if ($hostInventory -and (Test-Path -LiteralPath $hostInventory)) {
+    [Console]::Error.WriteLine("Setup refused: this host is managed by scripts\Manage-RunnerHost.ps1 (its inventory is $hostInventory). Change the slot counts in runners.local.json and run Manage-RunnerHost.ps1 -Action Plan, then -Action Apply.")
+    exit 1
+}
+
 # Exit codes of this script: 0 done, 1 failed, 2 the person has to act first (restart Windows, sign out, start Docker Desktop...);
 # the steps needed are printed and saved in <InstallRoot>\setup-state.json, and rerunning the same command resumes.
 function Invoke-SetupNative {
