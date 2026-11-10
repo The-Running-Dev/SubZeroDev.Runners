@@ -1,10 +1,15 @@
 # Copy this template to .github/workflows/self-hosted-docs-smoke.yml in the verified consumer.
 # Also copy scripts/docs-smoke and tests/fixtures/self-hosted-docs from this same revision.
 name: Self-hosted docs smoke
+run-name: Self-hosted docs smoke ${{ inputs.correlation_id }}
 
 on:
   workflow_dispatch:
     inputs:
+      correlation_id:
+        description: Unique dispatch identifier (the host controller supplies this)
+        type: string
+        required: true
       expected_runner_name:
         description: Exact runner name from Get-SmokeEligibility.ps1
         type: string

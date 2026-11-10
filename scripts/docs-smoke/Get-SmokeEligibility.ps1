@@ -5,7 +5,10 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $RunnerRegistration,
-    [string] $Repository
+    [string] $Repository,
+    # A controller may need to reconcile an already dispatched run while the
+    # runner is busy/offline. This never reports that runner as available.
+    [switch] $AllowUnavailable
 )
 $ErrorActionPreference = 'Stop'
 function Get-GitHub([string] $Endpoint) {
@@ -69,4 +72,4 @@ if ($parts.Count -eq 1) {
     workflowPolicyVerified = $false
     checkedAt = [DateTime]::UtcNow.ToString('o')
 } | ConvertTo-Json -Depth 5
-if ($runner.status -ne 'online' -or $runner.busy) { throw 'Registration is eligible, but the runner is not currently online and idle.' }
+if (-not $AllowUnavailable -and ($runner.status -ne 'online' -or $runner.busy)) { throw 'Registration is eligible, but the runner is not currently online and idle.' }

@@ -42,6 +42,59 @@ request new credentials or change registrations.
 
 ## 1. Establish the eligible consumer on the existing host
 
+### Automated consumer preparation and acceptance
+
+In the **existing host clone that contains `linux/runner/.runner`**, use PowerShell 7
+and the host's signed-in GitHub CLI session:
+
+```powershell
+./scripts/docs-smoke/Invoke-Smoke.ps1 -Action Prepare
+```
+
+For repository registration, this discovers that exact repository. For organization
+registration, add `-Repository '<org>/<existing consumer>'`; it does not choose an
+arbitrary repository. Prepare verifies eligibility and opens a consumer PR adding
+only the six runtime files in one commit on a separate branch. An identical prior
+branch/PR is reused; existing differing files are refused. It does not merge or
+dispatch. Existing consumer push/PR automation can react to the branch/PR.
+
+Review and merge the **consumer PR** it prints, then run:
+
+```powershell
+./scripts/docs-smoke/Invoke-Smoke.ps1 -Action Run
+```
+
+Supply the same `-Repository` for organization registration. Run checks the exact
+installed files on the default branch and selected `-Ref` (default: default branch),
+probes the live nested mounts, dispatches with the actual runner name/ID, waits up
+to 45 minutes and downloads both site/result artifacts. It independently checks
+the site contents and live GitHub job records, then prints the run URL and local
+evidence directory. No registration, runner stop/recreation, merge or automatic
+trigger is introduced by this controller.
+
+If the live probe fails because existing containers still lack the mount, apply
+the reviewed recreation in section 2, then repeat Run. There is no image rebuild
+or mode change. Workflow allowlists still need to permit the pinned public actions
+and reusable workflow; successful scope validation alone does not prove that.
+
+The controller keeps a per-consumer/runner journal and lock under
+`%LOCALAPPDATA%\SubZeroDev\Runners\linux-docs-smoke\` (or `-StateDirectory`). On an
+interruption, timeout, missing GitHub response or artifact outage, repeat Run to
+resume the original dispatch rather than create another. A busy/offline runner
+can be reconciled, but a new dispatch requires it online and idle. Changed
+ref/commit/runner, another run attempt, duplicate correlations or unreadable state
+stop for reconciliation. Never delete an unresolved journal merely to retry:
+inspect the saved run/correlation first. The controller never cancels other jobs.
+An explicit non-timeout HTTP 4xx dispatch rejection clears its own intent because
+no run was created. Transport/timeouts and server errors retain it. Preparation
+can open a consumer PR while the registered runner is unavailable; a new run
+still requires online/idle status and a passing live probe. A ref update in the
+remaining check-to-dispatch interval can start a different revision, which the
+controller rejects when reading its exact head SHA; it does not claim atomic
+branch ownership or silently create tags that could trigger release automation.
+
+The detailed individual steps below remain useful for diagnostics.
+
 From the Runners clone containing the Linux registration and the reviewed fix:
 
 ```powershell
@@ -116,6 +169,7 @@ After confirming the exact consumer/ref and expected runner ID/name:
 
 ```powershell
 gh workflow run self-hosted-docs-smoke.yml --repo $before.repository --ref '<reviewed ref>' `
+  -f "correlation_id=$([guid]::NewGuid().ToString('N'))" `
   -f "expected_runner_name=$($before.runnerName)" -f "expected_runner_id=$($before.runnerId)"
 ```
 
@@ -144,6 +198,7 @@ Windows acceptance run do not count as Linux smoke acceptance.
 ```powershell
 ./tests/Test-LinuxJobContainerMounts.ps1
 ./scripts/docs-smoke/Test-Eligibility.ps1
+./tests/Test-LinuxDocsSmokeController.ps1
 node --test scripts/docs-smoke/smoke.test.mjs
 # External executable fixture checks require Linux:
 ./tests/Test-LinuxJobContainerProbe.ps1
