@@ -62,7 +62,7 @@ $flow = @{ Auth = 0; Clones = @(); Installs = @(); Verified = 0; Smoke = @() }
 function Confirm-RunnerSetupAuthentication { param($Scope, $NonInteractive, $WithSmoke) $flow.Auth++ }
 function Confirm-RunnerSetupRepositories { param($Scope, $Repositories) $flow.TargetRepositories = @($Repositories); $Repositories }
 function Sync-RunnerSetupInstance { param($Clone, $InstanceId, $SourceCommit, $GitHubUrl) $flow.Clones += $Clone }
-function Install-RunnerSetupInstance { param($Clone, $InstanceId, $GitHubUrl, $Labels) $flow.Installs += [pscustomobject]@{ Id = $InstanceId; Labels = $Labels } }
+function Install-RunnerSetupInstance { param($Clone, $InstanceId, $GitHubUrl, $Labels, $Name) $flow.Installs += [pscustomobject]@{ Id = $InstanceId; Labels = $Labels; Name = $Name } }
 function Get-RunnerSetupEvidence {
     param($Clone, $InstanceId)
     [pscustomobject]@{ Instance = $InstanceId; Name = "custom-$InstanceId"; AgentId = [int]$InstanceId.Substring(3); Workspace = "$Clone\work"; SupervisorPid = 100 + [int]$InstanceId.Substring(3) }
@@ -82,6 +82,17 @@ Assert (($flow.Installs.Id -join ',') -eq 'win01,win02,win03') 'Instance IDs wer
 $pair = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())"
 Assert ($flow.Installs[0].Labels -contains $pair -and $flow.Installs[1].Labels -contains $pair -and $flow.Installs[2].Labels -notcontains $pair) 'Smoke targeting did not select only the first two instances.'
 Assert (($flow.Smoke[0].Names -join ',') -eq 'custom-win01,custom-win02') 'Smoke ignored actual persisted identities.'
+Assert (-not ($flow.Installs | Where-Object Name)) 'Setup passed a runner name without -HostId; the installer default must stay unchanged.'
+Assert ($flow.Smoke[0].Label -eq $pair) 'Smoke without -HostId did not target the computer-name pair label.'
+# -HostId names the host labels and new runner names; the pair label still covers win01 and win02 only.
+$flow.Installs = @(); $flow.Smoke = @(); $flow.BuildAgent = @()
+Invoke-WindowsRunnerHostSetup @options -HostId 'beast-2' | Out-Null
+Assert (($flow.Installs | Where-Object { $_.Labels -contains 'subzerodev-host-beast-2' }).Count -eq 3) 'The hostId host label was not applied to every instance.'
+Assert ($flow.Installs[0].Labels -contains 'subzerodev-pair-beast-2' -and $flow.Installs[1].Labels -contains 'subzerodev-pair-beast-2' -and $flow.Installs[2].Labels -notcontains 'subzerodev-pair-beast-2') 'The hostId pair label did not select only the first two instances.'
+Assert (($flow.Installs.Name -join ',') -eq 'subzerodev.runner.windows.beast-2.win01,subzerodev.runner.windows.beast-2.win02,subzerodev.runner.windows.beast-2.win03') 'Runner names were not built from hostId.'
+Assert ($flow.Smoke[0].Label -eq 'subzerodev-pair-beast-2') 'Smoke did not target the hostId pair label.'
+Assert-Throws { Invoke-WindowsRunnerHostSetup @options -HostId 'Beast_2' } 'An invalid hostId was accepted.'
+$flow.Installs = @(); $flow.Smoke = @(); $flow.BuildAgent = @()
 $flow.BuildAgent = @()
 $skipped = Invoke-WindowsRunnerHostSetup @options -SkipBuildAgent $true | Select-Object -Last 1
 Assert ($flow.BuildAgent.Count -eq 0 -and $skipped.BuildAgentExitCode -eq 0) '-SkipBuildAgent still provisioned BuildAgent.'

@@ -1,7 +1,12 @@
 {
   "runnerVersion": "2.338.0",
+  "hostId": null,
   "github": {
-    "labels": ["subzerodev"]
+    "labels": ["subzerodev"],
+    "runnerGroup": {
+      "name": "Default",
+      "repositories": null
+    }
   },
   "buildAgent": {
     "enabled": true,
@@ -32,16 +37,22 @@
     "updater": {
       "version": null,
       "healthTimeout": "120s"
+    },
+    "estimate": {
+      "memory": "8g"
     }
   },
   "windows": {
     "directory": "windows",
+    "count": null,
+    "startAtSignIn": false,
     "name": "subzerodev.runner.windows",
     "labels": ["subzerodev-windows"],
     "workFolder": "_work"
   },
   "linux": {
     "directory": "linux/runner",
+    "count": null,
     "name": "subzerodev.runner.linux",
     "labels": ["subzerodev-linux"],
     "container": "subzerodev-runner-linux",

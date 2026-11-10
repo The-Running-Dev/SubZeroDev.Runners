@@ -33,6 +33,9 @@ jobs:
       - name: Exercise bootstrap under stock Windows PowerShell 5.1
         shell: powershell
         run: ./tests/Test-WindowsRunnerBootstrap.ps1
+      - name: Verify settings, slot names and runners.host.json layering
+        shell: pwsh
+        run: ./tests/Test-RunnerSettings.ps1
       - name: Exercise automated host setup with isolated fixtures
         shell: pwsh
         run: ./tests/Test-WindowsRunnerHostSetup.ps1

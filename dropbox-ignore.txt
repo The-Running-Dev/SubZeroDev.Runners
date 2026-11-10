@@ -22,6 +22,9 @@ windows/legacy-migration.json
 windows/legacy-migration.json.tmp
 windows/last-trim.txt
 
+# Host manager's settings for a Windows clone, generated per host
+runners.host.json
+
 # Linux runner, mounted at /runner in the container
 linux/runner/bin
 linux/runner/bin.*

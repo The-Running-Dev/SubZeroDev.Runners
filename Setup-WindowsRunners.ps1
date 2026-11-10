@@ -21,7 +21,10 @@ param(
     [string] $SmokeRepository,
     [switch] $NonInteractive,
     # Registers the runners only; leaves Docker Desktop, the build-agent tool and its image alone.
-    [switch] $SkipBuildAgent
+    [switch] $SkipBuildAgent,
+    # The host's name in new runner names and the host labels (subzerodev-host-<id>, subzerodev-pair-<id>). Omitted, the
+    # lower-cased computer name is used, as before. Runners already installed keep their names.
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{0,30}$')] [string] $HostId
 )
 
 # Exit codes of this script: 0 done, 1 failed, 2 the person has to act first (restart Windows, sign out, start Docker Desktop...);
@@ -152,7 +155,7 @@ function Sync-SetupCheckout {
 }
 
 function Start-WindowsRunnerSetup {
-    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string[]] $TargetRepositories, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive, [bool] $SkipBuildAgent, [string] $Repository)
+    param([int] $Count, [string] $InstallRoot, [string] $GitHubUrl, [string[]] $ExtraLabels, [string[]] $TargetRepositories, [string] $SourceRef, [string] $SmokeRepository, [bool] $NonInteractive, [bool] $SkipBuildAgent, [string] $Repository, [string] $HostId)
     $ErrorActionPreference = 'Stop'
     if ($Repository -and ($Count -lt 2 -or $SkipBuildAgent)) { throw '-Repository verification requires at least two runners and BuildAgent enabled.' }
     if ($Repository -and $Repository -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*/[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw '-Repository must be owner/repository.' }
@@ -176,8 +179,10 @@ function Start-WindowsRunnerSetup {
     # This file contains options only. Credentials stay in gh's store or the inherited environment.
     $optionsPath = Join-Path ([IO.Path]::GetTempPath()) ("windows-runner-setup-" + [guid]::NewGuid().ToString('N') + '.json')
     try {
-        @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); TargetRepositories = @($TargetRepositories); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive; SkipBuildAgent = $SkipBuildAgent; VerificationRepository = $Repository } |
-            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $optionsPath -Encoding UTF8
+        $options = @{ Count = $Count; InstallRoot = $InstallRoot; GitHubUrl = $GitHubUrl; ExtraLabels = @($ExtraLabels); TargetRepositories = @($TargetRepositories); SourceCommit = "$commit"; SmokeRepository = $SmokeRepository; NonInteractive = $NonInteractive; SkipBuildAgent = $SkipBuildAgent; VerificationRepository = $Repository }
+        # Only when given, so a -SourceRef from before -HostId existed still runs.
+        if ($HostId) { $options.HostId = $HostId }
+        $options | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $optionsPath -Encoding UTF8
         # The worker's exit 2 is not a failure: the runners are set up and the person has to act (it printed what).
         Invoke-SetupNative -File $tools.pwsh -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-OptionsPath', $optionsPath) -AllowExitCode 0, 2
         [int]$script:SetupNativeExit
@@ -187,5 +192,5 @@ function Start-WindowsRunnerSetup {
 }
 
 if ($Repository -and -not $PSBoundParameters.ContainsKey('GitHubUrl')) { $GitHubUrl = "https://github.com/$Repository" }
-exit ([int](Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -TargetRepositories $TargetRepositories -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive) -SkipBuildAgent ([bool]$SkipBuildAgent) -Repository $Repository | Select-Object -Last 1))
+exit ([int](Start-WindowsRunnerSetup -Count $Count -InstallRoot $InstallRoot -GitHubUrl $GitHubUrl -ExtraLabels $ExtraLabels -TargetRepositories $TargetRepositories -SourceRef $SourceRef -SmokeRepository $SmokeRepository -NonInteractive ([bool]$NonInteractive) -SkipBuildAgent ([bool]$SkipBuildAgent) -Repository $Repository -HostId $HostId | Select-Object -Last 1))
 

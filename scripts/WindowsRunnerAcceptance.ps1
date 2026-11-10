@@ -206,7 +206,8 @@ function Sync-RunnerAcceptanceFixture {
 }
 
 function Invoke-RunnerAcceptanceLifecycle {
-    param([string] $InstallRoot, [string] $Repository, [string] $SourceClone, [string[]] $Clones, [object[]] $Instances, [hashtable] $State, [string] $Mode, [string] $WorkflowBranch)
+    param([string] $InstallRoot, [string] $Repository, [string] $SourceClone, [string[]] $Clones, [object[]] $Instances, [hashtable] $State, [string] $Mode, [string] $WorkflowBranch, [string] $PairLabel)
+    if (-not $PairLabel) { $PairLabel = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())" }
     $correlation = [guid]::NewGuid().ToString('N')
     # Read-only lookups come first: a failure here cannot have dispatched anything, so it must not leave a journal that blocks setup.
     if (-not $WorkflowBranch) { $WorkflowBranch = (Invoke-RunnerSetupGh @('api', "repos/$Repository")).default_branch }
@@ -217,7 +218,7 @@ function Invoke-RunnerAcceptanceLifecycle {
     try {
         try {
             Send-RunnerSetupGh @('api', '-X', 'POST', "repos/$Repository/actions/workflows/windows-runner-lifecycle-acceptance.yml/dispatches") @{
-                ref = $WorkflowBranch; inputs = @{ correlation = $correlation; runner_label = "subzerodev-pair-$($env:COMPUTERNAME.ToLowerInvariant())"; hold_seconds = "$hold" }
+                ref = $WorkflowBranch; inputs = @{ correlation = $correlation; runner_label = $PairLabel; hold_seconds = "$hold" }
             } | Out-Null
         } catch {
             # A refused dispatch (HTTP 4xx) created no run, so keeping its journal would block every later setup with nothing to recover.
@@ -283,6 +284,8 @@ function Invoke-RunnerSetupAcceptance {
     param([string] $InstallRoot, [string] $Repository, [object[]] $Instances, [hashtable] $SetupOptions)
     $clones = @($Instances | ForEach-Object { Join-Path $InstallRoot $_.Instance })
     $source = $clones[0]
+    # Setup gives the first two runners the pair label of the host ID (-HostId), or of the computer name without one.
+    $pairLabel = "subzerodev-pair-$(if ($SetupOptions.HostId) { $SetupOptions.HostId } else { $env:COMPUTERNAME.ToLowerInvariant() })"
     $state = Get-RunnerAcceptanceState $InstallRoot
     $material = @($Repository, $SetupOptions.SourceCommit, $SetupOptions.GitHubUrl, $SetupOptions.Count, $clones, $Instances.Instance, $Instances.Name, $Instances.AgentId)
     foreach ($clone in $clones) { foreach ($file in 'runners.json', 'runners.local.json') { $material += (Get-FileHash -LiteralPath (Join-Path $clone $file) -Algorithm SHA256).Hash } }
@@ -307,11 +310,11 @@ function Invoke-RunnerSetupAcceptance {
                 Invoke-RunnerAcceptanceProcess (Join-Path $source 'tests\Invoke-WindowsHostAcceptance.ps1') @{ Clones = $clones; Stage = @('Build', 'Adoption', 'Rerun'); FixtureDirectory = $fixture; SetupCommand = $command; ReportPath = (Join-Path $InstallRoot 'acceptance\host.md') }
             }
             Builds {
-                Invoke-RunnerAcceptanceProcess (Join-Path $source 'tests\Invoke-WindowsRunnerBuildAgentAcceptance.ps1') @{ Repository = $Repository; InstallWorkflow = $true; ExpectedRunnerNames = @($Instances[0..1].Name); TimeoutMinutes = 60; ReportDirectory = (Join-Path $InstallRoot 'acceptance\builds'); StateDirectory = $InstallRoot }
+                Invoke-RunnerAcceptanceProcess (Join-Path $source 'tests\Invoke-WindowsRunnerBuildAgentAcceptance.ps1') @{ Repository = $Repository; InstallWorkflow = $true; RunnerLabel = $pairLabel; ExpectedRunnerNames = @($Instances[0..1].Name); TimeoutMinutes = 60; ReportDirectory = (Join-Path $InstallRoot 'acceptance\builds'); StateDirectory = $InstallRoot }
             }
             default {
                 $workflowBranch = Install-RunnerAcceptanceWorkflow $Repository $source
-                Invoke-RunnerAcceptanceLifecycle -InstallRoot $InstallRoot -Repository $Repository -SourceClone $source -Clones $clones -Instances $Instances -State $state -Mode $stage -WorkflowBranch $workflowBranch
+                Invoke-RunnerAcceptanceLifecycle -InstallRoot $InstallRoot -Repository $Repository -SourceClone $source -Clones $clones -Instances $Instances -State $state -Mode $stage -WorkflowBranch $workflowBranch -PairLabel $pairLabel
             }
         }
         $state.completed[$stage] = [DateTime]::UtcNow.ToString('o')
