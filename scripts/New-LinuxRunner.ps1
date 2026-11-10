@@ -22,6 +22,8 @@ param([switch] $Build, [switch] $Update, [int] $TimeoutMinutes, [switch] $Force)
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
 if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
+# The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
+Enter-HostLock -Kind 'New-LinuxRunner'
 $linux = $Config.linux
 $sidecar = $linux.docker
 if ($Update) {

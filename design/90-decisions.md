@@ -7,6 +7,31 @@ Append-only. Newest at the top. The rejected alternatives are the point â€” with
 
 ---
 
+### 2026-11-10 — S2: the host lock carries a join token in lock.json and is named per state directory
+Context: The handoff's lock is one machine-wide mutex; setup starts child scripts (Install, Manage-WindowsRunner) that must not deadlock on their parent, and tests need a lock of their own.
+Chosen: a joinable holder writes a token to lock.json and SZR_HOST_OPERATION; a child joins only when the token matches and the recorded pid is alive with the same start time. The mutex name hashes the lowercased state directory, so another LOCALAPPDATA is another lock. A non-joinable holder clears an inherited token and restores it on exit.
+Rejected: an environment flag alone (any process could claim it), and one global mutex name (tests would touch the real host lock).
+
+### 2026-11-10 — S2: the Windows runner of this checkout is slot windows-legacy, outside numbering
+Context: Adopt must record the pre-pool runner without it taking a number from the clones win01..winNN.
+Chosen: slotId `windows-legacy`; it is skipped by numbering and by drift, and Plan retires it only after win01 is online and with -Retire.
+Rejected: numbering it win00 or win01, which collides with the first clone.
+
+### 2026-11-10 — S2: Adopt refuses a readable inventory, and an unreadable one unless -ReplaceUnreadable
+Context: An inventory is the host's ownership record; Adopt over it could drop slots.
+Chosen: Adopt only creates the first inventory. With -ReplaceUnreadable the unreadable file is kept as inventory.json.unreadable-<stamp> beside the new one. Adopt records a registration only when its .runner agentId equals GitHub's id for that name, and writes nothing when GitHub or Docker cannot be read.
+Rejected: merging into an existing inventory, and treating an unreadable one as absent.
+
+### 2026-11-10 — S2: the setup worker takes the joinable lock and rechecks the inventory; the bootstrap's pre-worker steps run unlocked
+Context: Setup-WindowsRunners.ps1 (5.1) cannot load HostState.ps1 before the PowerShell 7 worker exists.
+Chosen: the 5.1 entry refuses early on an existing inventory; the worker re-checks under the lock. Prerequisite installs before the worker are not locked.
+Rejected: porting the lock to 5.1.
+
+### 2026-11-10 — S2: Plan exits 1 on unreadable state, 3 when there are changes; Status reports offline without a cause
+Context: Unknown must not read as absent, and an unverified explanation must not be presented as fact.
+Chosen: Plan: 0 no changes, 3 changes, 1 unreadable inventory or journal. Status carries only GitHub's status and busy. Compose drift is not applicable before S4. Init writes the checkout's runners.local.json. Manage-WindowsRunner locks every action except Status; the supervisor clears SZR_HOST_OPERATION.
+Rejected: a cause field on offline runners, and exiting 0 on unreadable state.
+
 ### 2026-11-10 â€” S1: housekeeping.minFreeGB stays 10 in runners.json; null means no free-space check
 Context: the handoff lists `housekeeping.minFreeGB` with default null, but runners.json already ships 10 and `scripts/Housekeeping.ps1` acts on it.
 Chosen: keep 10, accept null (no check) or any non-negative number, so today's housekeeping is unchanged.

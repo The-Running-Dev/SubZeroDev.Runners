@@ -16,6 +16,8 @@ param(
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
+# The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
+Enter-HostLock -Kind 'Register-Runners'
 $github = $Config.github
 if (-not $github.url) { throw 'Set github.url in runners.local.json, for example { "github": { "url": "https://github.com/<owner>/<repo>" } }.' }
 $scope = Get-RunnerScope $github.url

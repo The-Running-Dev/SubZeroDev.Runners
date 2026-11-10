@@ -2,6 +2,7 @@
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'RunnerConfig.ps1')
+. (Join-Path $PSScriptRoot 'HostState.ps1')
 $Config = Read-RunnerConfig -Root $Root
 $LocalConfig = Join-Path $Root 'runners.local.json'
 

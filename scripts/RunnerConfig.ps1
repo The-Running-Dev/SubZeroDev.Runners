@@ -240,6 +240,16 @@ function Test-HostSettingsDrift([Parameter(Mandatory)] [string] $Clone) {
     }
 }
 
+# The generated.hash a clone's runners.host.json records: what the host manager last wrote there. $null when the file is
+# absent, unreadable or has no generated block.
+function Get-HostSettingsRecord([Parameter(Mandatory)] [string] $Clone) {
+    $path = Join-Path $Clone 'runners.host.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { $settings = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json } catch { return $null }
+    if (-not (IsSettingsObject $settings) -or -not (IsSettingsObject $settings.generated)) { return $null }
+    $settings.generated.hash
+}
+
 # Writes a clone's runners.host.json, and only that file. A file that is unreadable or was edited by hand is kept unless
 # -Force: the edit may be someone's fix, and overwriting it would lose it silently.
 function Write-HostSettings([Parameter(Mandatory)] [string] $Clone, [Parameter(Mandatory)] $Settings, [switch] $Force) {
@@ -255,7 +265,8 @@ function Write-HostSettings([Parameter(Mandatory)] [string] $Clone, [Parameter(M
 # count retires the highest numbers. A new slot takes the next number above the highest ever recorded: numbers are never
 # reused. A null count keeps exactly the live slots.
 function Get-SlotNumbers([string] $Platform, $Count, $Inventory) {
-    $recorded = @($Inventory.slots | Where-Object { $_ -and $_.platform -eq $Platform })
+    # A slot without a trailing number (windows-legacy, the pre-pool single-clone install) is not numbered and never counts.
+    $recorded = @($Inventory.slots | Where-Object { $_ -and $_.platform -eq $Platform -and "$($_.slotId)" -match '\d+$' })
     $numberOf = { param($slot) [int]($slot.slotId -replace '^\D+', '') }
     $live = @($recorded | Where-Object { $_.state -in 'provisioning', 'active' } | ForEach-Object { & $numberOf $_ } | Sort-Object)
     if ($null -eq $Count) { return $live }

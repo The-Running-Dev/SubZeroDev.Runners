@@ -9,6 +9,8 @@ param([int] $TimeoutMinutes, [switch] $Force)
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
 if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
+# The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
+Enter-HostLock -Kind 'Stop-Runners'
 $kept = 0
 foreach ($step in @(
         @{ Label = 'Windows'; Run = { Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop' } }

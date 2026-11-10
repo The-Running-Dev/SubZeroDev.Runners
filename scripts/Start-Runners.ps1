@@ -5,6 +5,8 @@
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
+# The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
+Enter-HostLock -Kind 'Start-Runners'
 $diag = Join-Path $WindowsRunner '_diag'
 New-Item -ItemType Directory -Force $diag | Out-Null
 $log = Join-Path $diag ('Startup_{0:yyyyMMdd-HHmmss}-utc.log' -f [DateTime]::UtcNow)

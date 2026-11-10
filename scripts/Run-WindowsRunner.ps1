@@ -3,6 +3,8 @@
 # idles while maintenance.json exists, and records what it is doing in supervisor.json (read by Manage-WindowsRunner.ps1).
 $mutex = [Threading.Mutex]::new($false, $WindowsMutexName)
 if (-not $mutex.WaitOne(0)) { exit }
+# A supervisor started under a host operation outlives it: neither it nor its jobs may join that operation's lock.
+[Environment]::SetEnvironmentVariable($HostOperationVariable, $null)
 
 function Write-SupervisorStatus([hashtable] $Values) {
     foreach ($key in $Values.Keys) { $script:status[$key] = $Values[$key] }

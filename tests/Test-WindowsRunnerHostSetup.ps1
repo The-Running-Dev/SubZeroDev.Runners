@@ -169,7 +169,7 @@ try {
     # Real worker process: nothing but the host and GitHub operations is replaced; the process must exit non-zero with the text.
     $workerDir = Join-Path $failure 'worker\scripts'
     New-Item -ItemType Directory -Path $workerDir -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $repo 'scripts\Configure-WindowsRunners.ps1') -Destination $workerDir
+    foreach ($file in 'Configure-WindowsRunners.ps1', 'RunnerConfig.ps1', 'HostState.ps1') { Copy-Item -LiteralPath (Join-Path $repo "scripts\$file") -Destination $workerDir }
     @(
         ". '$functions'"
         'function Confirm-RunnerSetupAuthentication { param($Scope, $NonInteractive, $WithSmoke) }'
@@ -181,8 +181,12 @@ try {
     ) | Set-Content -LiteralPath (Join-Path $workerDir 'WindowsRunnerSetup.ps1')
     $optionsFile = Join-Path $failure 'options.json'
     $failOptions | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $optionsFile
-    $workerOutput = & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $workerDir 'Configure-WindowsRunners.ps1') -OptionsPath $optionsFile 2>&1 | Out-String
-    $workerExit = $LASTEXITCODE
+    $savedLocalAppData = $env:LOCALAPPDATA
+    $env:LOCALAPPDATA = Join-Path $failure 'LocalAppData'
+    try {
+        $workerOutput = & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $workerDir 'Configure-WindowsRunners.ps1') -OptionsPath $optionsFile 2>&1 | Out-String
+        $workerExit = $LASTEXITCODE
+    } finally { $env:LOCALAPPDATA = $savedLocalAppData }
     Assert ($workerExit -ne 0) "The worker exited $workerExit after a failed install. Output:`n$workerOutput"
     Assert ($workerOutput -match 'could not be removed or verified gone' -and $workerOutput -match 'taskschd\.msc') "The worker lost the failure text:`n$workerOutput"
     Assert ($workerOutput -notmatch 'Setup complete') 'The worker reported completion after a failed install.'

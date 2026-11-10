@@ -24,6 +24,9 @@ param(
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
 if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
+# Every action but Status changes the runner, so it takes the host lock for the whole run (or joins the operation that
+# started it). Status takes no lock.
+if ($Action -ne 'Status') { Enter-HostLock -Kind "Manage-WindowsRunner $Action" }
 
 function Write-Outcome($Result) {
     switch ($Result.Outcome) {

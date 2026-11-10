@@ -9,7 +9,7 @@ Acceptance: new settings with validation (`hostId`, `linux.count`, `windows.coun
 Out of scope: inventory, journal and lock; any host mutation.
 
 ## S2 — Host state: inventory, journal, lock, Init/Adopt, Plan/Status
-Status: todo
+Status: done
 Depends on: S1
 Acceptance: `scripts/HostState.ps1` and `scripts/Manage-RunnerHost.ps1` Init, Adopt, Plan and Status as in the handoff; Setup refuses when an inventory exists; the handoff's Host state, Plan is read-only and Runner group tests pass.
 Out of scope: Apply, Hold, Resume.
