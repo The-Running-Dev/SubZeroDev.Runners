@@ -18,49 +18,51 @@ param(
 . "$PSScriptRoot\Lifecycle.ps1"
 # The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
 Enter-HostLock -Kind 'Register-Runners'
-$github = $Config.github
-if (-not $github.url) { throw 'Set github.url in runners.local.json, for example { "github": { "url": "https://github.com/<owner>/<repo>" } }.' }
-$scope = Get-RunnerScope $github.url
+try {
+    $github = $Config.github
+    if (-not $github.url) { throw 'Set github.url in runners.local.json, for example { "github": { "url": "https://github.com/<owner>/<repo>" } }.' }
+    $scope = Get-RunnerScope $github.url
 
-$runners = @(
-    @{
-        Label = 'Windows'; Name = $Config.windows.name; Directory = $WindowsRunner; WorkFolder = $Config.windows.workFolder; WorkArgument = $null
-        Labels = @(@($github.labels) + @($Config.windows.labels) | Select-Object -Unique); Configure = $null
-        Stop = { $stopped = Stop-WindowsRunner -Reason 'registration change'; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained }; if ($stopped.Outcome -eq 'failed') { throw "The runner did not stop, so its registration was not changed. $(@($stopped.Failures) -join ' ')" } }
-    }
-    @{
-        # The Linux runner is configured from a throwaway container of the same image, on the same /runner mount.
-        Label = 'Linux'; Name = $Config.linux.name; Directory = $LinuxRunner; WorkFolder = $Config.linux.workFolder; WorkArgument = $Config.linux.workFolder
-        Labels = @(@($github.labels) + @($Config.linux.labels) | Select-Object -Unique)
-        Configure = { & $Docker run --rm --mount "type=bind,source=$LinuxRunner,target=/runner" $Config.linux.image configure @args }
-        Stop = { $stopped = Stop-LinuxRunners; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained }; if ($stopped.Outcome -eq 'failed') { throw "The runner did not stop, so its registration was not changed. $(@($stopped.Failures) -join ' ')" } }
-    }
-)
+    $runners = @(
+        @{
+            Label = 'Windows'; Name = $Config.windows.name; Directory = $WindowsRunner; WorkFolder = $Config.windows.workFolder; WorkArgument = $null
+            Labels = @(@($github.labels) + @($Config.windows.labels) | Select-Object -Unique); Configure = $null
+            Stop = { $stopped = Stop-WindowsRunner -Reason 'registration change'; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained }; if ($stopped.Outcome -eq 'failed') { throw "The runner did not stop, so its registration was not changed. $(@($stopped.Failures) -join ' ')" } }
+        }
+        @{
+            # The Linux runner is configured from a throwaway container of the same image, on the same /runner mount.
+            Label = 'Linux'; Name = $Config.linux.name; Directory = $LinuxRunner; WorkFolder = $Config.linux.workFolder; WorkArgument = $Config.linux.workFolder
+            Labels = @(@($github.labels) + @($Config.linux.labels) | Select-Object -Unique)
+            Configure = { & $Docker run --rm --mount "type=bind,source=$LinuxRunner,target=/runner" $Config.linux.image configure @args }
+            Stop = { $stopped = Stop-LinuxRunners; if ($stopped.Outcome -eq 'timeout') { throw $stopped.Retained }; if ($stopped.Outcome -eq 'failed') { throw "The runner did not stop, so its registration was not changed. $(@($stopped.Failures) -join ' ')" } }
+        }
+    )
 
-$failures = [Collections.Generic.List[string]]::new()
-$changed = $false
-foreach ($runner in $runners) {
-    try {
-        $registration = Get-LocalRegistration $runner.Directory
-        $plan = Get-RegistrationPlan `
-            -Local $registration -Remote (Get-GitHubRunner $scope $runner.Name) `
-            -LocalRemote $(if ($registration) { Get-GitHubRunner (Get-RunnerScope $registration.gitHubUrl) $registration.agentName }) `
-            -Name $runner.Name -GitHubUrl $github.url -Labels $runner.Labels -WorkFolder $runner.WorkFolder -RunnerDirectory $runner.Directory `
-            -HasCredentials (Test-Path -LiteralPath (Join-Path $runner.Directory '.credentials')) -Replace:$Replace
-        foreach ($reason in $plan.Reasons) { Write-Output "$($runner.Label): $reason" }
-        $parameters = @{ Plan = $plan; RunnerDirectory = $runner.Directory; Name = $runner.Name; GitHubUrl = $github.url; Replace = $Replace; BeforeChange = $runner.Stop }
-        if ($runner.Configure) { $parameters.Configure = $runner.Configure }
-        if ($runner.WorkArgument) { $parameters.WorkArgument = $runner.WorkArgument }
-        $applied = Invoke-RunnerRegistration @parameters
-        if ($applied.Result -notin 'unchanged', 'labels-added') { $changed = $true }
-        $problems = @(Confirm-RunnerRegistration -RunnerDirectory $runner.Directory -Name $runner.Name -GitHubUrl $github.url -Labels $runner.Labels -WorkFolder $runner.WorkFolder)
-        if ($problems) { throw "does not match the configuration:`n - $($problems -join "`n - ")" }
-        Write-Output "$($runner.Label): $($runner.Name) $($applied.Result)$(if ($applied.Evidence) { "; previous registration files in $($applied.Evidence)" })."
+    $failures = [Collections.Generic.List[string]]::new()
+    $changed = $false
+    foreach ($runner in $runners) {
+        try {
+            $registration = Get-LocalRegistration $runner.Directory
+            $plan = Get-RegistrationPlan `
+                -Local $registration -Remote (Get-GitHubRunner $scope $runner.Name) `
+                -LocalRemote $(if ($registration) { Get-GitHubRunner (Get-RunnerScope $registration.gitHubUrl) $registration.agentName }) `
+                -Name $runner.Name -GitHubUrl $github.url -Labels $runner.Labels -WorkFolder $runner.WorkFolder -RunnerDirectory $runner.Directory `
+                -HasCredentials (Test-Path -LiteralPath (Join-Path $runner.Directory '.credentials')) -Replace:$Replace
+            foreach ($reason in $plan.Reasons) { Write-Output "$($runner.Label): $reason" }
+            $parameters = @{ Plan = $plan; RunnerDirectory = $runner.Directory; Name = $runner.Name; GitHubUrl = $github.url; Replace = $Replace; BeforeChange = $runner.Stop }
+            if ($runner.Configure) { $parameters.Configure = $runner.Configure }
+            if ($runner.WorkArgument) { $parameters.WorkArgument = $runner.WorkArgument }
+            $applied = Invoke-RunnerRegistration @parameters
+            if ($applied.Result -notin 'unchanged', 'labels-added') { $changed = $true }
+            $problems = @(Confirm-RunnerRegistration -RunnerDirectory $runner.Directory -Name $runner.Name -GitHubUrl $github.url -Labels $runner.Labels -WorkFolder $runner.WorkFolder)
+            if ($problems) { throw "does not match the configuration:`n - $($problems -join "`n - ")" }
+            Write-Output "$($runner.Label): $($runner.Name) $($applied.Result)$(if ($applied.Evidence) { "; previous registration files in $($applied.Evidence)" })."
+        }
+        catch {
+            $failures.Add("$($runner.Label) runner $($runner.Name): $($_.Exception.Message)")
+            Write-Warning $failures[-1]
+        }
     }
-    catch {
-        $failures.Add("$($runner.Label) runner $($runner.Name): $($_.Exception.Message)")
-        Write-Warning $failures[-1]
-    }
-}
-if (-not $NoStart) { & (Join-Path $PSScriptRoot 'Start-Runners.ps1') }
-if ($failures.Count) { Write-Error "Registration incomplete:`n - $($failures -join "`n - ")" -ErrorAction Continue; exit 1 }
+    if (-not $NoStart) { & (Join-Path $PSScriptRoot 'Start-Runners.ps1') }
+    if ($failures.Count) { Write-Error "Registration incomplete:`n - $($failures -join "`n - ")" -ErrorAction Continue; exit 1 }
+} finally { Exit-HostLock }

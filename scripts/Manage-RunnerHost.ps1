@@ -6,7 +6,7 @@
 #           ID GitHub reports under that name, and the containers this repository's scripts create for it. It writes
 #           only the inventory.
 #   Plan    compares the settings with the inventory, Docker and GitHub and prints the changes Apply would make, with a
-#           planHash. Exit 0: no changes; 3: changes; 1: the state cannot be read.
+#           planHash. Exit 0: no changes; 3: changes, or a drift/blocked finding; 1: the state, or something the plan needs, cannot be read.
 #   Status  prints each slot as GitHub, Docker and the files on disk report it, with drift and any unfinished operation.
 #
 # Plan and Status take no lock and change nothing. Init and Adopt take the host lock.
@@ -155,9 +155,13 @@ function Get-SlotDrift($Slot) {
                 & $add 'container' 'drift' "The container named $($runner.name) is $($container.Id), not the recorded $($runner.id)."
             } elseif ($container.State -eq 'present' -and $image.State -eq 'present' -and $container.Image -ne $image.Id) {
                 & $add 'image' 'drift' "The container $($runner.name) runs image $($container.Image); $($Config.linux.image) is now $($image.Id)."
+            } elseif ($container.State -eq 'absent') {
+                & $add 'container' 'drift' "The container named $($runner.name) does not exist."
             } elseif ($image.State -eq 'absent') {
                 & $add 'image' 'drift' "The image $($Config.linux.image) is not built."
             }
+        } else {
+            & $add 'container' 'drift' "No runner container is recorded for $($Slot.slotId)."
         }
         # The compose config and file hashes start with compose (S4): no slot is composed before it.
     } elseif ($Slot.installPath) {
@@ -231,7 +235,8 @@ function Get-HostPlan {
         foreach ($item in $group.findings) { $plan.findings.Add($item) }
         foreach ($item in @(Get-UnownedRunners $inv $scope)) { $plan.findings.Add($item) }
     }
-    $plan.planHash = Get-PlanHash $plan.changes
+    # What the plan cannot tell apart from "nothing to do" is part of it: a finding that is unknown, drift or blocked.
+    $plan.planHash = Get-PlanHash ([ordered]@{ changes = $plan.changes; findings = @($plan.findings | Where-Object { $_.severity -in 'unknown', 'drift', 'blocked' }) })
     $plan
 }
 
@@ -332,7 +337,7 @@ function Invoke-Init {
 # { State = proven | unproven | none | unknown; Registration; Scope; Runner; Reason }.
 function Test-Registration([string] $Directory, [hashtable] $Listings) {
     $registration = $null
-    try { $registration = Get-LocalRegistration $Directory } catch { return [pscustomobject]@{ State = 'unproven'; Reason = "$Directory\.runner cannot be read." } }
+    try { $registration = Get-LocalRegistration $Directory } catch { return [pscustomobject]@{ State = 'unknown'; Reason = "$Directory\.runner cannot be read." } }
     if (-not $registration) { return [pscustomobject]@{ State = 'none' } }
     if (-not $registration.agentId -or -not $registration.agentName -or -not $registration.gitHubUrl) {
         return [pscustomobject]@{ State = 'unproven'; Registration = $registration; Reason = "$Directory\.runner has no agentId, agentName or gitHubUrl." }
@@ -373,7 +378,15 @@ function Invoke-Adopt {
             switch ($proof.State) {
                 'none' { return }
                 'unknown' { throw "Adopt stopped, nothing written: GitHub could not be read to prove $Directory ($($proof.Reason))." }
-                'unproven' { $unowned.Add([ordered]@{ directory = $Directory; runnerName = $proof.Registration.agentName; reason = $proof.Reason }); return }
+                'unproven' {
+                    $unowned.Add([ordered]@{ directory = $Directory; runnerName = $proof.Registration.agentName; reason = $proof.Reason })
+                    # The directory holds a registration this host does not own: its number is reserved, so Plan never proposes
+                    # a new slot on top of it. The slot is not live and nothing manages it.
+                    if ($SlotId -match '\d+$') {
+                        $slots.Add([ordered]@{ slotId = $SlotId; platform = $Platform; state = 'unowned'; legacy = $false; registrationDirectory = (Get-CanonicalPath $Directory); reason = $proof.Reason; adoptedUtc = $now })
+                    }
+                    return
+                }
             }
             $slot = [ordered]@{
                 slotId = $SlotId; platform = $Platform; state = 'active'; legacy = $false
@@ -430,26 +443,28 @@ function Invoke-Adopt {
             $slot.legacy = $true
         }
 
-        $scopes = @($slots | ForEach-Object scope | Select-Object -Unique)
+        $scopes = @($slots | Where-Object { $_.state -eq 'active' } | ForEach-Object scope | Select-Object -Unique)
         $scope = if ($scopes.Count -eq 1) { $scopes[0] } elseif ($Config.github.url) { Get-RunnerScope $Config.github.url }
         $record = [ordered]@{ generation = 1; hostId = $hostId; github = [ordered]@{ scope = $scope }; slots = $slots.ToArray() }
         if ($inventory.State -eq 'unreadable') {
             $kept = "$($inventory.Path).unreadable-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"
-            Move-Item -LiteralPath $inventory.Path -Destination $kept
+            Copy-Item -LiteralPath $inventory.Path -Destination $kept
             "Kept the unreadable inventory as $kept."
         }
         Write-HostInventory $record
-        "Adopted $($slots.Count) slot(s) into $(Get-HostInventoryPath): $(@($slots | ForEach-Object { "$($_.slotId) ($($_.runnerName), id $($_.runnerId))" }) -join '; ')."
+        "Adopted $(@($slots | Where-Object { $_.state -eq 'active' }).Count) slot(s) into $(Get-HostInventoryPath): $(@($slots | Where-Object { $_.state -eq 'active' } | ForEach-Object { "$($_.slotId) ($($_.runnerName), id $($_.runnerId))" }) -join '; ')."
         foreach ($item in $unowned) { "Not adopted: $($item.directory)$(if ($item.runnerName) { " ($($item.runnerName))" }): $($item.reason)" }
     }
 }
 
 # --- Output.
 
+function Test-PlanFindings($Plan) { [bool]@($Plan.findings | Where-Object { $_.severity -in 'unknown', 'drift', 'blocked' }).Count }
+
 function Write-PlanText($Plan) {
     "Host $($Plan.hostId): inventory $($Plan.inventory.state)$(if ($Plan.inventory.reason) { " ($($Plan.inventory.reason))" })"
     if ($Plan.operation.state -eq 'unreadable') { "Operation journal unreadable: $($Plan.operation.reason)" }
-    if (-not $Plan.changes.Count) { 'No changes.' }
+    if (-not $Plan.changes.Count) { if (Test-PlanFindings $Plan) { 'No changes to apply, but the findings below are not resolved.' } else { 'No changes.' } }
     foreach ($change in $Plan.changes) {
         $details = @($change.Keys | Where-Object { $_ -ne 'kind' } | ForEach-Object { "$_=$(@($change[$_]) -join ',')" }) -join ' '
         "  $($change.kind) $details"
@@ -487,7 +502,10 @@ try {
                 [Console]::Error.WriteLine('Plan cannot be computed: the host state cannot be read. Restore the file, or rebuild the inventory with -Action Adopt -ReplaceUnreadable.')
                 exit 1
             }
-            exit $(if ($plan.changes.Count) { 3 } else { 0 })
+            # 3: changes, or a drifted or blocked finding to act on; 1: something could not be read, so "no changes" is not known.
+            $unknown = @($plan.findings | Where-Object { $_.severity -eq 'unknown' }).Count
+            if ($unknown) { [Console]::Error.WriteLine("Plan is incomplete: $unknown item(s) could not be read.") }
+            exit $(if ($unknown) { 1 } elseif ($plan.changes.Count -or (Test-PlanFindings $plan)) { 3 } else { 0 })
         }
         'Status' {
             $status = Get-HostStatus

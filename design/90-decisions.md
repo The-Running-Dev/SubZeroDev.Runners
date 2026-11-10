@@ -46,3 +46,18 @@ Rejected: rewiring the legacy scripts onto slots now, which changes the running 
 Context: `Setup-WindowsRunners.ps1 -HostId` builds `subzerodev.runner.windows.<hostId>.winNN`, but an instance already installed has `windows.name` saved in its Install-owned runners.local.json.
 Chosen: pass the hostId name to Install only when no `windows.name` is saved; labels use hostId either way. Omitting -HostId passes no name and keeps the computer-name labels, exactly as before.
 Rejected: renaming on rerun, which re-registers a live runner outside the journaled per-instance path S6 adds.
+
+### 2026-11-10 — S2 review: entry scripts release the host lock in finally; Install and Remove-LegacyTasks take it
+Context: independent review found entry scripts that took the lock and returned without releasing it, so a later command in the same prompt waited on a dead holder; Install-WindowsRunner and Remove-LegacyTasks took no lock at all.
+Chosen: every entry script wraps its body in try/finally with Exit-HostLock (Manage-WindowsRunner only when it took one, never for Status); Install-WindowsRunner and Remove-LegacyTasks take the lock. A test runs an entry script from a prompt and checks the lock is gone.
+Rejected: relying on process exit to free the lock.
+
+### 2026-11-10 — S2 review: an unproven registration reserves its slot number as an `unowned` slot
+Context: Adopt dropped a registration whose .runner id GitHub did not confirm, so Plan could add a new slot on the same number and register over it.
+Chosen: Adopt records it with state `unowned`, no runnerId; Plan skips its number and never changes it. An unreadable .runner is `unknown`, and Adopt stops writing nothing. A failed write leaves the original unreadable inventory in place (Copy-Item, not Move-Item).
+Rejected: ignoring unproven registrations.
+
+### 2026-11-10 — S2 review: Plan exit 1 when anything it needs cannot be read; findings are in the planHash
+Context: a Plan over an unreadable Docker or clone said "No changes", and its hash equalled a clean host's.
+Chosen: any `unknown` finding exits 1 ("Plan is incomplete"); drift/blocked findings exit 3; the hash covers changes plus unknown/drift/blocked findings. A recorded Linux container that is gone, or a Linux slot with no container record, is container drift.
+Rejected: treating unread state as absent.

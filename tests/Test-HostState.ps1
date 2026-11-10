@@ -318,7 +318,7 @@ function Invoke-Manager($Fixture, [string[]] $Arguments) { Invoke-HostScript $Fi
 function Get-JsonOutput($Run) {
     $start = $Run.Output.IndexOf('{')
     Assert ($start -ge 0) "No JSON in the output (exit $($Run.ExitCode)):`n$($Run.Output)"
-    $Run.Output.Substring($start) | ConvertFrom-Json
+    $Run.Output.Substring($start, $Run.Output.LastIndexOf('}') - $start + 1) | ConvertFrom-Json
 }
 # A child started in the background with stdout and stderr in files (the lock cases watch it while it runs).
 function Start-HostScript($Fixture, [string] $Script, [string[]] $Arguments) {
@@ -343,7 +343,15 @@ function Wait-ChildText($Child, [string] $Pattern, [int] $Seconds = 60) {
 # The host the Adopt cases prove: the pre-pool Linux runner (id 7), a linux/runner-02 whose .runner says id 9 while GitHub
 # says 10 (not proven), this checkout's own Windows runner (windows-legacy, id 20), the clone win01 (id 30), and a clone
 # win02 that never registered.
+# A git checkout with one commit, so the clone-commit comparison of Plan can be read.
+function Initialize-GitCheckout([string] $Directory) {
+    New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    git -C $Directory init -q 2>&1 | Out-Null
+    git -C $Directory -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m fixture 2>&1 | Out-Null
+}
 function Initialize-AdoptableHost($Fixture) {
+    Initialize-GitCheckout $Fixture.Clone
+    Initialize-GitCheckout (Join-Path $Fixture.InstallRoot 'win01\windows')
     Write-Registration (Join-Path $Fixture.Clone 'linux\runner') 7 'subzerodev.runner.linux'
     Write-Registration (Join-Path $Fixture.Clone 'linux\runner-02') 9 'subzerodev.runner.linux.testhost.02'
     Write-Registration (Join-Path $Fixture.Clone 'windows') 20 'subzerodev.runner.windows'
@@ -378,7 +386,7 @@ Test-Case 'Adopt records only proven registrations, with full container IDs, usi
     Assert ($inventory.schema -eq $HostInventorySchema -and $inventory.version -eq 1 -and $inventory.generation -eq 1) 'The inventory has no schema, version 1 and generation 1.'
     Assert ($inventory.hostId -eq 'testhost' -and $inventory.github.scope -eq 'orgs/AbsoluteZeroDev') "The inventory has host $($inventory.hostId) and scope $($inventory.github.scope)."
     $ids = (@($inventory.slots | ForEach-Object { "$($_.slotId)=$($_.runnerId)" }) | Sort-Object) -join ','
-    Assert ($ids -eq 'linux-01=7,win01=30,windows-legacy=20') "Adopted slots are $ids."
+    Assert ($ids -eq 'linux-01=7,linux-02=,win01=30,windows-legacy=20') "Adopted slots are $ids."
     $linux = $inventory.slots | Where-Object slotId -EQ 'linux-01'
     Assert ($linux.legacy -eq $true -and $linux.runnerName -eq 'subzerodev.runner.linux') 'linux-01 is not the legacy pre-pool runner.'
     $runner = $linux.containers | Where-Object role -EQ 'runner'
@@ -388,7 +396,8 @@ Test-Case 'Adopt records only proven registrations, with full container IDs, usi
     $legacy = $inventory.slots | Where-Object slotId -EQ 'windows-legacy'
     Assert ($legacy.legacy -eq $true -and $legacy.installPath -eq (Get-CanonicalPath $fixture.Clone)) 'windows-legacy is not this checkout.'
     Assert ($run.Output -match 'Not adopted: .*runner-02 \(subzerodev\.runner\.linux\.testhost\.02\): .*agentId 9.*id 10') "The unproven runner-02 was not reported.`n$($run.Output)"
-    Assert (-not ($inventory.slots | Where-Object slotId -EQ 'linux-02')) 'An unproven registration was adopted.'
+    $reserved = $inventory.slots | Where-Object slotId -EQ 'linux-02'
+    Assert ($reserved.state -eq 'unowned' -and -not $reserved.runnerId) 'An unproven registration was adopted as a live slot, or its number was not reserved.'
     $calls = Get-Calls $fixture
     Assert ($calls.Count -gt 0 -and -not ($calls | Where-Object { $_ -match '(^| )-X ' })) "Adopt made a GitHub call that is not a read:`n$($calls -join "`n")"
     $docker = Get-Calls $fixture 'docker.log'
@@ -479,6 +488,58 @@ Test-Case 'Plan after Adopt: migrate linux-01, retire windows-legacy after win01
     $third = Get-JsonOutput (Invoke-Manager $fixture @('-Action', 'Plan', '-Json'))
     Assert ($third.changes | Where-Object { $_.kind -eq 'add' -and $_.slotId -eq 'win02' -and $_.runnerName -eq 'subzerodev.runner.windows.testhost.win02' }) 'windows.count 2 did not add win02.'
     Assert ($third.planHash -ne $plan.planHash) 'The planHash did not change with the plan.'
+}
+
+Test-Case 'Plan never adds a slot on top of an unproven registration: its number stays reserved' {
+    $fixture = New-HostFixture @{ linux = @{ count = 2 } }
+    Initialize-AdoptableHost $fixture
+    Assert ((Invoke-Manager $fixture @('-Action', 'Adopt')).ExitCode -eq 0) 'Adopt failed.'
+    $plan = Get-JsonOutput (Invoke-Manager $fixture @('-Action', 'Plan', '-Json'))
+    $added = @($plan.changes | Where-Object kind -EQ 'add' | Where-Object platform -EQ 'linux' | ForEach-Object slotId)
+    Assert ($added.Count -eq 1 -and $added[0] -eq 'linux-03') "Plan adds $($added -join ',') for linux; linux-02 holds an unproven registration."
+}
+
+Test-Case 'Adopt stops, writing nothing, when a .runner file cannot be read' {
+    $fixture = New-HostFixture
+    Initialize-AdoptableHost $fixture
+    Set-Content -LiteralPath (Join-Path $fixture.Clone 'linux\runner-02\.runner') -Value '{ not json'
+    $run = Invoke-Manager $fixture @('-Action', 'Adopt')
+    Assert ($run.ExitCode -eq 1 -and $run.Output -match 'Adopt stopped, nothing written') "Adopt exited $($run.ExitCode).`n$($run.Output)"
+    Assert (-not (Test-Path -LiteralPath (Join-Path $fixture.State 'inventory.json'))) 'Adopt wrote an inventory with an unreadable .runner.'
+}
+
+function Write-Linux02Inventory($Fixture) {
+    $slot = [ordered]@{
+        slotId = 'linux-02'; platform = 'linux'; state = 'active'; legacy = $false; runnerName = 'subzerodev.runner.linux.testhost.02'; runnerId = 9
+        scope = 'orgs/AbsoluteZeroDev'; registrationDirectory = (Join-Path $Fixture.Clone 'linux\runner-02')
+        containers = @([ordered]@{ role = 'runner'; id = (New-Hex 'runner-02'); name = 'subzerodev-runner-linux-02'; image = $imageId; labels = @{} })
+    }
+    Write-FixtureState $Fixture 'inventory.json' (ConvertTo-StateJson $HostInventorySchema @{ generation = 1; hostId = 'testhost'; github = @{ scope = 'orgs/AbsoluteZeroDev' }; slots = @($slot) })
+    Set-World $Fixture @{ runners = @((New-Runner 9 'subzerodev.runner.linux.testhost.02')); groups = @([ordered]@{ id = 1; name = 'Default'; visibility = 'all'; allows_public_repositories = $false }); groupRepos = @{}; groupRunners = @{ '1' = @(9) }; fail = $null }
+}
+
+Test-Case 'A recorded Linux container that is gone is drift, so Plan has a change' {
+    $fixture = New-HostFixture @{ windows = @{ count = 0 } }
+    Write-Linux02Inventory $fixture
+    Set-Docker $fixture @{ unavailable = $false; containers = @{}; images = @{ 'subzerodev-runner-linux:local' = $imageId } }
+    $run = Invoke-Manager $fixture @('-Action', 'Plan', '-Json')
+    $plan = Get-JsonOutput $run
+    $update = $plan.changes | Where-Object { $_.kind -eq 'update' -and $_.slotId -eq 'linux-02' }
+    Assert ($run.ExitCode -eq 3 -and $update -and @($update.reasons) -contains 'container') "A missing container is not drift (exit $($run.ExitCode)).`n$($run.Output)"
+}
+
+Test-Case 'Plan says so, exits 1 and has a different planHash when Docker cannot be read' {
+    $fixture = New-HostFixture @{ windows = @{ count = 0 } }
+    Write-Linux02Inventory $fixture
+    Set-Docker $fixture @{ unavailable = $false; containers = @{ 'subzerodev-runner-linux-02' = @{ Id = (New-Hex 'runner-02'); Image = $imageId; Labels = @{} } }; images = @{ 'subzerodev-runner-linux:local' = $imageId } }
+    $known = Invoke-Manager $fixture @('-Action', 'Plan', '-Json')
+    Assert ($known.ExitCode -eq 0) "Plan over a fully read host exited $($known.ExitCode).`n$($known.Output)"
+    Set-Docker $fixture @{ unavailable = $true; containers = @{}; images = @{} }
+    $run = Invoke-Manager $fixture @('-Action', 'Plan')
+    Assert ($run.ExitCode -eq 1 -and $run.Output -notmatch 'No changes\.' -and $run.Output -match '\[unknown\]') "Plan exited $($run.ExitCode) and said:`n$($run.Output)"
+    $hash = (Get-JsonOutput $known).planHash
+    $unknownHash = (Get-JsonOutput (Invoke-Manager $fixture @('-Action', 'Plan', '-Json'))).planHash
+    Assert ($hash -ne $unknownHash) 'An unread host and a clean host have the same planHash.'
 }
 
 Test-Case 'Plan with nothing to change exits 0; an unowned runner of this host is a finding, never a change' {
@@ -653,6 +714,21 @@ Test-Case 'Manage-WindowsRunner.ps1 -Action Status takes no lock' {
         Assert ((Get-ChildText $child) -notmatch 'Waiting for another runner operation') 'Status waited for the lock.'
         Assert ($child.Process.ExitCode -eq $unlocked.ExitCode) "Status exited $($child.Process.ExitCode) under the lock and $($unlocked.ExitCode) without it."
     } finally { Exit-HostLock }
+}
+
+Test-Case 'An entry script run from a prompt releases the host lock when it returns' {
+    $fixture = New-HostFixture
+    $output = Use-FixtureEnvironment $fixture {
+        $script = Join-Path $fixture.Clone 'scripts\Manage-WindowsRunner.ps1'
+        & $pwshPath -NoLogo -NoProfile -Command "& '$script' -Action Stop -Force *> `$null; 'held=' + [bool]`$global:SubZeroDevHostLock; 'file=' + (Test-Path -LiteralPath '$($fixture.State)\lock.json')" 2>&1 | ForEach-Object { "$_" }
+    }
+    $text = $output -join ' '
+    Assert ($text -match 'held=False' -and $text -match 'file=False') "The script left the lock held after it returned: $text"
+    $other = Use-FixtureEnvironment $fixture {
+        $name = Get-HostLockName
+        & $pwshPath -NoLogo -NoProfile -Command "`$m = [Threading.Mutex]::new(`$false, '$name'); try { `$ok = `$m.WaitOne(500) } catch { `$ok = `$true }; 'free=' + `$ok" 2>&1 | ForEach-Object { "$_" }
+    }
+    Assert (($other -join ' ') -match 'free=True') "Another process could not take the lock afterwards: $($other -join ' ')"
 }
 
 # --- setup refusal ------------------------------------------------------------------------------------------------------

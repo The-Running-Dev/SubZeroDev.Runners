@@ -73,8 +73,13 @@ $local.windows.workFolder = $WorkFolder
 # (or removes it when there was none), so a failed install leaves nothing changed.
 $localBefore = if (Test-Path -LiteralPath $localPath) { [IO.File]::ReadAllBytes($localPath) }
 $local | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $localPath
+$lockTaken = $false
 try {
     . "$PSScriptRoot\Common.ps1"
+    # The host lock for the rest of the run: waits for another runner operation on this host, or joins the one (setup) that
+    # started it.
+    Enter-HostLock -Kind 'Install-WindowsRunner'
+    $lockTaken = $true
 
     $parts = ([Uri]$GitHubUrl).AbsolutePath.Trim('/').Split('/')
     . "$PSScriptRoot\Registration.ps1"
@@ -92,6 +97,7 @@ try {
 }
 catch {
     $failure = $_
+    if ($lockTaken) { Exit-HostLock }
     try {
         if ($null -ne $localBefore) { [IO.File]::WriteAllBytes($localPath, $localBefore) }
         else { Remove-Item -LiteralPath $localPath -Force -ErrorAction Stop }
@@ -100,66 +106,68 @@ catch {
     throw $failure
 }
 foreach ($line in $migration.Lines) { Write-Output $line }
-function Get-RunnerStatus {
-    $runner = Get-GitHubRunner $scope $Name
-    if ($runner) { $runner.Status }
-}
-
-# Runner binaries, checked against the digest GitHub publishes for the release.
-New-Item -ItemType Directory -Force $WindowsRunner | Out-Null
-if (-not (Test-Path -LiteralPath (Join-Path $WindowsRunner 'config.cmd'))) {
-    $archive = Get-RunnerArchive -Platform win-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $Root 'downloads')
-    Expand-Archive -LiteralPath $archive.Path -DestinationPath $WindowsRunner -Force
-    Write-Output "Runner $($Config.runnerVersion) extracted to $WindowsRunner."
-}
-
-# The private SDK the supervisor puts first on PATH; actions/setup-dotnet adds other versions next to it.
-$dotnet = Join-Path $WindowsRunner '_tool\dotnet'
-if (-not (Test-Path -LiteralPath (Join-Path $dotnet 'dotnet.exe'))) {
-    & (Join-Path $PSScriptRoot 'dotnet-install.ps1') -Channel 10.0 -InstallDir $dotnet -NoPath
-    if (-not (Test-Path -LiteralPath (Join-Path $dotnet 'dotnet.exe'))) { throw "The .NET SDK was not installed in $dotnet." }
-}
-
-# Registration. What the merged configuration asks for is compared with the local registration and with GitHub; every
-# difference is applied or refused, never saved and ignored. Unchanged settings keep the name, id, labels and credentials.
-$labelList = @(@($Config.github.labels) + @($Config.windows.labels) | Select-Object -Unique)
-$labels = $labelList -join ','
-$registration = Get-LocalRegistration $WindowsRunner
-$plan = Get-RegistrationPlan `
-    -Local $registration `
-    -Remote (Get-GitHubRunner $scope $Name) `
-    -LocalRemote $(if ($registration) { Get-GitHubRunner (Get-RunnerScope $registration.gitHubUrl) $registration.agentName }) `
-    -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder -RunnerDirectory $WindowsRunner `
-    -HasCredentials (Test-Path -LiteralPath (Join-Path $WindowsRunner '.credentials')) -Replace:$Replace
-foreach ($reason in $plan.Reasons) { Write-Output "Registration: $reason" }
-$beforeChange = {
-    if (-not (Get-SupervisorProcess) -and -not (Get-WindowsRunnerListeners)) { return }
-    if ($registration -and $plan.LinkedId) {
-        # Wait for a running job rather than cancel it, and leave the registration alone if it outlasts the deadline.
-        $stopped = Stop-WindowsRunner -Reason 'registration change'
-        if ($stopped.Outcome -eq 'timeout') { throw "Registration not changed. $($stopped.Retained)" }
-        if ($stopped.Outcome -eq 'failed') { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
+try {
+    function Get-RunnerStatus {
+        $runner = Get-GitHubRunner $scope $Name
+        if ($runner) { $runner.Status }
     }
-    else {
-        $stopped = Stop-WindowsRunnerProcesses
-        if (-not $stopped.Stopped) { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
-    }
-}
-$applied = Invoke-RunnerRegistration -Plan $plan -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Replace:$Replace -BeforeChange $beforeChange
-switch ($applied.Result) {
-    'unchanged' { Write-Output "$Name is already registered from this clone with the requested settings." }
-    'labels-added' { Write-Output "$Name keeps its registration; added labels $($applied.Labels -join ', ')." }
-    default { Write-Output "$Name registered ($($applied.Result)); previous registration files saved in $($applied.Evidence)." }
-}
-$problems = @(Confirm-RunnerRegistration -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder)
-if ($problems) { throw "The registration does not match the configuration:`n - $($problems -join "`n - ")" }
-# Housekeeping is not scheduled any more; a failure here must not fail the install.
-try { & (Join-Path $PSScriptRoot 'Trim-RunnerLogs.ps1') | ForEach-Object { Write-Output $_ } }
-catch { Write-Warning "Log trim failed: $($_.Exception.Message)" }
 
-# Start-WindowsRunner confirms the supervisor of this clone initialized (or is already running); it throws when it did not,
-# which fails the install before any "online" claim.
-Start-WindowsRunner | ForEach-Object { Write-Output "Supervisor $_." }
-for ($attempt = 0; $attempt -lt 24 -and ($status = Get-RunnerStatus) -ne 'online'; $attempt++) { Start-Sleep -Seconds 5 }
-if ($status -ne 'online') { throw "$Name is $status after 2 minutes; see the newest Console_*.log in $(Join-Path $WindowsRunner '_diag')." }
-Write-Output "$Name is online with labels self-hosted, Windows, X64, $labels."
+    # Runner binaries, checked against the digest GitHub publishes for the release.
+    New-Item -ItemType Directory -Force $WindowsRunner | Out-Null
+    if (-not (Test-Path -LiteralPath (Join-Path $WindowsRunner 'config.cmd'))) {
+        $archive = Get-RunnerArchive -Platform win-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $Root 'downloads')
+        Expand-Archive -LiteralPath $archive.Path -DestinationPath $WindowsRunner -Force
+        Write-Output "Runner $($Config.runnerVersion) extracted to $WindowsRunner."
+    }
+
+    # The private SDK the supervisor puts first on PATH; actions/setup-dotnet adds other versions next to it.
+    $dotnet = Join-Path $WindowsRunner '_tool\dotnet'
+    if (-not (Test-Path -LiteralPath (Join-Path $dotnet 'dotnet.exe'))) {
+        & (Join-Path $PSScriptRoot 'dotnet-install.ps1') -Channel 10.0 -InstallDir $dotnet -NoPath
+        if (-not (Test-Path -LiteralPath (Join-Path $dotnet 'dotnet.exe'))) { throw "The .NET SDK was not installed in $dotnet." }
+    }
+
+    # Registration. What the merged configuration asks for is compared with the local registration and with GitHub; every
+    # difference is applied or refused, never saved and ignored. Unchanged settings keep the name, id, labels and credentials.
+    $labelList = @(@($Config.github.labels) + @($Config.windows.labels) | Select-Object -Unique)
+    $labels = $labelList -join ','
+    $registration = Get-LocalRegistration $WindowsRunner
+    $plan = Get-RegistrationPlan `
+        -Local $registration `
+        -Remote (Get-GitHubRunner $scope $Name) `
+        -LocalRemote $(if ($registration) { Get-GitHubRunner (Get-RunnerScope $registration.gitHubUrl) $registration.agentName }) `
+        -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder -RunnerDirectory $WindowsRunner `
+        -HasCredentials (Test-Path -LiteralPath (Join-Path $WindowsRunner '.credentials')) -Replace:$Replace
+    foreach ($reason in $plan.Reasons) { Write-Output "Registration: $reason" }
+    $beforeChange = {
+        if (-not (Get-SupervisorProcess) -and -not (Get-WindowsRunnerListeners)) { return }
+        if ($registration -and $plan.LinkedId) {
+            # Wait for a running job rather than cancel it, and leave the registration alone if it outlasts the deadline.
+            $stopped = Stop-WindowsRunner -Reason 'registration change'
+            if ($stopped.Outcome -eq 'timeout') { throw "Registration not changed. $($stopped.Retained)" }
+            if ($stopped.Outcome -eq 'failed') { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
+        }
+        else {
+            $stopped = Stop-WindowsRunnerProcesses
+            if (-not $stopped.Stopped) { throw "Registration not changed: the runner did not stop. $(@($stopped.Failures) -join ' ')" }
+        }
+    }
+    $applied = Invoke-RunnerRegistration -Plan $plan -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Replace:$Replace -BeforeChange $beforeChange
+    switch ($applied.Result) {
+        'unchanged' { Write-Output "$Name is already registered from this clone with the requested settings." }
+        'labels-added' { Write-Output "$Name keeps its registration; added labels $($applied.Labels -join ', ')." }
+        default { Write-Output "$Name registered ($($applied.Result)); previous registration files saved in $($applied.Evidence)." }
+    }
+    $problems = @(Confirm-RunnerRegistration -RunnerDirectory $WindowsRunner -Name $Name -GitHubUrl $GitHubUrl -Labels $labelList -WorkFolder $Config.windows.workFolder)
+    if ($problems) { throw "The registration does not match the configuration:`n - $($problems -join "`n - ")" }
+    # Housekeeping is not scheduled any more; a failure here must not fail the install.
+    try { & (Join-Path $PSScriptRoot 'Trim-RunnerLogs.ps1') | ForEach-Object { Write-Output $_ } }
+    catch { Write-Warning "Log trim failed: $($_.Exception.Message)" }
+
+    # Start-WindowsRunner confirms the supervisor of this clone initialized (or is already running); it throws when it did not,
+    # which fails the install before any "online" claim.
+    Start-WindowsRunner | ForEach-Object { Write-Output "Supervisor $_." }
+    for ($attempt = 0; $attempt -lt 24 -and ($status = Get-RunnerStatus) -ne 'online'; $attempt++) { Start-Sleep -Seconds 5 }
+    if ($status -ne 'online') { throw "$Name is $status after 2 minutes; see the newest Console_*.log in $(Join-Path $WindowsRunner '_diag')." }
+    Write-Output "$Name is online with labels self-hosted, Windows, X64, $labels."
+} finally { Exit-HostLock }
