@@ -233,7 +233,7 @@ try {
     Assert ($dockerfile -notmatch 'actions-runner-linux-x64-\d') 'The Dockerfile hard-codes a runner version.'
     Assert ((Get-Content -Raw -LiteralPath (Join-Path $repo '.dockerignore')) -match 'healthcheck\.sh') '.dockerignore hides the health check from the build context.'
     $newLinux = Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts\New-LinuxRunner.ps1')
-    Assert ($newLinux -match 'Test-BuildAgentUpdater' -and $newLinux -match 'RUNNER_SHA256=' -and $newLinux -match 'Enter-RunnerMaintenance') 'New-LinuxRunner.ps1 lost the updater gate, the verified archive or the drain.'
+    Assert ($newLinux -match 'Test-BuildAgentUpdater' -and $newLinux -match 'RUNNER_SHA256\s*=' -and $newLinux -match 'Enter-RunnerMaintenance') 'New-LinuxRunner.ps1 lost the updater gate, the verified archive or the drain.'
     Assert ($newLinux -notmatch 'update[^\r\n]*latest') 'New-LinuxRunner.ps1 updates to latest.'
     foreach ($file in Get-ChildItem (Join-Path $repo 'scripts') -Filter *.ps1 -File) {
         Assert ((Get-Content -Raw -LiteralPath $file.FullName) -notmatch 'actions-runner-(win|linux)-x64-\d+\.\d+\.\d+') "$($file.Name) hard-codes a runner archive version; runners.json runnerVersion is the only source."

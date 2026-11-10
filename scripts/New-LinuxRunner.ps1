@@ -3,31 +3,169 @@
 # With linux.docker.mode 'sidecar' it also (re)creates the docker:dind container that jobs use as their Docker daemon;
 # with 'dind' it removes that container and runs the runner privileged, with its own daemon.
 #
+# Two ways to create containers:
+#   - The pre-pool runner (slot 01 of a host with no host inventory, or one the inventory marks legacy) is created with
+#     `docker run`, exactly as before.
+#   - A slot the host inventory records (not legacy) is created from the generated linux\compose.local.yaml with
+#     `docker compose up -d --no-deps <services>`: only the named slot's containers are recreated, and the image is rebuilt
+#     whenever its build context (Dockerfile, scripts, runner archive, .dockerignore, build arguments) changed. -Slot linux-NN
+#     limits the run to one slot; without it every such slot is processed (the pre-pool runner is left alone: migrating it is
+#     Manage-RunnerHost's job).
+#
 # The running container is replaced only after the runner has been drained: it stops taking jobs (its custom labels are
 # withdrawn at GitHub), the script waits up to -TimeoutMinutes for a running job to finish, replaces the container, and
 # restores the labels. A job that outlasts the deadline is not cancelled: nothing is replaced and the report says so.
-# -Force replaces at once and cancels whatever is running.
+# -Force replaces at once and cancels whatever is running. A runner the owner held (Hold) stays held.
 #
 # -Update hands the replacement of the runner container to BuildAgent's updater (`build-agent update`: lock, update record,
 # health wait, restore of the original container). It is blocked until a published BuildAgent.Tool containing
 # Docker-BuildAgent PR #136 is configured (buildAgent.updater.version), because without it the updater refuses this runner.
 # The updater restores the container, not what the replacement wrote to the mounted /runner (binaries, credentials) or
 # volumes; the runner's own mounted self-update is unchanged. The Docker sidecar has no health check, so it is always
-# replaced by this script, never by the updater.
+# replaced by this script, never by the updater. -Update refuses a compose container: the updater would restore the old
+# container and fight the compose file.
 # Exit code 0: done. 1: blocked, kept (running job), or failed.
-param([switch] $Build, [switch] $Update, [int] $TimeoutMinutes, [switch] $Force)
+param([switch] $Build, [switch] $Update, [int] $TimeoutMinutes, [switch] $Force, [ValidatePattern('^linux-\d{2,}$')] [string] $Slot)
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\RunnerArchive.ps1"
 . "$PSScriptRoot\BuildAgent.ps1"
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
+. "$PSScriptRoot\Compose.ps1"
 if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
+
+# The image and the hash of what it was built from. $buildArguments are the Dockerfile's build arguments.
+function Get-LinuxImageBuild {
+    # One runner version for both platforms (runners.json runnerVersion), downloaded and checked against the SHA-256 GitHub
+    # publishes; the Dockerfile checks it again and fails when either build argument is missing.
+    $archive = Get-RunnerArchive -Platform linux-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $Root 'downloads') | Select-Object -Last 1
+    $buildArguments = [ordered]@{ BASE_IMAGE = $Config.linux.baseImage; RUNNER_VERSION = $Config.runnerVersion; RUNNER_SHA256 = $archive.Sha256 }
+    [pscustomobject]@{ Arguments = $buildArguments; Hash = (Get-LinuxBuildContextHash $Root $buildArguments) }
+}
+
+function Invoke-LinuxImageBuild($ImageBuild) {
+    $arguments = @('build', '--pull', '--label', "$ContextHashLabel=$($ImageBuild.Hash)")
+    foreach ($name in $ImageBuild.Arguments.Keys) { $arguments += @('--build-arg', "$name=$($ImageBuild.Arguments[$name])") }
+    & $Docker @arguments -f (Join-Path $Root 'linux\Dockerfile') -t $Config.linux.image $Root
+    if ($LASTEXITCODE) { throw 'Image build failed.' }
+}
+
+# Compose slots: the inventory's live, non-legacy Linux slots (optionally one). Anything else leaves the legacy path as it was.
+function Get-ComposeSlots {
+    $inventory = Read-HostInventory
+    if ($inventory.State -ne 'readable') { return @() }
+    $slots = @(Get-LinuxSlots $Config $inventory.Value | Where-Object { -not $_.Legacy -and -not $_.New })
+    if ($Slot) { $slots = @($slots | Where-Object { $_.SlotId -eq $Slot }) }
+    $slots
+}
+
+function Update-WorkFolder([string] $RunnerDirectory) {
+    # The work folder lives in the registration, so keep it in step with runners.json.
+    $registration = Join-Path $RunnerDirectory '.runner'
+    if (Test-Path -LiteralPath $registration) {
+        $settings = Get-Content -Raw $registration | ConvertFrom-Json
+        if ($settings.workFolder -ne $Config.linux.workFolder) {
+            $settings.workFolder = $Config.linux.workFolder
+            $settings | ConvertTo-Json | Set-Content $registration
+        }
+    }
+}
+
+function Wait-SidecarReady([string] $Container) {
+    # The daemon writes the client certificates on its first start; the runner needs them.
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        $probe = Invoke-Docker @('exec', $Container, 'docker', 'version')
+        if ($probe.ExitCode -eq 0) { return $true }
+        Start-Sleep -Seconds 2
+    }
+    $false
+}
+
+function Get-ContainerId([string] $Name) {
+    $inspect = Invoke-Docker @('container', 'inspect', '--format', '{{.Id}}', $Name)
+    if ($inspect.ExitCode -eq 0 -and $inspect.Output.Trim()) { $inspect.Output.Trim() }
+}
+
+# One compose slot: drain, recreate its containers (sidecar first, then the runner), record their IDs, end maintenance if
+# this run started it. Returns $true when the slot is done; $false (reported) when it was kept or failed.
+function Update-ComposeSlot($ComposeSlot, [string] $ComposeFile) {
+    $directory = [IO.Path]::GetFullPath((Join-Path $Root $ComposeSlot.Directory))
+    $stateFile = Join-Path $directory 'maintenance.json'
+    $registered = Test-Path -LiteralPath (Join-Path $directory '.runner')
+    $heldBefore = Get-HeldBefore $stateFile
+    $container = $ComposeSlot.Container
+    if ($heldBefore) {
+        # A drain that times out ends maintenance, which would drop the owner's hold; replacing a held slot is Apply's job.
+        [Console]::Error.WriteLine("$($ComposeSlot.SlotId) is held; resume it first (Manage-RunnerHost -Action Resume). Nothing was changed.")
+        return $false
+    }
+    if ($registered) {
+        $busy = { Invoke-Docker @('exec', $container, 'pgrep', '-f', 'Runner.Worker') | ForEach-Object { $_.ExitCode -eq 0 } }.GetNewClosure()
+        try { $drain = Enter-RunnerMaintenance -StateFile $stateFile -RunnerDirectory $directory -IsBusy $busy -Reason 'replace' -TimeoutMinutes $TimeoutMinutes -Force:$Force }
+        catch { [Console]::Error.WriteLine("$($ComposeSlot.SlotId) kept. $($_.Exception.Message)"); return $false }
+        if ($drain.Outcome -in 'timeout', 'failed') {
+            $why = if ($drain.Outcome -eq 'failed') { @($drain.Failures) -join ' ' } else { $drain.Retained }
+            [Console]::Error.WriteLine("$($ComposeSlot.SlotId) kept. $why")
+            return $false
+        }
+    }
+    try { return (Restart-ComposeSlotContainers $ComposeSlot $ComposeFile $directory $stateFile $registered $heldBefore $container) }
+    catch { [Console]::Error.WriteLine("$($ComposeSlot.SlotId): $($_.Exception.Message) The runner stays in maintenance$(if ($registered) { " (record $stateFile)" }); fix the cause and rerun this script."); return $false }
+}
+
+# Everything after the drain: any throw here is reported by the caller with the slot still in maintenance.
+function Restart-ComposeSlotContainers($ComposeSlot, [string] $ComposeFile, [string] $directory, [string] $stateFile, [bool] $registered, $heldBefore, [string] $container) {
+    Update-WorkFolder $directory
+    Initialize-LinuxSlotResources $Config $ComposeSlot
+    $sidecarName = $ComposeSlot.Services | Where-Object { $_ -like '*-docker' }
+    if ($sidecarName) {
+        $up = Invoke-LinuxCompose -File $ComposeFile -Verb up -Services @($sidecarName) -ForceRecreate
+        if ($up.ExitCode -ne 0) { [Console]::Error.WriteLine("$($ComposeSlot.SlotId): the Docker sidecar did not start; the runner stays in maintenance. $($up.Output)"); return $false }
+        if (-not (Wait-SidecarReady $ComposeSlot.DockerContainer)) { [Console]::Error.WriteLine("$($ComposeSlot.SlotId): the Docker sidecar did not become ready; the runner stays in maintenance."); return $false }
+    }
+    $up = Invoke-LinuxCompose -File $ComposeFile -Verb up -Services @($ComposeSlot.SlotId) -ForceRecreate
+    if ($up.ExitCode -ne 0) { [Console]::Error.WriteLine("$($ComposeSlot.SlotId): the container did not start; the runner stays in maintenance. $($up.Output)"); return $false }
+    # The containers this run created, by full ID, so a later step can tell them from anything that merely has the same name.
+    $inventory = Read-HostInventory
+    if ($inventory.State -eq 'readable') {
+        $record = Get-InventorySlot $inventory.Value $ComposeSlot.SlotId
+        if ($record) {
+            $ids = @([ordered]@{ role = 'runner'; name = $container; id = (Get-ContainerId $container) })
+            if ($ComposeSlot.DockerContainer) { $ids += [ordered]@{ role = 'docker'; name = $ComposeSlot.DockerContainer; id = (Get-ContainerId $ComposeSlot.DockerContainer) } }
+            $record | Add-Member -Force -NotePropertyName containers -NotePropertyValue $ids
+            $inventory.Value | Add-Member -Force -NotePropertyName generation -NotePropertyValue ([int]$inventory.Value.generation + 1)
+            Write-HostInventory $inventory.Value
+        }
+    }
+    if ($registered) {
+        try { Complete-OperationMaintenance @{ name = 'recreate'; heldBefore = $heldBefore } $stateFile $directory | Out-Null }
+        catch { [Console]::Error.WriteLine("$($ComposeSlot.SlotId) runs, but maintenance was not ended; the recovery record $stateFile is kept: $($_.Exception.Message)"); return $false }
+    }
+    $true
+}
+
 # The host lock for the whole run: waits for another runner operation on this host, or joins the one that started it.
 Enter-HostLock -Kind 'New-LinuxRunner'
 try {
     $linux = $Config.linux
     $sidecar = $linux.docker
+    $hostInventory = Read-HostInventory
+    if ($hostInventory.State -eq 'unreadable') {
+        [Console]::Error.WriteLine("The host inventory cannot be read ($($hostInventory.Reason)); refusing to guess which containers exist. Fix or restore $($hostInventory.Path) (Manage-RunnerHost -Action Status explains it).")
+        exit 1
+    }
+    $composeSlots = @(Get-ComposeSlots)
+    if ($Slot -and -not $composeSlots.Count) {
+        [Console]::Error.WriteLine("$Slot is not a compose slot in the host inventory (the pre-pool runner and unknown slots are not handled by -Slot).")
+        exit 1
+    }
     if ($Update) {
+        # Checked before anything else: a compose container is never handed to the updater.
+        $label = if ($composeSlots.Count) { [pscustomobject]@{ State = 'present'; Project = $ComposeProject } } else { Get-ContainerComposeProject $linux.container }
+        if ($label.State -eq 'unknown' -or $label.Project) {
+            [Console]::Error.WriteLine("-Update refused: $(if ($label.Project) { "the runner container is managed by compose project '$($label.Project)'" } else { 'whether the runner container is managed by compose could not be determined' }). The updater would restore the old container and fight the compose file; replace it with this script (without -Update) or Manage-RunnerHost -Action Update.")
+            exit 1
+        }
         $settings = Get-BuildAgentSettings $Config
         $updater = Test-BuildAgentUpdater $settings
         if (-not $updater.Available) {
@@ -35,12 +173,26 @@ try {
             exit 1
         }
     }
+
+    if ($composeSlots.Count) {
+        # Compose path. The image is checked against its build context on every run, and rebuilt when it is missing or stale.
+        $imageBuild = Get-LinuxImageBuild
+        $current = Get-LinuxImageContextHash $linux.image
+        if ($Build -or $current -ne $imageBuild.Hash) { Invoke-LinuxImageBuild $imageBuild }
+        $allSlots = @(Get-LinuxSlots $Config (Read-HostInventory).Value | Where-Object { -not $_.Legacy -and -not $_.New })
+        $composeFile = Get-LinuxComposeFilePath $Root
+        $yaml = ConvertTo-LinuxComposeYaml $Config $allSlots $Root $PSScriptRoot
+        if (-not (Test-Path -LiteralPath $composeFile) -or [IO.File]::ReadAllText($composeFile) -ne $yaml) { Write-FileAtomic $composeFile $yaml }
+        $failed = @()
+        foreach ($composeSlot in $composeSlots) { if (-not (Update-ComposeSlot $composeSlot $composeFile)) { $failed += $composeSlot.SlotId } }
+        if (-not $Slot) { Write-Output 'The pre-pool runner (if any) was not touched; Manage-RunnerHost migrates it.' }
+        if ($failed.Count) { [Console]::Error.WriteLine("Not done: $($failed -join ', ')."); exit 1 }
+        return
+    }
+
     if ($Build) {
-        # One runner version for both platforms (runners.json runnerVersion), downloaded and checked against the SHA-256 GitHub
-        # publishes; the Dockerfile checks it again and fails when either build argument is missing.
-        $archive = Get-RunnerArchive -Platform linux-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $Root 'downloads') | Select-Object -Last 1
-        & $Docker build --pull --build-arg "BASE_IMAGE=$($linux.baseImage)" --build-arg "RUNNER_VERSION=$($Config.runnerVersion)" --build-arg "RUNNER_SHA256=$($archive.Sha256)" -f (Join-Path $Root 'linux\Dockerfile') -t $linux.image $Root
-        if ($LASTEXITCODE) { throw 'Image build failed.' }
+        $imageBuild = Get-LinuxImageBuild
+        Invoke-LinuxImageBuild $imageBuild
     }
     $registered = Test-Path -LiteralPath (Join-Path $LinuxRunner '.runner')
     $maintenanceFile = Get-LinuxMaintenanceFile
@@ -69,15 +221,7 @@ try {
         Write-Output $meaning
         exit 0
     }
-    # The work folder lives in the registration, so keep it in step with runners.json.
-    $registration = Join-Path $LinuxRunner '.runner'
-    if (Test-Path -LiteralPath $registration) {
-        $settings = Get-Content -Raw $registration | ConvertFrom-Json
-        if ($settings.workFolder -ne $linux.workFolder) {
-            $settings.workFolder = $linux.workFolder
-            $settings | ConvertTo-Json | Set-Content $registration
-        }
-    }
+    Update-WorkFolder $LinuxRunner
     # Each removal is verified (the container is gone afterwards). A container that cannot be stopped or removed stops this script
     # with the runner still in maintenance; nothing after it (the sidecar, a new container) is touched.
     foreach ($name in @($linux.container) + @(if ($sidecar) { $sidecar.container })) {
@@ -87,63 +231,26 @@ try {
             exit 1
         }
     }
-    $dockerArgs = @()
+    # The same container specs the compose file is generated from, started the way they always were.
+    $specs = Get-LinuxContainerSpecs $Config (Get-LegacyLinuxSlot $Config) $LinuxRunner $PSScriptRoot
     if ($DockerSidecar) {
         & $Docker network inspect $sidecar.network 2>$null | Out-Null
         if ($LASTEXITCODE) {
             & $Docker network create $sidecar.network | Out-Null
             if ($LASTEXITCODE) { throw "Network $($sidecar.network) could not be created." }
         }
-        # The daemon is privileged; the runner is not. Images and build cache stay in dataVolume across jobs.
-        # The work folder is shared at the same path, so bind mounts of a checkout resolve inside the daemon too.
-        # Job containers also bind /runner/externals for JavaScript actions. The daemon must see the same runner tree,
-        # including the versioned directories targeted by runner self-update symlinks. Only the runner writes this tree.
-        # dind mounts a tmpfs over /tmp unless /tmp is already a mount, which would hide the work folder; this one keeps it visible.
-        & $Docker run -d --name $sidecar.container --restart unless-stopped --privileged --cpus $sidecar.cpus --memory $sidecar.memory `
-            --network $sidecar.network --network-alias docker `
-            -e DOCKER_TLS_CERTDIR=/certs `
-            --tmpfs /tmp `
-            --mount "type=volume,source=$($sidecar.dataVolume),target=/var/lib/docker" `
-            --mount "type=volume,source=$($sidecar.certsVolume),target=/certs" `
-            --mount "type=volume,source=$($sidecar.workVolume),target=$($linux.workFolder)" `
-            --mount "type=bind,source=$LinuxRunner,target=/runner,readonly" `
-            $sidecar.image | Out-Null
+        $sidecarArguments = ConvertTo-DockerRunArguments $specs.Sidecar
+        & $Docker @sidecarArguments | Out-Null
         if ($LASTEXITCODE) { throw 'Docker sidecar start failed.' }
-        # The daemon writes the client certificates on its first start; the runner needs them.
         for ($attempt = 0; $attempt -lt 30; $attempt++) {
             & $Docker exec $sidecar.container docker version 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) { break }
             Start-Sleep -Seconds 2
         }
         if ($LASTEXITCODE) { throw "Docker sidecar did not become ready: $(& $Docker logs --tail 20 $sidecar.container 2>&1)" }
-        $dockerArgs = @(
-            '--network', $sidecar.network
-            '-e', 'DOCKER_HOST=tcp://docker:2376', '-e', 'DOCKER_TLS_VERIFY=1', '-e', 'DOCKER_CERT_PATH=/certs/client'
-            # Ports that Testcontainers publishes live on the daemon's host, not on localhost.
-            '-e', 'TESTCONTAINERS_HOST_OVERRIDE=docker'
-            '--mount', "type=volume,source=$($sidecar.certsVolume),target=/certs,readonly"
-            '--mount', "type=volume,source=$($sidecar.workVolume),target=$($linux.workFolder)"
-        )
     }
-    elseif ($sidecar -and $sidecar.mode -eq 'dind') {
-        # The runner itself is privileged and runs dockerd; images and build cache stay in dindVolume across jobs.
-        # Its daemon listens on the default socket, so DOCKER_HOST stays unset and published ports are on localhost.
-        # The stop timeout leaves the entrypoint time to stop the daemon cleanly after the runner exits.
-        $dockerArgs = @(
-            '--privileged', '-e', 'BUILD_AGENT_DOCKERD=1', '--stop-timeout', '60'
-            '--mount', "type=volume,source=$($sidecar.dindVolume),target=/var/lib/docker"
-        )
-    }
-    & $Docker run -d --name $linux.container --restart unless-stopped --cpus $linux.cpus --memory $linux.memory `
-        -e RUNNER_WORK_FOLDER=$($linux.workFolder) `
-        -e ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/runner-hooks/Clear-LinuxWorkspace.sh `
-        -e RUNNER_CLEANUP_RETRIES=$($Config.housekeeping.retries) `
-        -e RUNNER_CLEANUP_DELAY=$($Config.housekeeping.retryDelaySeconds) `
-        --mount "type=bind,source=$LinuxRunner,target=/runner" `
-        --mount "type=volume,source=$($linux.cacheVolume),target=/cache" `
-        --mount "type=bind,source=$PSScriptRoot,target=/runner-hooks,readonly" `
-        @dockerArgs `
-        $linux.image
+    $runnerArguments = ConvertTo-DockerRunArguments $specs.Runner
+    & $Docker @runnerArguments
     if ($LASTEXITCODE) {
         # The old container is gone; the runner stays out of rotation (maintenance kept) until a start succeeds.
         [Console]::Error.WriteLine('Container start failed. The runner stays in maintenance (labels withdrawn); fix the cause and rerun this script.')

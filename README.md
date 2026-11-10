@@ -206,7 +206,13 @@ membership (which needs a sign-out and sign-in) as an action rather than changin
 
 ### Linux updates
 
-`New-LinuxRunner.ps1` recreates the container itself. `-Update` instead delegates to BuildAgent's updater
+`New-LinuxRunner.ps1` recreates the container itself. For a slot the host inventory records (not the pre-pool runner) it
+does so with `docker compose up -d --no-deps` against the generated `linux\compose.local.yaml` (never committed, never
+`down`): `-Slot linux-02` drains and recreates only that slot's sidecar and runner, and the image is rebuilt whenever its
+build context (Dockerfile, entrypoint, healthcheck, runner archive, `.dockerignore`, build arguments) changed. The pre-pool
+runner keeps its `docker run` path until it is migrated. `Get-LinuxRunnerStatus.ps1 [-Json]` reports per slot whether the
+container's image, the image's context hash and the compose definition are current; a check it cannot make says
+`not-checked`. `-Update` refuses a container compose manages. `-Update` instead delegates to BuildAgent's updater
 (`build-agent update`: locking, an update record, a wait for the replacement's own `HEALTHCHECK`, restore of the original
 container). Only a `BuildAgent.Tool` containing Docker-BuildAgent PR #136 can update this container (2.1.0 refuses a
 privileged container or one with CPU/memory limits), and that change has **no published artifact yet**, so

@@ -10,6 +10,7 @@ try {
     $scripts = Join-Path $temp 'scripts'
     New-Item -ItemType Directory -Path $scripts -Force | Out-Null
     Copy-Item (Join-Path $repo 'scripts/New-LinuxRunner.ps1') $scripts
+    Copy-Item (Join-Path $repo 'scripts/Compose.ps1') $scripts
     foreach ($file in 'RunnerArchive.ps1', 'BuildAgent.ps1', 'Registration.ps1', 'Lifecycle.ps1') { Set-Content (Join-Path $scripts $file) '# Fixture: no production module loaded.' }
     @'
 $Root = Split-Path $PSScriptRoot -Parent
@@ -19,6 +20,7 @@ $DockerSidecar = if ($Config.linux.docker.mode -eq 'sidecar') { $Config.linux.do
 $Docker = 'Invoke-FixtureDocker'
 function Enter-HostLock { param($Kind, [switch] $Joinable) }
 function Exit-HostLock { }
+function Read-HostInventory { [pscustomobject]@{ State = 'absent' } }
 function Get-LinuxMaintenanceFile { Join-Path $Root 'maintenance.json' }
 function Remove-LinuxContainer { param($Name) [pscustomobject]@{ Result='removed' } }
 function Invoke-FixtureDocker {

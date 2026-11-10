@@ -3,6 +3,9 @@
 # Only the shared settings, scripts and image sources are tracked.
 /windows/
 /linux/runner/
+/linux/runner-*/
+/linux/compose.local.yaml
+/linux/compose.local.yaml.tmp
 /downloads/
 *.log
 /runners.local.json

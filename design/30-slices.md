@@ -21,7 +21,7 @@ Acceptance: the entrypoint waits while held; `Manage-WindowsRunner -Action AutoS
 Out of scope: compose.
 
 ## S4 — Compose and the image context hash
-Status: todo
+Status: done
 Depends on: S3
 Acceptance: `linux/compose.local.yaml` generation, per-slot recreate with `--no-deps`, the context hash label, `-Update` refusing compose containers, `Get-LinuxRunnerStatus.ps1 -Json`; the handoff's Compose tests pass.
 Out of scope: legacy migration.
