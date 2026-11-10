@@ -94,15 +94,27 @@ function Update-ComposeSlot($ComposeSlot, [string] $ComposeFile) {
     $registered = Test-Path -LiteralPath (Join-Path $directory '.runner')
     $heldBefore = Get-HeldBefore $stateFile
     $container = $ComposeSlot.Container
+    if ($heldBefore) {
+        # A drain that times out ends maintenance, which would drop the owner's hold; replacing a held slot is Apply's job.
+        [Console]::Error.WriteLine("$($ComposeSlot.SlotId) is held; resume it first (Manage-RunnerHost -Action Resume). Nothing was changed.")
+        return $false
+    }
     if ($registered) {
         $busy = { Invoke-Docker @('exec', $container, 'pgrep', '-f', 'Runner.Worker') | ForEach-Object { $_.ExitCode -eq 0 } }.GetNewClosure()
-        $drain = Enter-RunnerMaintenance -StateFile $stateFile -RunnerDirectory $directory -IsBusy $busy -Reason 'replace' -TimeoutMinutes $TimeoutMinutes -Force:$Force
+        try { $drain = Enter-RunnerMaintenance -StateFile $stateFile -RunnerDirectory $directory -IsBusy $busy -Reason 'replace' -TimeoutMinutes $TimeoutMinutes -Force:$Force }
+        catch { [Console]::Error.WriteLine("$($ComposeSlot.SlotId) kept. $($_.Exception.Message)"); return $false }
         if ($drain.Outcome -in 'timeout', 'failed') {
             $why = if ($drain.Outcome -eq 'failed') { @($drain.Failures) -join ' ' } else { $drain.Retained }
             [Console]::Error.WriteLine("$($ComposeSlot.SlotId) kept. $why")
             return $false
         }
     }
+    try { return (Restart-ComposeSlotContainers $ComposeSlot $ComposeFile $directory $stateFile $registered $heldBefore $container) }
+    catch { [Console]::Error.WriteLine("$($ComposeSlot.SlotId): $($_.Exception.Message) The runner stays in maintenance$(if ($registered) { " (record $stateFile)" }); fix the cause and rerun this script."); return $false }
+}
+
+# Everything after the drain: any throw here is reported by the caller with the slot still in maintenance.
+function Restart-ComposeSlotContainers($ComposeSlot, [string] $ComposeFile, [string] $directory, [string] $stateFile, [bool] $registered, $heldBefore, [string] $container) {
     Update-WorkFolder $directory
     Initialize-LinuxSlotResources $Config $ComposeSlot
     $sidecarName = $ComposeSlot.Services | Where-Object { $_ -like '*-docker' }
@@ -137,6 +149,11 @@ Enter-HostLock -Kind 'New-LinuxRunner'
 try {
     $linux = $Config.linux
     $sidecar = $linux.docker
+    $hostInventory = Read-HostInventory
+    if ($hostInventory.State -eq 'unreadable') {
+        [Console]::Error.WriteLine("The host inventory cannot be read ($($hostInventory.Reason)); refusing to guess which containers exist. Fix or restore $($hostInventory.Path) (Manage-RunnerHost -Action Status explains it).")
+        exit 1
+    }
     $composeSlots = @(Get-ComposeSlots)
     if ($Slot -and -not $composeSlots.Count) {
         [Console]::Error.WriteLine("$Slot is not a compose slot in the host inventory (the pre-pool runner and unknown slots are not handled by -Slot).")

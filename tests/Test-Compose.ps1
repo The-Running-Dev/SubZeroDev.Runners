@@ -133,6 +133,10 @@ Test-Case 'The compose file says what the specs say: names, images, limits, moun
     }
 }
 
+Test-Case 'A dollar sign in a value is written $$ so compose does not interpolate it' {
+    Assert ((ConvertTo-YamlScalar 'C:\pa$th\$HOME') -ceq '"C:\\pa$$th\\$$HOME"') "Got: $(ConvertTo-YamlScalar 'C:\pa$th\$HOME')"
+}
+
 Test-Case 'Every compose call names its services and --no-deps; nothing can ask for `down`' {
     $script:calls = [Collections.Generic.List[object]]::new()
     function Invoke-Docker([string[]] $Arguments) { $script:calls.Add($Arguments); [pscustomobject]@{ ExitCode = 0; Output = '' } }
@@ -433,6 +437,35 @@ Test-Case 'A failed compose up leaves the runner in maintenance and says so' {
     Assert (Test-Path (Join-Path $f.Clone 'linux\runner-02\maintenance.json')) 'The maintenance record was dropped after a failed start.'
     Assert ((Get-Ups $f).Count -eq 1) 'The runner was started after its sidecar failed.'
     Assert (@(Get-CustomLabels $f 'subzerodev.runner.linux.testhost.02').Count -eq 0) 'The labels were restored although nothing started.'
+}
+
+Test-Case 'An unreadable inventory refuses every run: no guessing, no legacy path, no docker call' {
+    $f = New-Fixture
+    [IO.File]::WriteAllText((Join-Path $f.State 'inventory.json'), '{ not json')
+    foreach ($arguments in @(@(), @('-Slot', 'linux-02'), @('-Update'))) {
+        $run = Invoke-Script $f 'New-LinuxRunner.ps1' $arguments
+        Assert ($run.ExitCode -eq 1 -and $run.Output -match 'host inventory cannot be read') "Exit $($run.ExitCode) for '$($arguments -join ' ')': $($run.Output)"
+    }
+    Assert (-not (Get-Ups $f).Count -and -not (Get-Builds $f).Count -and -not @(Get-DockerLog $f | Where-Object { $_ -match '^(run|rm|stop|create) ' }).Count) "Docker was asked to change something: $((Get-DockerLog $f) -join ' | ')"
+}
+
+Test-Case 'A slot the owner held is not replaced, and stays held' {
+    $f = New-Fixture
+    $hold = Join-Path $f.Clone 'linux\runner-02\maintenance.json'
+    [IO.File]::WriteAllText($hold, '{"reason":"owner"}')
+    $run = Invoke-Script $f 'New-LinuxRunner.ps1' @('-Slot', 'linux-02')
+    Assert ($run.ExitCode -eq 1 -and $run.Output -match 'linux-02 is held; resume it first') "Exit $($run.ExitCode): $($run.Output)"
+    Assert ((Test-Path $hold) -and [IO.File]::ReadAllText($hold) -ceq '{"reason":"owner"}') 'The owner''s hold was changed.'
+    Assert (-not (Get-Ups $f).Count) 'A held slot was recreated.'
+}
+
+Test-Case 'A slot that cannot be drained is reported by name, and the other slots go on' {
+    $f = New-Fixture
+    [IO.File]::WriteAllText((Join-Path $f.Clone 'linux\runner-01\.runner'), '{ not json')
+    $run = Invoke-Script $f 'New-LinuxRunner.ps1'
+    Assert ($run.ExitCode -eq 1 -and $run.Output -match 'Not done: linux-01\b') "Exit $($run.ExitCode): $($run.Output)"
+    Assert ($run.Output -match 'linux-01 kept\.') "The failure was not reported per slot: $($run.Output)"
+    Assert ((Get-Ups $f | Where-Object { $_ -match 'linux-02' }).Count -eq 2) 'Slot 02 was not recreated after slot 01 failed.'
 }
 
 Test-Case 'Each of Dockerfile, entrypoint.sh, healthcheck.sh, the runner archive, .dockerignore and a build argument triggers a rebuild; nothing else does' {

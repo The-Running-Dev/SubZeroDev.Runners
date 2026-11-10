@@ -109,7 +109,8 @@ function ConvertTo-DockerRunArguments($Spec) {
 }
 
 # A double-quoted YAML scalar (a JSON string is one), so paths with spaces, colons and backslashes need no thought.
-function ConvertTo-YamlScalar($Value) { (ConvertTo-Json -InputObject ([string]$Value) -Compress) }
+# Compose interpolates $VAR in every value, so a literal dollar is written $$.
+function ConvertTo-YamlScalar($Value) { (ConvertTo-Json -InputObject ([string]$Value) -Compress).Replace('$', '$$') }
 
 function ConvertTo-ComposeService($Spec, [string] $ServiceName, [string] $NetworkKey) {
     $lines = [Collections.Generic.List[string]]::new()
