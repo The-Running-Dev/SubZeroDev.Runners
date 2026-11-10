@@ -66,6 +66,9 @@ jobs:
       - name: Verify host state, lock, Adopt, Plan and Status
         shell: pwsh
         run: ./tests/Test-HostState.ps1
+      - name: Verify automatic start keeps maintenance, Hold and Resume
+        shell: pwsh
+        run: ./tests/Test-Maintenance.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)

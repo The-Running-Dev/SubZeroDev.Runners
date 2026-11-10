@@ -9,9 +9,19 @@
 #           planHash. Exit 0: no changes; 3: changes, or a drift/blocked finding; 1: the state, or something the plan needs, cannot be read.
 #   Status  prints each slot as GitHub, Docker and the files on disk report it, with drift and any unfinished operation.
 #
-# Plan and Status take no lock and change nothing. Init and Adopt take the host lock.
+#   AutoStart  what runs at host start and at sign-in: waits for Docker (up to buildAgent.docker.readyTimeoutSeconds), then
+#           starts each active Windows slot's supervisor without ending maintenance. Linux slots need nothing: Docker restarts
+#           their containers and the entrypoint waits while a slot is held.
+#   Hold -Slot  drains the slot, stops it and keeps its maintenance record: nothing starts it again until Resume.
+#   Resume -Slot  the only owner path that ends the maintenance Hold began: restores labels, deletes the record, starts the
+#           one listener. Hold and Resume refuse a slot while an operation on it is unfinished (finish it with Apply).
+#   Startup applies windows.startAtSignIn: writes or removes the per-user Startup entry that runs AutoStart.
+#
+# Plan and Status take no lock and change nothing. Init, Adopt, AutoStart, Hold and Resume take the host lock.
 param(
-    [Parameter(Mandatory)] [ValidateSet('Init', 'Adopt', 'Plan', 'Status')] [string] $Action,
+    [Parameter(Mandatory)] [ValidateSet('Init', 'Adopt', 'Plan', 'Status', 'AutoStart', 'Hold', 'Resume', 'Startup')] [string] $Action,
+    # The slot Hold and Resume act on, e.g. linux-01 or win02.
+    [string] $Slot,
     [ValidateRange(0, 16)] [Nullable[int]] $LinuxCount,
     [ValidateRange(0, 16)] [Nullable[int]] $WindowsCount,
     [string] $HostId,
@@ -457,6 +467,144 @@ function Invoke-Adopt {
     }
 }
 
+# --- AutoStart, Hold, Resume and the sign-in entry.
+
+# Runs the instance's own Manage-WindowsRunner.ps1. The caller holds the host lock as joinable, so the child joins it.
+function Invoke-InstanceAction($Record, [string] $InstanceAction) {
+    $worker = Join-Path ([string]$Record.installPath) 'scripts\Manage-WindowsRunner.ps1'
+    if (-not (Test-Path -LiteralPath $worker)) { return [pscustomobject]@{ ExitCode = 1; Output = "$worker does not exist." } }
+    $output = & (Get-Process -Id $PID).Path -NoProfile -File $worker -Action $InstanceAction 2>&1 | ForEach-Object { "$_" }
+    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output -join "`n").Trim() }
+}
+
+# Waits for the Docker daemon: nothing to wait for when docker cannot be run at all, and a daemon that never answers is
+# reported, not fatal (Windows runners do not need it to start).
+function Wait-DockerReady {
+    $deadline = [DateTime]::UtcNow.AddSeconds([int]$Config.buildAgent.docker.readyTimeoutSeconds)
+    while ($true) {
+        $info = Invoke-Docker @('info')
+        if ($null -eq $info.ExitCode) { return 'docker is not installed here; not waiting for it.' }
+        if ($info.ExitCode -eq 0) { return $null }
+        $left = ($deadline - [DateTime]::UtcNow).TotalSeconds
+        if ($left -le 0) { return "Docker did not answer within $($Config.buildAgent.docker.readyTimeoutSeconds) seconds ($($info.Output))." }
+        Start-Sleep -Seconds ([Math]::Min(5, [Math]::Ceiling($left)))
+    }
+}
+
+# What runs at host start (and at sign-in): every active Windows slot's supervisor starts with maintenance left as it is.
+# Linux slots need nothing: Docker restarts their containers and the entrypoint waits while a slot is held.
+function Invoke-AutoStart {
+    $inventory = Read-HostInventory
+    if ($inventory.State -eq 'absent') { 'No host inventory: nothing is managed here, so nothing was started.'; return }
+    if ($inventory.State -eq 'unreadable') { throw "AutoStart refused: the host inventory $($inventory.Path) cannot be read because $($inventory.Reason)." }
+    $warning = Wait-DockerReady
+    if ($warning) { Write-Warning $warning }
+    Use-HostLock -Kind 'Manage-RunnerHost AutoStart' -Joinable -ScriptBlock {
+        $current = Assert-HostInventoryUsable 'Resume'
+        foreach ($slot in @($current.slots | Where-Object { $_ -and $_.platform -eq 'windows' -and $_.state -eq 'active' } | Sort-Object slotId)) {
+            $result = Invoke-InstanceAction $slot 'AutoStart'
+            if ($result.ExitCode -eq 0) { "$($slot.slotId): $($result.Output)" }
+            else { $script:HostFailed = $true; [Console]::Error.WriteLine("$($slot.slotId): AutoStart failed (exit $($result.ExitCode)): $($result.Output)") }
+        }
+    }
+}
+
+# The active slot -Slot names, or a refusal. A slot with an unfinished operation is refused (C4): Hold and Resume would
+# change what the operation recorded about who held it.
+function Get-ManagedSlot([string] $Verb) {
+    if (-not $Slot) { throw "$Verb needs -Slot <slotId> (see -Action Status)." }
+    $inv = Assert-HostInventoryUsable $Verb
+    $record = Get-InventorySlot $inv $Slot
+    if (-not $record) { throw "$Verb refused: the inventory has no slot '$Slot'." }
+    if ($record.state -ne 'active') { throw "$Verb refused: slot $Slot is $($record.state), not active." }
+    $operation = Read-HostOperation
+    if ($operation.State -eq 'readable') {
+        $op = $operation.Value
+        $pending = @($op.steps | Where-Object { $_.state -ne 'done' }) | Select-Object -First 1
+        throw "$Verb refused: the unfinished operation $($op.kind) ($($op.id)) on $($op.slotId), started $($op.startedUtc), next step $($pending.name), may change what is held. Finish it with Apply first."
+    }
+    $record
+}
+
+function Invoke-Hold {
+    Use-HostLock -Kind 'Manage-RunnerHost Hold' -Joinable -ScriptBlock {
+        $record = Get-ManagedSlot 'Hold'
+        if ($record.platform -eq 'windows') {
+            $result = Invoke-InstanceAction $record 'Maintenance'
+            if ($result.ExitCode -ne 0) { $script:HostFailed = $true; [Console]::Error.WriteLine("Hold failed for $Slot (exit $($result.ExitCode)): $($result.Output)"); return }
+            "${Slot}: $($result.Output)"
+            return
+        }
+        $dir = [string]$record.registrationDirectory
+        $file = Join-Path $dir 'maintenance.json'
+        $runner = @($record.containers | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+        $busy = { if ($runner) { & $Docker exec $runner.name pgrep -f Runner.Worker 2>$null | Out-Null; $LASTEXITCODE -eq 0 } else { $false } }.GetNewClosure()
+        $drain = Enter-RunnerMaintenance -StateFile $file -RunnerDirectory $dir -IsBusy $busy -Reason 'hold' -TimeoutMinutes $Config.lifecycle.drainTimeoutMinutes
+        if ($drain.Outcome -in 'timeout', 'failed') {
+            $script:HostFailed = $true
+            [Console]::Error.WriteLine("Hold did not complete for ${Slot}: $(if ($drain.Failures) { @($drain.Failures) -join ' ' } else { $drain.Retained })")
+            return
+        }
+        # The runner first, then the Docker sidecar its jobs depend on.
+        $containers = @(@($record.containers | Where-Object { $_.role -eq 'runner' }) + @($record.containers | Where-Object { $_.role -ne 'runner' }))
+        for ($i = 0; $i -lt $containers.Count; $i++) {
+            $stop = Stop-LinuxContainer $containers[$i].name
+            if ($stop.Result -eq 'failed') {
+                Set-MaintenanceState $file @{ phase = 'stop-failed'; failure = $stop.Detail; failedUtc = [DateTime]::UtcNow.ToString('o') }
+                $script:HostFailed = $true
+                [Console]::Error.WriteLine("Hold stopped short for ${Slot}: $($stop.Detail) The record is kept, so no listener starts.")
+                return
+            }
+        }
+        Set-MaintenanceState $file @{ phase = 'held' }
+        "${Slot}: held. The record $file stays until -Action Resume."
+    }
+}
+
+function Invoke-Resume {
+    Use-HostLock -Kind 'Manage-RunnerHost Resume' -Joinable -ScriptBlock {
+        $record = Get-ManagedSlot 'Resume'
+        if ($record.platform -eq 'windows') {
+            $result = Invoke-InstanceAction $record 'Start'
+            if ($result.ExitCode -ne 0) { $script:HostFailed = $true; [Console]::Error.WriteLine("Resume failed for $Slot (exit $($result.ExitCode)): $($result.Output)"); return }
+            "${Slot}: $($result.Output)"
+            return
+        }
+        $dir = [string]$record.registrationDirectory
+        $file = Join-Path $dir 'maintenance.json'
+        if (-not (Test-Path -LiteralPath $file)) { "${Slot}: not held; nothing to resume."; return }
+        # An unreadable record is refused with the existing message before anything starts.
+        if ((Get-MaintenanceState $file).phase -eq 'unreadable') { Exit-RunnerMaintenance $file $dir | Out-Null }
+        # Containers first (a held entrypoint waits), the record last: exactly one listener starts, when the record goes.
+        foreach ($container in @(@($record.containers | Where-Object { $_.role -ne 'runner' }) + @($record.containers | Where-Object { $_.role -eq 'runner' }))) {
+            if ((Get-ContainerState $container.name).State -eq 'stopped') {
+                $start = Invoke-Docker @('start', $container.name)
+                if ($start.ExitCode -ne 0) { $script:HostFailed = $true; [Console]::Error.WriteLine("Resume stopped for ${Slot}: docker start $($container.name) exited $($start.ExitCode): $($start.Output) The record is kept."); return }
+            }
+        }
+        Exit-RunnerMaintenance $file $dir | Out-Null
+        "${Slot}: resumed; the listener starts."
+    }
+}
+
+# windows.startAtSignIn: a per-user Startup entry that runs host AutoStart. No elevation, no scheduled task, no service.
+function Get-StartupEntryPath {
+    $directory = if ($env:SZR_STARTUP_DIRECTORY) { $env:SZR_STARTUP_DIRECTORY } else { [Environment]::GetFolderPath('Startup') }
+    Join-Path $directory 'SubZeroDev Runners AutoStart.cmd'
+}
+
+function Set-StartupEntry {
+    $path = Get-StartupEntryPath
+    if ($Config.windows.startAtSignIn -eq $true) {
+        $worker = Join-Path $PSScriptRoot 'Manage-RunnerHost.ps1'
+        New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
+        Write-FileAtomic $path "@echo off`r`nstart `"`" /min pwsh.exe -NoProfile -ExecutionPolicy Bypass -File `"$worker`" -Action AutoStart`r`n"
+        "windows.startAtSignIn is on: wrote $path."
+    }
+    elseif (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force; "windows.startAtSignIn is off: removed $path." }
+    else { "windows.startAtSignIn is off: no Startup entry exists." }
+}
+
 # --- Output.
 
 function Test-PlanFindings($Plan) { [bool]@($Plan.findings | Where-Object { $_.severity -in 'unknown', 'drift', 'blocked' }).Count }
@@ -495,6 +643,10 @@ try {
     switch ($Action) {
         'Init' { Invoke-Init; exit 0 }
         'Adopt' { Invoke-Adopt; exit 0 }
+        'AutoStart' { Invoke-AutoStart; exit [int]$script:HostFailed }
+        'Hold' { Invoke-Hold; exit [int]$script:HostFailed }
+        'Resume' { Invoke-Resume; exit [int]$script:HostFailed }
+        'Startup' { Set-StartupEntry; exit 0 }
         'Plan' {
             $plan = Get-HostPlan
             if ($Json) { ConvertTo-Json -InputObject $plan -Depth 20 } else { Write-PlanText $plan }

@@ -2,11 +2,14 @@
 # Per-instance control of the Windows runner, for Windows-only and combined installs alike. Run it from the instance's clone
 # (each instance has its own clone, supervisor and registration).
 #
-# Nothing starts the supervisor at sign-in and nothing restarts it if it dies: Start is the only way it starts. If Status
-# reports it down, run Start. The supervisor restarts the runner process itself, with backoff; that part is automatic.
+# Nothing restarts the supervisor if it dies. It starts by Start, by AutoStart, or at sign-in when windows.startAtSignIn is on
+# (the host manager runs AutoStart then). If Status reports it down, run Start. The supervisor restarts the runner process
+# itself, with backoff; that part is automatic.
 #
 #   Status       one line each for supervisor, listener, job and GitHub. Exit 0 only when all are healthy.
 #   Start        end maintenance and start the supervisor.
+#   AutoStart    start the supervisor and leave maintenance alone: a held runner idles with no listener. Does nothing when the
+#                supervisor already runs. What the Startup entry and Manage-RunnerHost.ps1 -Action AutoStart use.
 #   Stop         drain (stop taking jobs, wait for the running job), then stop. A job that outlasts -TimeoutMinutes is kept:
 #                nothing is stopped and the report says what is still running. -Force stops at once and cancels the job.
 #   Restart      Stop, then Start.
@@ -15,7 +18,7 @@
 # Draining withdraws the runner's custom labels at GitHub while it waits, and restores them afterwards. A job that targets
 # only the default labels (self-hosted, Windows, X64) is not held back; the workflows for these runners use the subzerodev-* labels.
 param(
-    [Parameter(Mandatory)] [ValidateSet('Status', 'Start', 'Stop', 'Restart', 'Maintenance')] [string] $Action,
+    [Parameter(Mandatory)] [ValidateSet('Status', 'Start', 'AutoStart', 'Stop', 'Restart', 'Maintenance')] [string] $Action,
     [int] $TimeoutMinutes,
     [switch] $Force,
     [switch] $Json
@@ -67,6 +70,10 @@ try {
             # Start-WindowsRunner returns only once the supervisor confirmed it initialized; otherwise it throws.
             try { Write-Output (Start-WindowsRunner) }
             catch { [Console]::Error.WriteLine("Start failed: $($_.Exception.Message)"); exit 1 }
+        }
+        'AutoStart' {
+            try { Write-Output (Start-WindowsRunner -KeepMaintenance) }
+            catch { [Console]::Error.WriteLine("AutoStart failed: $($_.Exception.Message)"); exit 1 }
         }
         'Stop' {
             $result = Stop-WindowsRunner -TimeoutMinutes $TimeoutMinutes -Force:$Force -Reason 'stop'

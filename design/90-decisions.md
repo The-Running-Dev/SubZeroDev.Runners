@@ -7,6 +7,10 @@ Append-only. Newest at the top. The rejected alternatives are the point â€” with
 
 ---
 
+### 2026-11-10 - S3: a maintenance record holds by existing, and only Resume (or Start) deletes it
+Context: Docker restarts and sign-in must never start a listener under a held runner, and an unreadable record must not read as "not held".
+Chosen: the Linux entrypoint and Windows AutoStart treat any maintenance.json as held without parsing it. Manage-WindowsRunner AutoStart starts the supervisor with Start-WindowsRunner -KeepMaintenance (it idles with no listener); Start still ends maintenance. Host Hold and Resume run under a joinable host lock, refuse a slot with an unfinished operation (C4) and point to Apply. Hold stops the runner container first, then the sidecar; Resume starts the sidecar first. Resume over an unreadable record refuses with the existing "kept" message before starting anything. windows.startAtSignIn is a per-user Startup .cmd running host AutoStart (no task, service or elevation).
+Rejected: parsing the record in the entrypoint (a corrupt file would start a listener), a scheduled task or service for sign-in (needs elevation, was removed in S1), and making AutoStart call Start (it would end maintenance on every reboot).
 ### 2026-11-10 — S2: the host lock carries a join token in lock.json and is named per state directory
 Context: The handoff's lock is one machine-wide mutex; setup starts child scripts (Install, Manage-WindowsRunner) that must not deadlock on their parent, and tests need a lock of their own.
 Chosen: a joinable holder writes a token to lock.json and SZR_HOST_OPERATION; a child joins only when the token matches and the recorded pid is alive with the same start time. The mutex name hashes the lowercased state directory, so another LOCALAPPDATA is another lock. A non-joinable holder clears an inherited token and restores it on exit.
