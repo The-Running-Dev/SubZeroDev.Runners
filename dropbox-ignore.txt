@@ -33,6 +33,8 @@ linux/runner/externals.*
 linux/runner/_work
 linux/runner/_diag
 linux/*.log
+linux/compose.local.yaml
+linux/compose.local.yaml.tmp
 
 # Installers, downloadable again from GitHub and Microsoft
 downloads/*.tar.gz

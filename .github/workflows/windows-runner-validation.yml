@@ -69,6 +69,9 @@ jobs:
       - name: Verify automatic start keeps maintenance, Hold and Resume
         shell: pwsh
         run: ./tests/Test-Maintenance.ps1
+      - name: Verify Linux runners as compose services, the image context hash and Linux status
+        shell: pwsh
+        run: ./tests/Test-Compose.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)
