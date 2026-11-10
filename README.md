@@ -294,10 +294,13 @@ time. Sharing them across repositories needs an organization; see Later.
 
 ## Docker in Linux jobs
 
-Job-container workflows such as ActionTemplates `docs.yml` need the runner installation
-visible to the Docker daemon as well as the workspace. Sidecar mode shares `/runner`
-read-only with that daemon so `/runner/externals` and self-update targets resolve.
-Existing containers need recreation to acquire this mount. See the
+Job-container workflows such as ActionTemplates `docs.yml` need the runner's Node
+runtimes visible to the Docker daemon as well as the workspace. Sidecar mode shares
+only a runtime projection at `/runner/externals`, read-only in the daemon. A job-start
+hook refreshes it from the current runner installation, including self-update targets;
+the registration tree is not mounted in the sidecar. See the
+[runtime isolation design and approval-gated activation](docs/linux-runtime-isolation.md).
+Existing containers need recreation to acquire these mounts and the hook. See the
 [Linux documentation smoke runbook](docs/linux-docs-smoke.md) for the opt-in nested
 container probe, eligible-consumer check and manual reusable-workflow acceptance.
 On the registered host, `scripts/docs-smoke/Invoke-Smoke.ps1 -Action Prepare`

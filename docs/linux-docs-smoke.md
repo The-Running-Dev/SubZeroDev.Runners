@@ -8,10 +8,13 @@ directory into that container to provide JavaScript runtimes, including the Node
 in its own filesystem. Sharing only the work volume leaves `/runner/externals`
 unavailable to that daemon.
 
-`New-LinuxRunner.ps1` now shares the same complete runner installation at
-`/runner` with the sidecar, read-only. The runner retains its writable mount.
-Sharing the complete tree preserves the versioned directories that `externals`
-can point to after self-update. The workspace volume and DinD mode are unchanged.
+`New-LinuxRunner.ps1` shares a Node-only projection at `/runner/externals` with
+the sidecar, read-only. The runner retains its writable installation mount;
+the sidecar no longer receives that installation or its `.credentials*` files.
+A job-start hook resolves the current `externals` directory (including versioned
+self-update symlinks) and copies only `node<version>[_alpine]/bin/node` into a
+separate volume before job containers start. See the [isolation design and
+approval-gated activation](linux-runtime-isolation.md). The workspace volume and DinD mode are unchanged.
 No BuildAgent release, image rebuild or shared ActionTemplates change is needed.
 Existing containers acquire the mount only when recreated.
 
@@ -27,7 +30,8 @@ It does not exercise the Windows `BuildAgent.Tool` wrapper.
 
 | Check | Evidence |
 | --- | --- |
-| Mount creation regression | Executes `New-LinuxRunner.ps1` with temporary modules/fake Docker; checks matching installation/workspace mounts, read-only sidecar, source with spaces, DinD behavior and failure handling |
+| Mount creation regression | Executes `New-LinuxRunner.ps1` with temporary modules/fake Docker; checks runtime-only sidecar, pre-job refresh hook, matching workspace mounts, unchanged synthetic registration, source with spaces, DinD behavior and failure handling |
+| Runtime projection regression | Synthetic files and namespace model; executes projected runtime fixtures across fresh/versioned layouts, checks registration exclusion, refresh, stale removal and link/invalid-source refusal; no Docker engine |
 | Evidence validator | Synthetic site archives and a local mock jobs API; validates success and rejection of missing artifacts, failed builds, unexpected runner identity and unavailable GitHub metadata |
 | Eligibility checker | Mocked repository/org inventories and group access; rejects cross-scope, mismatched/offline identities, restricted groups, archived consumers and disabled Actions |
 | Host probe controller | External fake Docker checks the actual nested-container arguments, symlink probe, failure propagation and cleanup on Linux |
@@ -115,7 +119,9 @@ must be resolved before calling a repository eligible for execution.
 
 ## 2. Recreate the affected containers and preserve registration identity
 
-Choose a period when the runner is idle. Check the local registration's work
+Obtain approval for the exact host actions before running this section or the
+probe in section 3; dispatch and consumer/default-branch changes require their own
+reviewed action. Choose a period when the runner is idle. Check the local registration's work
 folder already matches configuration, so recreation does not rewrite that field:
 
 ```powershell
@@ -144,8 +150,12 @@ This uses the running Linux runner's existing Docker connection, creates a uniqu
 temporary workspace marker and versioned-directory symlink, then starts one
 bounded nested container with the pinned BuildAgent image. It must read the same
 marker through both workspace and symlink binds and execute the real runner's
-`/__e/node24/bin/node`. The report records the resolved live externals target,
-image, mode, runtime and result. Only the uniquely named test container and
+`/__e/node24/bin/node`. In sidecar mode it first refreshes the projection through
+the real job-start script and mounts the daemon's `/runner` parent to check that
+only `externals` is present and no `.credentials*` path is exposed. It never reads
+registration credential contents. The workspace symlink is a fixture; it does
+not establish that a real runner update has happened. The report records the
+resolved live externals target, image, mode, runtime and result. Only the uniquely named test container and
 temporary workspace are cleaned; nothing prunes Docker or stops the runner.
 Each CLI command has a timeout, with cleanup attempted even on failure.
 
@@ -197,6 +207,7 @@ Windows acceptance run do not count as Linux smoke acceptance.
 
 ```powershell
 ./tests/Test-LinuxJobContainerMounts.ps1
+bash tests/Test-LinuxRunnerRuntimes.sh
 ./scripts/docs-smoke/Test-Eligibility.ps1
 ./tests/Test-LinuxDocsSmokeController.ps1
 node --test scripts/docs-smoke/smoke.test.mjs

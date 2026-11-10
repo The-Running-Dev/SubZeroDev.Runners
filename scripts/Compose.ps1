@@ -21,12 +21,12 @@ function Get-LegacyLinuxSlot($Config) {
         SlotId = 'linux-01'; Container = $Config.linux.container
         DockerContainer = $(if ($docker -and $docker.mode -eq 'sidecar') { $docker.container })
         Network = $(if ($docker -and $docker.mode -eq 'sidecar') { $docker.network })
-        Volumes = [pscustomobject]@{ Cache = $Config.linux.cacheVolume; DockerData = $docker.dataVolume; DockerCerts = $docker.certsVolume; Work = $docker.workVolume; Dind = $docker.dindVolume }
+        Volumes = [pscustomobject]@{ Cache = $Config.linux.cacheVolume; DockerData = $docker.dataVolume; DockerCerts = $docker.certsVolume; Work = $docker.workVolume; Dind = $docker.dindVolume; Runtimes = "$($Config.linux.container)-runtimes" }
     }
 }
 
-function New-Mount([string] $Type, [string] $Source, [string] $Target, [bool] $ReadOnly = $false) {
-    [pscustomobject]@{ Type = $Type; Source = $Source; Target = $Target; ReadOnly = $ReadOnly }
+function New-Mount([string] $Type, [string] $Source, [string] $Target, [bool] $ReadOnly = $false, [bool] $NoCopy = $false) {
+    [pscustomobject]@{ Type = $Type; Source = $Source; Target = $Target; ReadOnly = $ReadOnly; NoCopy = $NoCopy }
 }
 
 # The runner container's and the Docker sidecar's settings, as `docker run` has always set them (runner mounts, environment,
@@ -52,6 +52,9 @@ function Get-LinuxContainerSpecs($Config, $Slot, [string] $RunnerDirectory, [str
         Privileged = $false; StopTimeout = $null; Network = $null; NetworkAliases = @(); Tmpfs = @(); Labels = $Labels
     }
     if ($mode -eq 'sidecar') {
+        if ($volumes.Runtimes -in @($volumes.Cache, $volumes.DockerData, $volumes.DockerCerts, $volumes.Work, $volumes.Dind)) {
+            throw 'The derived runtime volume must not alias a runner state, cache or workspace volume.'
+        }
         # The daemon is privileged; the runner is not. Images and build cache stay in dataVolume across jobs. The work folder is
         # shared at the same path, so bind mounts of a checkout resolve inside the daemon too. Job containers also bind
         # /runner/externals for JavaScript actions: the daemon sees the same runner tree (read-only, only the runner writes it).
@@ -64,7 +67,7 @@ function Get-LinuxContainerSpecs($Config, $Slot, [string] $RunnerDirectory, [str
                 (New-Mount 'volume' $volumes.DockerData '/var/lib/docker')
                 (New-Mount 'volume' $volumes.DockerCerts '/certs')
                 (New-Mount 'volume' $volumes.Work $linux.workFolder)
-                (New-Mount 'bind' $RunnerDirectory '/runner' $true)
+                (New-Mount 'volume' $volumes.Runtimes '/runner/externals' $true $true)
             )
         }
         $runner.Network = $Slot.Network
@@ -72,6 +75,8 @@ function Get-LinuxContainerSpecs($Config, $Slot, [string] $RunnerDirectory, [str
         foreach ($entry in 'DOCKER_HOST=tcp://docker:2376', 'DOCKER_TLS_VERIFY=1', 'DOCKER_CERT_PATH=/certs/client', 'TESTCONTAINERS_HOST_OVERRIDE=docker') { $env.Add($entry) }
         $mounts.Add((New-Mount 'volume' $volumes.DockerCerts '/certs' $true))
         $mounts.Add((New-Mount 'volume' $volumes.Work $linux.workFolder))
+        $mounts.Add((New-Mount 'volume' $volumes.Runtimes '/runner-runtime' $false $true))
+        $env.Add('ACTIONS_RUNNER_HOOK_JOB_STARTED=/runner-hooks/Sync-LinuxRunnerRuntimes.sh')
     }
     elseif ($mode -eq 'dind') {
         # The runner itself is privileged and runs dockerd; images and build cache stay in dindVolume across jobs. Its daemon
@@ -88,7 +93,7 @@ function Get-LinuxContainerSpecs($Config, $Slot, [string] $RunnerDirectory, [str
 }
 
 function ConvertTo-MountArgument($Mount) {
-    "type=$($Mount.Type),source=$($Mount.Source),target=$($Mount.Target)$(if ($Mount.ReadOnly) { ',readonly' })"
+    "type=$($Mount.Type),source=$($Mount.Source),target=$($Mount.Target)$(if ($Mount.ReadOnly) { ',readonly' })$(if ($Mount.NoCopy) { ',volume-nocopy' })"
 }
 
 # `docker run -d ...` arguments for one spec (the legacy, pre-compose way to start a container).
@@ -130,6 +135,7 @@ function ConvertTo-ComposeService($Spec, [string] $ServiceName, [string] $Networ
         $lines.Add("        source: $(ConvertTo-YamlScalar $mount.Source)")
         $lines.Add("        target: $(ConvertTo-YamlScalar $mount.Target)")
         if ($mount.ReadOnly) { $lines.Add('        read_only: true') }
+        if ($mount.NoCopy) { $lines.Add('        volume:'); $lines.Add('          nocopy: true') }
     }
     if ($Spec.Tmpfs.Count) { $lines.Add('    tmpfs:'); foreach ($path in $Spec.Tmpfs) { $lines.Add("      - $(ConvertTo-YamlScalar $path)") } }
     if ($Spec.Network) {
@@ -192,7 +198,7 @@ function Invoke-LinuxCompose([Parameter(Mandatory)] [string] $File, [Parameter(M
 function Initialize-LinuxSlotResources($Config, $Slot) {
     $volumes = @($Slot.Volumes.Cache)
     if ($Config.linux.docker.mode -eq 'sidecar') {
-        $volumes += @($Slot.Volumes.DockerData, $Slot.Volumes.DockerCerts, $Slot.Volumes.Work)
+        $volumes += @($Slot.Volumes.DockerData, $Slot.Volumes.DockerCerts, $Slot.Volumes.Work, $Slot.Volumes.Runtimes)
         $exists = Invoke-Docker @('network', 'inspect', $Slot.Network)
         if ($exists.ExitCode -ne 0) {
             $created = Invoke-Docker @('network', 'create', $Slot.Network)
