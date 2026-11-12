@@ -1,0 +1,31 @@
+# Answers @claude in issues and pull requests, through the shared claude-mention.yml in
+# The-Running-Dev/.github. Needs the Claude GitHub App (https://github.com/apps/claude) on this
+# repository and a CLAUDE_CODE_OAUTH_TOKEN repository secret.
+#
+# The shared workflow ignores events that do not mention @claude and, by default, events raised
+# by bots. It runs on a GitHub-hosted runner, never on the self-hosted subzerodev-* runners.
+name: Claude
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+permissions: {}
+
+jobs:
+  claude:
+    uses: The-Running-Dev/.github/.github/workflows/claude-mention.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
