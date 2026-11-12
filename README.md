@@ -8,6 +8,31 @@ still owns triggers, logs, checks, secrets and artifacts; the jobs execute here.
 | `subzerodev.runner.windows` | Native process under the signed-in user, kept alive by `scripts\Run-WindowsRunner.ps1` | `subzerodev-windows` or `[self-hosted, subzerodev, Windows]` |
 | `subzerodev.runner.linux` | Docker container `subzerodev-runner-linux` on [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent) (Debian 12, .NET 8/9/10, Node 22, PowerShell, Docker CLI and Engine, GitVersion, NUKE) plus wasm-tools, CMake and Ninja | `subzerodev-linux` or `[self-hosted, subzerodev, Linux]` |
 
+Each runner takes one job at a time, so one Windows and one Linux job can run together.
+Neither needs inbound ports.
+
+## Prerequisites
+
+| Need | For | Notes |
+| --- | --- | --- |
+| Windows 10/11 x64, a normal (non-elevated) user | Everything | The runners stay unelevated; only package installers prompt for elevation |
+| PowerShell 7.2+, Git, GitHub CLI (`gh`) | Every script | [One-command setup](#one-command-windows-setup) installs what is missing |
+| `gh` signed in as a repository or organization admin | Registration, drains, verification | Organization runners need `gh auth refresh --hostname github.com --scopes admin:org` |
+| Docker Desktop in Linux-container mode | The Linux runner and BuildAgent builds | Setup installs it; skip with `-SkipBuildAgent`. The Linux runner needs no extra tools |
+| A GitHub repository or organization to register to | Registration | A private repository, or an organization whose runner group allows private repositories only |
+
+## Documentation
+
+The [documentation index](docs/README.md) lists every guide. The ones to know:
+
+- [Host management](docs/host-management.md): the host manager, Hold and Resume, start at sign-in, Linux slots as compose services.
+- [Windows runners](docs/windows-two-runners.md): setup, verification, operation and acceptance.
+- [Troubleshooting](docs/troubleshooting.md): symptom, cause, fix.
+- [Testing](docs/testing.md): running the suites locally, and what CI runs.
+- [Linux updater](docs/build-agent-2.2.0-updater.md), [runtime isolation](docs/linux-runtime-isolation.md) and [docs smoke](docs/linux-docs-smoke.md): the Linux runner's internals and acceptance.
+
+## Settings
+
 Names and labels come from `runners.json` (`windows.name`, `linux.name`, `github.labels`); the
 GitHub URL they are registered to comes from `runners.local.json`, which git ignores:
 
@@ -28,9 +53,7 @@ workspace, a non-numeric `lifecycle`/`housekeeping` value. Each runner gets `git
 | `buildAgent` | The pinned `BuildAgent.Tool` (`tool.version`, installed once per host in `tool.directory`), the net8.0 runtime it runs on (`dotnetRuntime`), the image by digest (`image`, passed to every build as `BUILD_AGENT_IMAGE`), the Docker connection (`docker.host`, `null` = Docker Desktop's default), per-instance build workspaces (`paths`), cache retention (`cache`) and the optional updater (`updater.version`, see below) |
 | `lifecycle` | Drain deadline, supervisor restart delay, backoff, the quick-exit threshold and `startTimeoutSeconds` (how long `Start` waits for the supervisor to initialize, default 60) |
 | `logs`, `housekeeping` | Log age and size caps, cleanup retries, the free-disk warning level |
-
-Each runner takes one job at a time, so one Windows and one Linux job can run together.
-Neither needs inbound ports.
+| `hostId`, `linux.count`, `windows.count`, `windows.startAtSignIn`, `github.runnerGroup` | The [host manager's](docs/host-management.md) settings: this host's ID, the slot counts (`null` = unmanaged, otherwise 0-16), whether the host starts the Windows runners at sign-in, and the runner group the runners belong to |
 
 ## One-command Windows setup
 
@@ -99,6 +122,8 @@ setup options. See [the Windows runbook](docs/windows-two-runners.md) for detail
 
 | Script | Does |
 | --- | --- |
+| `Manage-RunnerHost.ps1 -Action Init\|Adopt\|Plan\|Status\|AutoStart\|Hold\|Resume\|Startup [-Slot] [-Json]` | The host manager, run from the host's own checkout: records which slots (`linux-01`, `win01`, ...) this host owns, compares them with settings, Docker and GitHub (`Plan` exits 3 when something differs; it changes nothing), holds and resumes a slot across restarts, and starts the Windows runners at host start or sign-in without ending a hold. See [Host management](docs/host-management.md) |
+| `Get-LinuxRunnerStatus.ps1 [-Json]` | Read-only, one line per Linux slot: container state and whether the image, build context, compose definition and compose file are current |
 | `Start-Runners.ps1` | Reapplies ignore rules, trims logs, starts the Windows supervisor if `supervisor.pid` names none, starts Docker Desktop if needed, then the Docker sidecar (in sidecar mode) and the Linux container. Logs to `windows\_diag\Startup_*-utc.log`; on failure shows a toast that opens that log |
 | `Stop-Runners.ps1 [-TimeoutMinutes] [-Force]` | Drains, then stops the Windows runner, the Linux container and the sidecar. Draining withdraws each runner's custom labels at GitHub (no new job is assigned), waits up to `lifecycle.drainTimeoutMinutes` (or `-TimeoutMinutes`) for the running job, restores the labels afterwards. A job that outlasts the deadline is **not** cancelled: that runner keeps running and the report names it (exit 1). `-Force` stops at once and cancels the running job. Registrations stay |
 | `Manage-WindowsRunner.ps1 -Action Status\|Start\|Stop\|Restart\|Maintenance [-TimeoutMinutes] [-Force] [-Json]` | One Windows instance, from its clone (also for Windows-only installs). `Status` prints supervisor, listener, job and GitHub state and exits non-zero unless all are healthy. `Stop`/`Restart` drain like `Stop-Runners.ps1`. `Maintenance` drains and stops and keeps the supervisor idle (`maintenance.json`) until `Start` |
@@ -292,9 +317,11 @@ Use `subzerodev-windows-large` to target only this machine. There are no per-run
 limits; jobs share the host user, installed tools, ports and machine-wide state.
 Two is a starting concurrency setting; available RAM alone does not determine capacity.
 
-Nothing starts the runners automatically: no scheduled task, no Run entry, no service, no watchdog. After a restart, or
+Nothing starts the runners unless you ask: no scheduled task, no service, no watchdog. After a restart, or
 when `Status` shows the supervisor down, run `Manage-WindowsRunner.ps1 -Action Start` in each clone (it starts the
-supervisor detached and hidden, and confirms it initialized). Nothing here enables automatic sign-in or restarts the PC. Use the Windows-only
+supervisor detached and hidden, and confirms it initialized). To start them when you sign in, set `windows.startAtSignIn`
+and run `Manage-RunnerHost.ps1 -Action Startup`, which writes a per-user Startup entry (no elevation) that runs
+`AutoStart`; a held runner stays held ([details](docs/host-management.md#start-after-a-reboot)). Nothing here enables automatic sign-in or restarts the PC. Use the Windows-only
 installer/supervisor; the combined start/stop/register scripts also manage Linux and Docker.
 
 ## Using the runners from a repository
@@ -355,6 +382,16 @@ Jobs run code from the repositories that use these runners, with that repository
   `subzerodev-release`) and only the release environments' jobs pointed at it, so signing keys
   and release tokens never share a machine with pull request builds.
 
+## Testing and contributing
+
+Each script has a `tests\Test-*.ps1` that runs it against a fake Docker and a fake `gh`; none touches real runners. Run one
+with `./tests/Test-Compose.ps1`; [Testing](docs/testing.md) lists every suite and how to run them all. CI is
+`.github/workflows/windows-runner-validation.yml`; a new script needs a test and a line there.
+
+Work is organized as small slices with design first: read [AGENTS.md](AGENTS.md), then [design/](design/10-design.md) and
+[handoffs/](handoffs/runner-pool.md). Settings go through `scripts\RunnerConfig.ps1`, drains through `Lifecycle.ps1`,
+registrations through `Registration.ps1`. Never commit on `main`; one pull request per slice.
+
 ## Later
 
 - **Organization runners.** Move the private repositories into a free organization and set
@@ -377,7 +414,8 @@ Jobs run code from the repositories that use these runners, with that repository
 - **Windows runner in a dedicated VM.** Same `windows\` folder and scripts, run inside a VM
   built for it; the supervisor is still started explicitly (`Manage-WindowsRunner.ps1 -Action Start`).
 - **Linux stays a container.** Only the host it runs on may change.
-- **Automatic start.** There is none by design (see the supervisor paragraph above); it is not planned here.
+- **Host manager `Apply`.** Adding and retiring slots, legacy Linux migration and `Update` are planned
+  ([design](design/30-slices.md)); today the host manager reports (`Plan`, `Status`) and holds and resumes.
 - **Dev Drive.** Still supported in Windows 11 (only the Dev Home app was retired). A ReFS
   volume with Defender performance mode, at least 50 GB, created from Settings or as a VHDX.
   Fits `windows\_work`, `windows\_nuget` and other caches; Microsoft advises keeping SDKs
