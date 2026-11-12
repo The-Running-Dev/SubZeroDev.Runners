@@ -1,0 +1,27 @@
+# Claude Code review of every pull request, through the shared claude-review.yml in
+# The-Running-Dev/.github. Needs the Claude GitHub App (https://github.com/apps/claude) on this
+# repository and a CLAUDE_CODE_OAUTH_TOKEN repository secret.
+#
+# The shared workflow runs on a GitHub-hosted runner, so a pull request never reaches the
+# self-hosted subzerodev-* runners through this file. Fork pull requests are skipped: GitHub
+# withholds secrets from them, so the review could not authenticate.
+name: Claude review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions: {}
+
+jobs:
+  claude-review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    uses: The-Running-Dev/.github/.github/workflows/claude-review.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
