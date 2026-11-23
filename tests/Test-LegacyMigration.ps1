@@ -496,3 +496,5 @@ $failed = @($cases | Where-Object { -not $_.Passed })
 Write-Host ''
 Write-Host "$($cases.Count - $failed.Count)/$($cases.Count) passed"
 if ($failed.Count) { exit 1 }
+# The fakes deliberately fail some native calls, and GitHub's pwsh wrapper exits with the last LASTEXITCODE.
+exit 0
