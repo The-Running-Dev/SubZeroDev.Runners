@@ -27,7 +27,7 @@ Acceptance: `linux/compose.local.yaml` generation, per-slot recreate with `--no-
 Out of scope: legacy migration.
 
 ## S5 — Legacy Linux migration
-Status: todo
+Status: done
 Depends on: S4
 Acceptance: journaled `migrate-legacy-linux` with `heldBefore`, rollback before verification, removal only by `-Prune` with recorded ID and name; the handoff's migration failure-injection tests pass.
 Out of scope: `-RenameLegacy`.

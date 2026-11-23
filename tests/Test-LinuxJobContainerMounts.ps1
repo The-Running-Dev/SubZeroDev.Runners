@@ -21,6 +21,7 @@ $Docker = 'Invoke-FixtureDocker'
 function Enter-HostLock { param($Kind, [switch] $Joinable) }
 function Exit-HostLock { }
 function Read-HostInventory { [pscustomobject]@{ State = 'absent' } }
+function Read-HostOperation { [pscustomobject]@{ State = 'absent' } }
 function Get-LinuxMaintenanceFile { Join-Path $Root 'maintenance.json' }
 function Enter-RunnerMaintenance { [pscustomobject]@{ Outcome='drained' } }
 function Exit-RunnerMaintenance { }

@@ -16,10 +16,15 @@
 #   Resume -Slot  the only owner path that ends the maintenance Hold began: restores labels, deletes the record, starts the
 #           one listener. Hold and Resume refuse a slot while an operation on it is unfinished (finish it with Apply).
 #   Startup applies windows.startAtSignIn: writes or removes the per-user Startup entry that runs AutoStart.
+#   Apply   carries out the plan's migrate-legacy-linux change: moves the pre-pool Linux runner (linux-01, legacy) onto the
+#           compose containers with the same registration, journaled step by step in operation.json. Rerunning Apply finishes
+#           an interrupted migration; -Rollback undoes one that is not verified yet (the pre-pool containers start again).
+#           The pre-pool containers are kept (stopped, restart off) as keptForRollback; Apply -Prune removes them by recorded
+#           ID and name. Other plan changes (add, retire, update) are not applied by this version.
 #
-# Plan and Status take no lock and change nothing. Init, Adopt, AutoStart, Hold and Resume take the host lock.
+# Plan and Status take no lock and change nothing. Init, Adopt, AutoStart, Hold, Resume and Apply take the host lock.
 param(
-    [Parameter(Mandatory)] [ValidateSet('Init', 'Adopt', 'Plan', 'Status', 'AutoStart', 'Hold', 'Resume', 'Startup')] [string] $Action,
+    [Parameter(Mandatory)] [ValidateSet('Init', 'Adopt', 'Plan', 'Status', 'AutoStart', 'Hold', 'Resume', 'Startup', 'Apply')] [string] $Action,
     # The slot Hold and Resume act on, e.g. linux-01 or win02.
     [string] $Slot,
     [ValidateRange(0, 16)] [Nullable[int]] $LinuxCount,
@@ -27,6 +32,10 @@ param(
     [string] $HostId,
     # Adopt over an unreadable inventory. The old file is kept beside it as inventory.json.unreadable-<utc>.
     [switch] $ReplaceUnreadable,
+    # Apply: undo the unfinished legacy migration instead of finishing it (only before it is verified).
+    [switch] $Rollback,
+    # Apply: remove the containers a finished migration kept for rollback (by recorded ID and name).
+    [switch] $Prune,
     [switch] $Json,
     # Where the Windows instance clones live (winNN). The setup default.
     [string] $InstallRoot = $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'SubZeroDev\Runners' })
@@ -36,6 +45,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\Common.ps1"
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
+. "$PSScriptRoot\Compose.ps1"
 
 $PlanSchema = 'subzerodev.runners.host-plan'
 $StatusSchema = 'subzerodev.runners.host-status'
@@ -60,7 +70,8 @@ function Get-ScopeRunners([string] $Scope) {
     } catch { [pscustomobject]@{ State = 'unknown'; Runners = @(); Reason = $_.Exception.Message } }
 }
 
-# docker container inspect: { State = present | absent | unknown; Id; Name; Image; Labels; Reason }.
+# docker container inspect (by name or full ID): { State = present | absent | unknown; Id; Name; Image; Labels; Running;
+# RestartPolicy; Reason }.
 function Get-ContainerRecord([string] $Name) {
     $inspect = Invoke-Docker @('container', 'inspect', $Name)
     if ($null -eq $inspect.ExitCode) { return [pscustomobject]@{ State = 'unknown'; Reason = "docker could not be run: $($inspect.Output)" } }
@@ -72,7 +83,9 @@ function Get-ContainerRecord([string] $Name) {
     if (-not $item -or -not $item.Id) { return [pscustomobject]@{ State = 'unknown'; Reason = "docker container inspect $Name gave no container ID." } }
     $labels = [ordered]@{}
     if ($item.Config -and $item.Config.Labels) { foreach ($p in $item.Config.Labels.PSObject.Properties) { $labels[$p.Name] = [string]$p.Value } }
-    [pscustomobject]@{ State = 'present'; Id = [string]$item.Id; Name = ([string]$item.Name).TrimStart('/'); Image = [string]$item.Image; Labels = $labels; Reason = $null }
+    $running = if ($item.State -and $null -ne $item.State.Running) { [bool]$item.State.Running }
+    $restart = if ($item.HostConfig -and $item.HostConfig.RestartPolicy) { [string]$item.HostConfig.RestartPolicy.Name }
+    [pscustomobject]@{ State = 'present'; Id = [string]$item.Id; Name = ([string]$item.Name).TrimStart('/'); Image = [string]$item.Image; Labels = $labels; Running = $running; RestartPolicy = $restart; Reason = $null }
 }
 
 # The ID of a local image: { State = present | absent | unknown; Id; Reason }.
@@ -233,6 +246,9 @@ function Get-HostPlan {
                         $plan.changes.Add([ordered]@{ kind = 'migrate-legacy-linux'; platform = 'linux'; slotId = $slot.SlotId; runnerId = $record.runnerId; from = $runner.name; to = $slot.Container })
                         continue
                     }
+                }
+                if ($record.PSObject.Properties['keptForRollback'] -and @($record.keptForRollback).Count) {
+                    $plan.changes.Add([ordered]@{ kind = 'prune-kept'; platform = $slot.Platform; slotId = $slot.SlotId; containers = @($record.keptForRollback | ForEach-Object { $_.name }); requires = '-Prune' })
                 }
                 $drift = @(Get-SlotDrift $record)
                 $reasons = @($drift | Where-Object { $_.state -eq 'drift' } | ForEach-Object kind | Select-Object -Unique)
@@ -607,6 +623,367 @@ function Set-StartupEntry {
     else { "windows.startAtSignIn is off: no Startup entry exists." }
 }
 
+# --- Apply: the legacy Linux migration, its rollback, and pruning what it kept for rollback.
+#
+# The migration is one journaled operation (operation.json, kind migrate-legacy-linux) with these steps, each done once and
+# safe to repeat after a crash: drain (heldBefore journaled first), stop-legacy (restart policy journaled, then off, then
+# stopped, all by recorded ID), compose-up (the compose linux-01 on the pre-pool directory and volumes: sidecar first, then
+# the runner; new IDs journaled), end-maintenance (only when the migration started it), verify (GitHub reports the same
+# runner ID and name), commit (the inventory records the new containers and keeps the old ones for rollback; the journal
+# is deleted last). The two runner containers share one registration and never listen at the same time: the old one is
+# stopped before the new one exists, and the new one waits in its entrypoint while the maintenance record exists.
+
+$MigrationKind = 'migrate-legacy-linux'
+$MigrationSteps = @('drain', 'stop-legacy', 'compose-up', 'end-maintenance', 'verify', 'commit')
+
+function Get-OperationStep($Operation, [string] $Name) { @($Operation.steps | Where-Object { $_.name -eq $Name }) | Select-Object -First 1 }
+
+function Get-StepFact($Step, [string] $Name) { if ($Step -and $Step.facts -and $Step.facts.PSObject.Properties[$Name]) { $Step.facts.$Name } }
+
+function Set-StepFact($Operation, $Step, [string] $Name, $Value) {
+    if (-not $Step.facts) { $Step | Add-Member -Force -NotePropertyName facts -NotePropertyValue ([pscustomobject]@{}) }
+    $Step.facts | Add-Member -Force -NotePropertyName $Name -NotePropertyValue $Value
+    Write-HostOperation $Operation
+}
+
+function Complete-OperationStep($Operation, $Step) {
+    $Step.state = 'done'
+    $Step | Add-Member -Force -NotePropertyName doneUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
+    Write-HostOperation $Operation
+}
+
+function Test-OurComposeContainer($Container, [string] $SlotId) {
+    $Container.Labels -and $Container.Labels[$ComposeHostLabel] -eq (Get-RunnerHostId $Config) -and $Container.Labels[$ComposeSlotLabel] -eq $SlotId
+}
+
+# The recorded runner container first, then the Docker sidecar (the order a drain stops them in).
+function Get-RunnerFirst($Containers) { @(@($Containers | Where-Object { $_.role -eq 'runner' }) + @($Containers | Where-Object { $_.role -ne 'runner' })) }
+
+function Get-RunnerBusyCheck([string] $Container) {
+    { (Invoke-Docker @('exec', $Container, 'pgrep', '-f', 'Runner.Worker')).ExitCode -eq 0 }.GetNewClosure()
+}
+
+function Wait-ComposeSidecarReady([string] $Container) {
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if ((Invoke-Docker @('exec', $Container, 'docker', 'version')).ExitCode -eq 0) { return $true }
+        Start-Sleep -Seconds 2
+    }
+    $false
+}
+
+# The compose file holds every composed slot (and, while migrating, linux-01). No slots: no file.
+function Write-LinuxComposeFile($Slots) {
+    $path = Get-LinuxComposeFilePath $Root
+    if (-not @($Slots).Count) {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        return $path
+    }
+    $yaml = ConvertTo-LinuxComposeYaml $Config @($Slots | Sort-Object Number) $Root $PSScriptRoot
+    if (-not (Test-Path -LiteralPath $path) -or [IO.File]::ReadAllText($path) -ne $yaml) { Write-FileAtomic $path $yaml }
+    $path
+}
+
+# The legacy slot's row from Get-LinuxSlots and its inventory record, or a refusal.
+function Get-MigrationSlot($Inventory, [string] $Verb) {
+    $row = @(Get-LinuxSlots $Config $Inventory | Where-Object { $_.SlotId -eq 'linux-01' }) | Select-Object -First 1
+    $record = Get-InventorySlot $Inventory 'linux-01'
+    if (-not $row -or -not $record) { throw "$Verb refused: the inventory has no slot linux-01." }
+    if (-not $row.Legacy) { throw "$Verb refused: linux-01 is not the pre-pool runner (legacy) in the inventory." }
+    [pscustomobject]@{ Row = $row; Record = $record; Directory = [string]$record.registrationDirectory; StateFile = (Join-Path ([string]$record.registrationDirectory) 'maintenance.json') }
+}
+
+# What must hold before a migration is journaled. Nothing is changed by this.
+function Assert-MigrationPreflight($Target) {
+    $record = $Target.Record
+    if ($record.state -ne 'active') { throw "Apply refused: linux-01 is $($record.state), not active." }
+    if (-not $record.runnerId) { throw 'Apply refused: linux-01 records no runner ID, so the migrated runner could not be verified.' }
+    if (-not $Target.Directory -or -not (Test-Path -LiteralPath (Join-Path $Target.Directory '.runner'))) { throw "Apply refused: linux-01's registration $($Target.Directory)\.runner does not exist." }
+    $legacy = @(Get-RunnerFirst $record.containers)
+    if (-not @($legacy | Where-Object { $_.role -eq 'runner' }).Count) { throw 'Apply refused: no pre-pool runner container is recorded for linux-01.' }
+    foreach ($entry in $legacy) {
+        if (-not $entry.id -or -not $entry.name) { throw "Apply refused: a recorded $($entry.role) container of linux-01 has no ID or name." }
+        $found = Get-ContainerRecord $entry.id
+        if ($found.State -eq 'unknown') { throw "Apply refused: whether the container $($entry.name) ($($entry.id)) exists is unknown ($($found.Reason))." }
+        if ($found.State -eq 'absent') { throw "Apply refused: the recorded container $($entry.name) ($($entry.id)) does not exist. Nothing was changed." }
+        if ($found.Name -ne $entry.name) { throw "Apply refused: the recorded container $($entry.id) is now named $($found.Name), not $($entry.name). Nothing was changed." }
+    }
+    $image = Get-ImageId $Config.linux.image
+    if ($image.State -ne 'present') { throw "Apply refused: the image $($Config.linux.image) is $(if ($image.State -eq 'absent') { 'not built' } else { "unknown ($($image.Reason))" }). Build it, then rerun Apply." }
+    foreach ($name in @($Target.Row.Container, $Target.Row.DockerContainer) | Where-Object { $_ }) {
+        $found = Get-ContainerRecord $name
+        if ($found.State -eq 'unknown') { throw "Apply refused: whether a container named $name exists is unknown ($($found.Reason))." }
+        if ($found.State -eq 'present' -and -not (Test-OurComposeContainer $found 'linux-01')) { throw "Apply refused: a container named $name ($($found.Id)) exists and is not this host's compose linux-01. Nothing was changed." }
+    }
+}
+
+function Invoke-MigrationDrain($Operation, $Step, $Target) {
+    $held = Get-StepFact $Step 'heldBefore'
+    if ($null -eq $held) {
+        # Journaled before maintenance is entered, never recomputed: a retry would otherwise find its own record.
+        $held = Get-HeldBefore $Target.StateFile
+        Set-StepFact $Operation $Step 'heldBefore' $held
+    }
+    if (-not $held) {
+        $runner = @($Target.Record.containers | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+        $drain = Enter-RunnerMaintenance -StateFile $Target.StateFile -RunnerDirectory $Target.Directory -IsBusy (Get-RunnerBusyCheck $runner.id) -Reason 'migrate' -TimeoutMinutes $Config.lifecycle.drainTimeoutMinutes
+        if ($drain.Outcome -eq 'timeout') {
+            Remove-HostOperation
+            throw "Apply stopped: $($drain.Retained) The migration was not started (journal deleted); rerun Apply when the runner is idle."
+        }
+        if ($drain.Outcome -eq 'failed') { throw "Apply stopped in the drain: $(@($drain.Failures) -join ' ') The journal is kept; rerun Apply, or Apply -Rollback." }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-MigrationStopLegacy($Operation, $Step, $Target) {
+    $kept = @(Get-StepFact $Step 'containers')
+    if (-not $kept.Count) {
+        # The restart policies are journaled before any is changed, so a rollback can put back exactly what was there.
+        $kept = @(foreach ($entry in Get-RunnerFirst $Target.Record.containers) {
+                $found = Get-ContainerRecord $entry.id
+                if ($found.State -ne 'present' -or $found.Name -ne $entry.name) { throw "Apply stopped: the recorded container $($entry.name) ($($entry.id)) is $(if ($found.State -eq 'present') { "named $($found.Name)" } else { $found.State }). $($found.Reason) The journal is kept." }
+                [pscustomobject][ordered]@{ role = $entry.role; id = $found.Id; name = $found.Name; image = $found.Image; restart = $(if ($found.RestartPolicy) { $found.RestartPolicy } else { 'no' }) }
+            })
+        Set-StepFact $Operation $Step 'containers' $kept
+    }
+    foreach ($entry in $kept) {
+        $found = Get-ContainerRecord $entry.id
+        if ($found.State -ne 'present' -or $found.Name -ne $entry.name) { throw "Apply stopped: the recorded container $($entry.name) ($($entry.id)) is $(if ($found.State -eq 'present') { "named $($found.Name)" } else { $found.State }). $($found.Reason) The journal is kept; nothing else was changed." }
+        if ($found.RestartPolicy -ne 'no') {
+            $update = Invoke-Docker @('update', '--restart=no', $entry.id)
+            if ($update.ExitCode -ne 0) { throw "Apply stopped: docker update --restart=no $($entry.name) exited $($update.ExitCode): $($update.Output) The journal is kept." }
+        }
+        $stop = Stop-LinuxContainer $entry.id
+        if ($stop.Result -eq 'failed') { throw "Apply stopped: $($stop.Detail) The journal is kept." }
+        if ($stop.Result -eq 'absent') { throw "Apply stopped: the recorded container $($entry.name) ($($entry.id)) disappeared. The journal is kept." }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Get-MigrationComposeSlots($Inventory, $Target) {
+    @(@(Get-LinuxSlots $Config $Inventory | Where-Object { $_.Composed -and $_.SlotId -ne 'linux-01' }) + $Target.Row)
+}
+
+function Invoke-MigrationComposeUp($Operation, $Step, $Inventory, $Target) {
+    $row = $Target.Row
+    Initialize-LinuxSlotResources $Config $row
+    $file = Write-LinuxComposeFile (Get-MigrationComposeSlots $Inventory $Target)
+    $journaled = @(Get-StepFact $Step 'new' | ForEach-Object { $_.id })
+    $wanted = @(@(if ($row.DockerContainer) { [pscustomobject]@{ role = 'docker'; name = $row.DockerContainer; service = "$($row.SlotId)-docker" } }) + [pscustomobject]@{ role = 'runner'; name = $row.Container; service = $row.SlotId })
+    $new = [Collections.Generic.List[object]]::new()
+    foreach ($item in $wanted) {
+        $found = Get-ContainerRecord $item.name
+        if ($found.State -eq 'unknown') { throw "Apply stopped: whether $($item.name) exists is unknown ($($found.Reason)). The journal is kept." }
+        if ($found.State -eq 'present' -and $found.Id -notin $journaled -and -not (Test-OurComposeContainer $found 'linux-01')) { throw "Apply stopped: a container named $($item.name) ($($found.Id)) exists and is not this host's compose linux-01. The journal is kept." }
+        $up = Invoke-LinuxCompose -File $file -Verb up -Services @($item.service)
+        if ($up.ExitCode -ne 0) { throw "Apply stopped: compose up $($item.service) exited $($up.ExitCode): $($up.Output) The journal is kept; the pre-pool runner stays stopped and in maintenance." }
+        $created = Get-ContainerRecord $item.name
+        if ($created.State -ne 'present') { throw "Apply stopped: $($item.name) is $($created.State) after compose up. $($created.Reason) The journal is kept." }
+        $new.Add([pscustomobject][ordered]@{ role = $item.role; name = $created.Name; id = $created.Id })
+        Set-StepFact $Operation $Step 'new' $new.ToArray()
+        if ($item.role -eq 'docker' -and -not (Wait-ComposeSidecarReady $item.name)) { throw "Apply stopped: the Docker sidecar $($item.name) did not become ready. The journal is kept." }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-MigrationEndMaintenance($Operation, $Step, $Target) {
+    $held = Get-StepFact (Get-OperationStep $Operation 'drain') 'heldBefore'
+    Complete-OperationMaintenance @{ name = 'end-maintenance'; heldBefore = $held } $Target.StateFile $Target.Directory | Out-Null
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-MigrationVerify($Operation, $Step, $Inventory, $Target) {
+    $held = [bool](Get-StepFact (Get-OperationStep $Operation 'drain') 'heldBefore')
+    $runnerId = [int64]$Target.Record.runnerId
+    $scope = if ($Target.Record.scope) { [string]$Target.Record.scope } else { Get-InventoryScope $Inventory }
+    $newRunner = @(Get-StepFact (Get-OperationStep $Operation 'compose-up') 'new' | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+    $deadline = [DateTime]::UtcNow.AddSeconds([int]$Config.lifecycle.startTimeoutSeconds)
+    while ($true) {
+        $container = Get-ContainerRecord $newRunner.id
+        $listing = Get-ScopeRunners $scope
+        $match = if ($listing.State -eq 'known') { $listing.Runners | Where-Object { [int64]$_.id -eq $runnerId } | Select-Object -First 1 }
+        $why = if ($container.State -ne 'present' -or $container.Name -ne $newRunner.name) { "the container $($newRunner.name) ($($newRunner.id)) is $($container.State) $($container.Reason)" }
+        elseif (-not $container.Running) { "the container $($newRunner.name) is not running" }
+        elseif ($listing.State -ne 'known') { "GitHub could not be read ($($listing.Reason))" }
+        elseif (-not $match) { "GitHub has no runner with id $runnerId" }
+        elseif ($match.name -ne $Config.linux.name) { "GitHub's runner $runnerId is named $($match.name), not $($Config.linux.name)" }
+        elseif (-not $held -and $match.status -ne 'online') { "GitHub reports runner $runnerId $($match.status)" }
+        if (-not $why) { break }
+        if ([DateTime]::UtcNow -ge $deadline) { throw "Apply stopped at verify: $why. The journal is kept; rerun Apply to check again, or Apply -Rollback to go back to the pre-pool runner." }
+        Start-Sleep -Seconds ([Math]::Max(1, [int]$Config.lifecycle.pollSeconds))
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-MigrationCommit($Operation, $Step, $Inventory, $Target) {
+    $now = [DateTime]::UtcNow.ToString('o')
+    $containers = @(foreach ($entry in Get-RunnerFirst @(Get-StepFact (Get-OperationStep $Operation 'compose-up') 'new')) {
+            $found = Get-ContainerRecord $entry.id
+            if ($found.State -ne 'present') { throw "Apply stopped at commit: the new container $($entry.name) ($($entry.id)) is $($found.State). $($found.Reason) The journal is kept." }
+            [ordered]@{ role = $entry.role; id = $found.Id; name = $found.Name; image = $found.Image; labels = $found.Labels }
+        })
+    $kept = @(foreach ($entry in @(Get-StepFact (Get-OperationStep $Operation 'stop-legacy') 'containers')) {
+            [ordered]@{ role = $entry.role; id = $entry.id; name = $entry.name; image = $entry.image; restart = $entry.restart; state = 'kept-for-rollback'; keptUtc = $now; operationId = $Operation.id }
+        })
+    $Target.Record | Add-Member -Force -NotePropertyName containers -NotePropertyValue $containers
+    $Target.Record | Add-Member -Force -NotePropertyName keptForRollback -NotePropertyValue $kept
+    $Target.Record | Add-Member -Force -NotePropertyName migratedUtc -NotePropertyValue $now
+    $Inventory | Add-Member -Force -NotePropertyName generation -NotePropertyValue ([int]$Inventory.generation + 1)
+    Write-HostInventory $Inventory
+    Complete-OperationStep $Operation $Step
+    Remove-HostOperation
+}
+
+function Invoke-LegacyMigration($Inventory, $Operation) {
+    $target = Get-MigrationSlot $Inventory 'Apply'
+    if (-not $Operation) {
+        Assert-MigrationPreflight $target
+        $Operation = New-HostOperation -Kind $MigrationKind -SlotId 'linux-01' -Steps $MigrationSteps
+        Write-HostOperation $Operation
+        "Migrating linux-01 ($($target.Record.runnerName), id $($target.Record.runnerId)) to compose: operation $($Operation.id)."
+    } else { "Resuming operation $($Operation.id) ($MigrationKind) on linux-01." }
+    foreach ($step in @($Operation.steps)) {
+        if ($step.state -eq 'done') { continue }
+        switch ($step.name) {
+            'drain' { Invoke-MigrationDrain $Operation $step $target }
+            'stop-legacy' { Invoke-MigrationStopLegacy $Operation $step $target }
+            'compose-up' { Invoke-MigrationComposeUp $Operation $step $Inventory $target }
+            'end-maintenance' { Invoke-MigrationEndMaintenance $Operation $step $target }
+            'verify' { Invoke-MigrationVerify $Operation $step $Inventory $target }
+            'commit' { Invoke-MigrationCommit $Operation $step $Inventory $target }
+            default { throw "Apply stopped: operation $($Operation.id) has an unknown step '$($step.name)'. The journal is kept." }
+        }
+        "  $($step.name): done"
+    }
+    $held = [bool](Get-StepFact (Get-OperationStep $Operation 'drain') 'heldBefore')
+    "linux-01 runs on compose as $($target.Row.Container) with runner id $($target.Record.runnerId)$(if ($held) { '; it stays held until -Action Resume' }). The pre-pool containers are kept, stopped, for rollback; Apply -Prune removes them."
+}
+
+# Undoes an unfinished migration before it is verified: the new containers go (only ones this migration or this host's
+# compose created for linux-01), the pre-pool containers get their restart policy back and start, and maintenance ends
+# only if the migration started it. The inventory is not changed. Safe to repeat.
+function Invoke-MigrationRollback($Inventory, $Operation) {
+    if ($Operation.kind -ne $MigrationKind) { throw "Apply -Rollback refused: the unfinished operation is $($Operation.kind), not $MigrationKind." }
+    $verify = Get-OperationStep $Operation 'verify'
+    if ($verify.state -eq 'done') { throw "Apply -Rollback refused: the migration was verified (GitHub reports the runner on its new container). Run Apply to commit it." }
+    $target = Get-MigrationSlot $Inventory 'Apply -Rollback'
+    $Operation | Add-Member -Force -NotePropertyName rollingBack -NotePropertyValue $true
+    Write-HostOperation $Operation
+    $drain = Get-OperationStep $Operation 'drain'
+    $held = Get-StepFact $drain 'heldBefore'
+    $ended = Get-OperationStep $Operation 'end-maintenance'
+    $new = @(Get-StepFact (Get-OperationStep $Operation 'compose-up') 'new')
+    if ($ended.state -eq 'done' -and $held -eq $false -and $new.Count) {
+        # The new runner may be listening: drain it before its container goes.
+        $runner = @($new | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+        $redrain = Enter-RunnerMaintenance -StateFile $target.StateFile -RunnerDirectory $target.Directory -IsBusy (Get-RunnerBusyCheck $runner.id) -Reason 'rollback' -TimeoutMinutes $Config.lifecycle.drainTimeoutMinutes
+        if ($redrain.Outcome -in 'timeout', 'failed') { throw "Apply -Rollback stopped: the new runner did not drain. $(if ($redrain.Failures) { @($redrain.Failures) -join ' ' } else { $redrain.Retained }) The journal is kept; rerun Apply -Rollback." }
+        $ended.state = 'pending'
+        Write-HostOperation $Operation
+    }
+    # The new containers, runner first. A container is removed only when it is the journaled one or carries this host's
+    # compose labels for linux-01; anything else under those names stops the rollback.
+    $journaled = @($new | ForEach-Object { $_.id })
+    foreach ($entry in $new) {
+        $found = Get-ContainerRecord $entry.id
+        if ($found.State -eq 'unknown') { throw "Apply -Rollback stopped: whether $($entry.name) ($($entry.id)) exists is unknown ($($found.Reason)). The journal is kept." }
+        if ($found.State -eq 'present' -and $found.Name -ne $entry.name) { throw "Apply -Rollback stopped: the new container $($entry.id) is now named $($found.Name), not $($entry.name); remove it by hand. The journal is kept." }
+    }
+    foreach ($name in @($target.Row.Container, $target.Row.DockerContainer) | Where-Object { $_ }) {
+        $found = Get-ContainerRecord $name
+        if ($found.State -eq 'absent') { continue }
+        if ($found.State -eq 'unknown') { throw "Apply -Rollback stopped: whether $name exists is unknown ($($found.Reason)). The journal is kept." }
+        if ($found.Id -notin $journaled -and -not (Test-OurComposeContainer $found 'linux-01')) { throw "Apply -Rollback stopped: the container named $name ($($found.Id)) was not created by this migration; it was left alone. The journal is kept." }
+        $removed = Remove-LinuxContainer $found.Id
+        if ($removed.Result -eq 'failed') { throw "Apply -Rollback stopped: $($removed.Detail) The journal is kept." }
+    }
+    # The pre-pool containers, sidecar first (the runner's jobs depend on it): their restart policy back, then started.
+    $kept = @(Get-StepFact (Get-OperationStep $Operation 'stop-legacy') 'containers')
+    foreach ($entry in @(@($kept | Where-Object { $_.role -ne 'runner' }) + @($kept | Where-Object { $_.role -eq 'runner' }))) {
+        $found = Get-ContainerRecord $entry.id
+        if ($found.State -ne 'present' -or $found.Name -ne $entry.name) { throw "Apply -Rollback stopped: the pre-pool container $($entry.name) ($($entry.id)) is $(if ($found.State -eq 'present') { "named $($found.Name)" } else { $found.State }). $($found.Reason) The journal is kept." }
+        if ($found.RestartPolicy -ne $entry.restart) {
+            $update = Invoke-Docker @('update', "--restart=$($entry.restart)", $entry.id)
+            if ($update.ExitCode -ne 0) { throw "Apply -Rollback stopped: docker update --restart=$($entry.restart) $($entry.name) exited $($update.ExitCode): $($update.Output) The journal is kept." }
+        }
+        if (-not $found.Running) {
+            $start = Invoke-Docker @('start', $entry.id)
+            if ($start.ExitCode -ne 0) { throw "Apply -Rollback stopped: docker start $($entry.name) exited $($start.ExitCode): $($start.Output) The journal is kept." }
+        }
+    }
+    # Maintenance last: the pre-pool entrypoint waits while the record exists, so exactly one listener starts here.
+    if ($null -ne $held) { Complete-OperationMaintenance @{ name = 'rollback'; heldBefore = $held } $target.StateFile $target.Directory | Out-Null }
+    Write-LinuxComposeFile @(Get-LinuxSlots $Config $Inventory | Where-Object { $_.Composed }) | Out-Null
+    Remove-HostOperation
+    "Rolled back operation $($Operation.id): linux-01 runs on the pre-pool containers again$(if ($held) { ' (still held; -Action Resume ends that)' }). The inventory was not changed."
+}
+
+# Removes what a migration kept for rollback. A kept container is removed only when the recorded ID still names a stopped
+# container with the recorded name; one that is gone is dropped from the record; anything else is kept and reported.
+function Invoke-Prune($Inventory) {
+    $operation = Read-HostOperation
+    if ($operation.State -eq 'readable') { throw "Apply -Prune refused: the operation $($operation.Value.kind) ($($operation.Value.id)) is unfinished; finish it with Apply (or Apply -Rollback) first." }
+    $changed = $false
+    $any = $false
+    foreach ($slot in @($Inventory.slots | Where-Object { $_ -and $_.PSObject.Properties['keptForRollback'] -and @($_.keptForRollback).Count })) {
+        $any = $true
+        $remaining = [Collections.Generic.List[object]]::new()
+        foreach ($entry in Get-RunnerFirst @($slot.keptForRollback)) {
+            $found = Get-ContainerRecord $entry.id
+            $keep = $null
+            switch ($found.State) {
+                'absent' { "$($slot.slotId): $($entry.name) ($($entry.id)) is already gone; record dropped." }
+                'unknown' { $keep = "whether it exists is unknown ($($found.Reason))" }
+                default {
+                    if ($found.Id -ne $entry.id) { $keep = "docker reports it as $($found.Id), not the recorded ID" }
+                    elseif ($found.Name -ne $entry.name) { $keep = "it is now named $($found.Name), not $($entry.name)" }
+                    elseif ($found.Running -ne $false) { $keep = 'it is running' }
+                    else {
+                        $remove = Invoke-Docker @('rm', $entry.id)
+                        $after = Get-ContainerRecord $entry.id
+                        if ($after.State -eq 'absent') { "$($slot.slotId): removed $($entry.name) ($($entry.id))." }
+                        else { $keep = "docker rm exited $($remove.ExitCode): $($remove.Output) and it is still $($after.State)" }
+                    }
+                }
+            }
+            if ($keep) {
+                $remaining.Add($entry)
+                $script:HostFailed = $true
+                [Console]::Error.WriteLine("$($slot.slotId): kept $($entry.name) ($($entry.id)): $keep. Nothing else under that name is touched.")
+            } else { $changed = $true }
+        }
+        $slot | Add-Member -Force -NotePropertyName keptForRollback -NotePropertyValue $remaining.ToArray()
+    }
+    if (-not $any) { 'Nothing is kept for rollback; nothing to prune.'; return }
+    if ($changed) {
+        $Inventory | Add-Member -Force -NotePropertyName generation -NotePropertyValue ([int]$Inventory.generation + 1)
+        Write-HostInventory $Inventory
+    }
+}
+
+function Invoke-Apply {
+    Use-HostLock -Kind 'Manage-RunnerHost Apply' -Joinable -ScriptBlock {
+        $inventory = Assert-HostInventoryUsable $(if ($Prune) { 'Prune' } else { 'Apply' })
+        if ($Prune) { Invoke-Prune $inventory; return }
+        $operation = Read-HostOperation
+        $op = if ($operation.State -eq 'readable') { $operation.Value }
+        if ($Rollback) {
+            if (-not $op) { 'No unfinished operation; nothing to roll back.'; return }
+            Invoke-MigrationRollback $inventory $op
+            return
+        }
+        if ($op) {
+            if ($op.kind -ne $MigrationKind) { throw "Apply refused: the unfinished operation $($op.kind) ($($op.id)) is not one this version of Apply finishes." }
+            if ($op.PSObject.Properties['rollingBack'] -and $op.rollingBack) { throw "Apply refused: operation $($op.id) was being rolled back. Finish that with Apply -Rollback." }
+            Invoke-LegacyMigration $inventory $op
+            return
+        }
+        $row = @(Get-LinuxSlots $Config $inventory | Where-Object { $_.SlotId -eq 'linux-01' -and $_.Legacy -and -not $_.New -and -not $_.Composed }) | Select-Object -First 1
+        if ($row) { Invoke-LegacyMigration $inventory $null; return }
+        'Nothing to migrate: the pre-pool Linux runner is not in the inventory, or already runs on compose. Other plan changes (add, retire, update) are not applied by this version; see -Action Plan.'
+    }
+}
+
 # --- Output.
 
 function Test-PlanFindings($Plan) { [bool]@($Plan.findings | Where-Object { $_.severity -in 'unknown', 'drift', 'blocked' }).Count }
@@ -648,6 +1025,7 @@ try {
         'AutoStart' { Invoke-AutoStart; exit [int]$script:HostFailed }
         'Hold' { Invoke-Hold; exit [int]$script:HostFailed }
         'Resume' { Invoke-Resume; exit [int]$script:HostFailed }
+        'Apply' { Invoke-Apply; exit [int]$script:HostFailed }
         'Startup' { Set-StartupEntry; exit 0 }
         'Plan' {
             $plan = Get-HostPlan

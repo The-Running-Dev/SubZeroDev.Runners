@@ -4,7 +4,7 @@
 what would change. It runs in the host's own checkout (not in a Windows instance clone) and needs PowerShell 7.2+.
 
 Design background is in the [runner pool plan](runner-pool-plan.md). This guide covers the actions that exist today.
-`Apply` (adding and retiring slots), legacy Linux migration and `Update` are planned slices and are not available yet.
+`Apply` migrates the legacy Linux runner; adding and retiring slots and `Update` are planned slices and are not available yet.
 
 ## Concepts
 
@@ -14,7 +14,7 @@ Design background is in the [runner pool plan](runner-pool-plan.md). This guide 
 | Host ID | Lower-cased computer name by default (`hostId` in settings, 1-31 of `a-z0-9-`). Part of each Windows runner name: `subzerodev.runner.windows.<hostId>.win01` |
 | Inventory | `%LOCALAPPDATA%\SubZeroDev\Runners\host\inventory.json`: the slots this host's manager owns, with container IDs and runner IDs. An unreadable file is a distinct state, never treated as empty |
 | Journal | `operation.json` beside it: the one operation in progress. Hold and Resume refuse a slot while one is unfinished |
-| Host lock | One named mutex. Init, Adopt, AutoStart, Hold and Resume take it for their whole run; Plan and Status take none and write nothing |
+| Host lock | One named mutex. Init, Adopt, AutoStart, Hold, Resume and Apply take it for their whole run; Plan and Status take none and write nothing |
 | Slot 01 (legacy) | The pre-pool Linux runner `subzerodev.runner.linux` in `linux\runner`, kept under its old name, container and volumes |
 
 Settings resolve in this order, later wins: `runners.json`, `runners.host.json` (written by the manager for a Windows
@@ -37,6 +37,9 @@ means "no change on that side".
 | `AutoStart` | What runs at host start and sign-in: waits for Docker (up to `buildAgent.docker.readyTimeoutSeconds`), then starts each active Windows slot's supervisor. It never ends maintenance. Linux slots need nothing: Docker restarts their containers and the entrypoint waits while a slot is held |
 | `Hold -Slot <id>` | Drains the slot, stops it and keeps its maintenance record. Nothing starts it again until `Resume` |
 | `Resume -Slot <id>` | The only path that ends the maintenance Hold began: restores labels, deletes the record, starts the one listener (starting a stopped Linux container first) |
+| `Apply` | Migrates the legacy `linux-01` onto its compose containers (see [Legacy Linux migration](#legacy-linux-migration)), or resumes an unfinished migration. Exit 0 when done or nothing to do |
+| `Apply -Rollback` | Before the migration is verified: removes the new containers and restarts the pre-pool ones. The inventory is not changed |
+| `Apply -Prune` | Removes the pre-pool containers a finished migration kept for rollback |
 | `Startup` | Applies `windows.startAtSignIn`: writes or removes the per-user Startup entry that runs `AutoStart` |
 
 Typical first run on an existing host:
@@ -104,3 +107,32 @@ files on disk), `composeConfigHash` (the container matches the compose definitio
 the scripts generate). Each is `ok`, `drift`, `not-applicable` or `not-checked` with the reason; a check that cannot be made is never
 reported `ok`. The command only reads. `New-LinuxRunner.ps1 -Update` refuses containers created by compose; use the
 `-Build` path for them.
+
+## Legacy Linux migration
+
+`Plan` lists `migrate-legacy-linux` while `linux-01` still runs as the pre-pool `subzerodev-runner-linux` containers.
+`Apply` moves it onto compose (`subzerodev-runner-linux-01` and its sidecar) under the same registration, runner ID and
+volumes, as six journaled steps:
+
+| Step | Does |
+| --- | --- |
+| `drain` | Records whether the slot was already held, closes admission and waits for the running job. On timeout the journal is deleted, admission reopened and nothing else changed |
+| `stop-legacy` | Turns off the old containers' restart policy and stops them by ID. The old and new runner never run at the same time |
+| `compose-up` | Creates the network and volumes if needed, writes `linux\compose.local.yaml`, starts the sidecar, then the runner |
+| `end-maintenance` | Restores labels and deletes the maintenance record, unless the slot was held before Apply |
+| `verify` | Waits (`lifecycle.startTimeoutSeconds`) for the new container to run and GitHub to report the same runner ID online |
+| `commit` | Records the new containers in the inventory and keeps the old ones as `keptForRollback` |
+
+Before anything changes, Apply refuses when the image is not built, a recorded old container was renamed or cannot be
+read, or a container that is not this host's compose `linux-01` holds a target name. If a run stops part-way (killed,
+or a step failed), run `Apply` again to finish it, or `Apply -Rollback` to go back; `New-LinuxRunner.ps1`, `Hold` and
+`Resume` refuse until one of them finishes. Rollback is refused once `verify` is done.
+
+```powershell
+.\scripts\Manage-RunnerHost.ps1 -Action Apply             # migrate, or finish an interrupted migration
+.\scripts\Manage-RunnerHost.ps1 -Action Apply -Rollback   # before verify: back to the pre-pool containers
+.\scripts\Manage-RunnerHost.ps1 -Action Apply -Prune      # later: remove the kept pre-pool containers
+```
+
+`-Prune` removes a kept container only when its recorded ID still names a stopped container with the recorded name. A
+renamed, running or unreadable one is kept and reported (exit 1); one already gone is dropped from the record.
