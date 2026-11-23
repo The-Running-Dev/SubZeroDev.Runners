@@ -33,7 +33,7 @@ Acceptance: journaled `migrate-legacy-linux` with `heldBefore`, rollback before 
 Out of scope: `-RenameLegacy`.
 
 ## S6 — Add and retire slots
-Status: todo
+Status: done
 Depends on: S5
 Acceptance: Apply with add and retire operations, `-Retire`, `-Prune`, `-ExpectPlan` and the per-instance Windows path (C1); the handoff's Scale, Ownership, Unknown-is-not-absent, add and retire failure-injection, and Concurrency tests pass.
 Out of scope: Update.

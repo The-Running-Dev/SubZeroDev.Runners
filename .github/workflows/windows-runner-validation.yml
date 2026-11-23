@@ -81,6 +81,9 @@ jobs:
       - name: Verify the legacy Linux migration, its rollback and prune
         shell: pwsh
         run: ./tests/Test-LegacyMigration.ps1
+      - name: Verify adding and retiring slots, their failure recovery and concurrency
+        shell: pwsh
+        run: ./tests/Test-SlotScaling.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)

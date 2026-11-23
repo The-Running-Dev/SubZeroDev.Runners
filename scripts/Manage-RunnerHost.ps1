@@ -16,11 +16,15 @@
 #   Resume -Slot  the only owner path that ends the maintenance Hold began: restores labels, deletes the record, starts the
 #           one listener. Hold and Resume refuse a slot while an operation on it is unfinished (finish it with Apply).
 #   Startup applies windows.startAtSignIn: writes or removes the per-user Startup entry that runs AutoStart.
-#   Apply   carries out the plan's migrate-legacy-linux change: moves the pre-pool Linux runner (linux-01, legacy) onto the
-#           compose containers with the same registration, journaled step by step in operation.json. Rerunning Apply finishes
-#           an interrupted migration; -Rollback undoes one that is not verified yet (the pre-pool containers start again).
-#           The pre-pool containers are kept (stopped, restart off) as keptForRollback; Apply -Prune removes them by recorded
-#           ID and name. Other plan changes (add, retire, update) are not applied by this version.
+#   Apply   carries out the plan, each change one operation journaled step by step in operation.json; rerunning Apply
+#           finishes an interrupted one. In order: migrate-legacy-linux (the pre-pool linux-01 onto its compose containers with
+#           the same registration; -Rollback undoes it before it is verified, and its pre-pool containers are kept stopped for
+#           rollback), then add (lowest number first: Linux registers in a throwaway container and starts on compose, Windows
+#           gets its own clone InstallRoot\winNN), then retire (highest number first, only with -Retire: drained, stopped,
+#           removed at GitHub and locally; windows-legacy only once win01 is online). -ExpectPlan <planHash> refuses before
+#           any change when the plan is not the one reviewed. Apply -Prune removes what is kept for rollback and what retired
+#           slots left on disk (directory, clone, volumes). Exit 0: done; 3: a retire was skipped or deferred; 1: failed.
+#           Update changes are not applied by this version.
 #
 # Plan and Status take no lock and change nothing. Init, Adopt, AutoStart, Hold, Resume and Apply take the host lock.
 param(
@@ -34,8 +38,12 @@ param(
     [switch] $ReplaceUnreadable,
     # Apply: undo the unfinished legacy migration instead of finishing it (only before it is verified).
     [switch] $Rollback,
-    # Apply: remove the containers a finished migration kept for rollback (by recorded ID and name).
+    # Apply: remove the containers a finished migration kept for rollback (by recorded ID and name), and what retired slots left.
     [switch] $Prune,
+    # Apply: retire the slots the settings no longer want. Without it a retire is reported and skipped (exit 3).
+    [switch] $Retire,
+    # Apply: the planHash -Action Plan printed. Apply refuses before any change when the plan is no longer that one.
+    [string] $ExpectPlan,
     [switch] $Json,
     # Where the Windows instance clones live (winNN). The setup default.
     [string] $InstallRoot = $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'SubZeroDev\Runners' })
@@ -46,6 +54,8 @@ $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\Registration.ps1"
 . "$PSScriptRoot\Lifecycle.ps1"
 . "$PSScriptRoot\Compose.ps1"
+. "$PSScriptRoot\Housekeeping.ps1"
+. "$PSScriptRoot\WindowsRunnerSetup.ps1"
 
 $PlanSchema = 'subzerodev.runners.host-plan'
 $StatusSchema = 'subzerodev.runners.host-status'
@@ -235,7 +245,7 @@ function Get-HostPlan {
             $keep = @($wanted | ForEach-Object SlotId)
             foreach ($slot in @($live | Where-Object { $_.platform -eq $side.Platform -and $_.slotId -notin $keep } | Sort-Object slotId -Descending)) {
                 $change = [ordered]@{ kind = 'retire'; platform = $side.Platform; slotId = $slot.slotId; runnerName = $slot.runnerName; runnerId = $slot.runnerId; requires = '-Retire' }
-                if ($slot.slotId -eq 'windows-legacy') { $change.after = 'win01 online' }
+                if ($slot.slotId -eq 'windows-legacy' -and $Config.windows.count -gt 0) { $change.after = 'win01 online' }
                 $plan.changes.Add($change)
             }
             foreach ($slot in $wanted | Where-Object { -not $_.New }) {
@@ -918,47 +928,472 @@ function Invoke-MigrationRollback($Inventory, $Operation) {
     "Rolled back operation $($Operation.id): linux-01 runs on the pre-pool containers again$(if ($held) { ' (still held; -Action Resume ends that)' }). The inventory was not changed."
 }
 
-# Removes what a migration kept for rollback. A kept container is removed only when the recorded ID still names a stopped
-# container with the recorded name; one that is gone is dropped from the record; anything else is kept and reported.
+# --- Apply: adding and retiring slots.
+#
+# add-slot, one journaled operation per slot (steps provision, register, create, verify, commit): the slot is recorded as
+# provisioning before anything exists for it, registered (Linux: config.sh in a throwaway container of the pinned image on
+# the slot's own directory; Windows: its own clone InstallRoot\winNN set up and installed), started (Linux: the slot's
+# compose services, sidecar first), verified (GitHub reports the recorded runner ID under the slot's name, online), and
+# committed active. The runner ID is journaled and recorded the moment it is known, so a crash never leaves a registration
+# nobody owns.
+#
+# retire-slot (steps withdraw, drain, stop, deregister, clear-local, remove-containers, commit): heldBefore is journaled and
+# the slot marked retiring, the runner drained (a timeout puts the slot back to active and deletes the journal), stopped,
+# removed at GitHub by its recorded ID, its local registration deleted, its containers removed (only the recorded ones or
+# this host's compose ones for that slot), and the slot recorded retired. Its directory, clone and volumes stay for Prune.
+
+$AddKind = 'add-slot'
+$AddSteps = @('provision', 'register', 'create', 'verify', 'commit')
+$RetireKind = 'retire-slot'
+$RetireSteps = @('withdraw', 'drain', 'stop', 'deregister', 'clear-local', 'remove-containers', 'commit')
+$script:ApplyExit = 0
+
+function Set-RecordValue($Record, [string] $Name, $Value) { $Record | Add-Member -Force -NotePropertyName $Name -NotePropertyValue $Value }
+
+function Save-Inventory($Inventory) {
+    Set-RecordValue $Inventory 'generation' ([int]$Inventory.generation + 1)
+    Write-HostInventory $Inventory
+}
+
+# The names Get-LinuxSlots or Get-WindowsSlots gives a recorded slot, whatever state it is in now.
+function Get-RecordRow($Record) {
+    $probe = [pscustomobject]@{ slots = @([pscustomobject]@{ slotId = $Record.slotId; platform = $Record.platform; state = 'active'; legacy = [bool]$Record.legacy; containers = @($Record.containers) }) }
+    $rows = if ($Record.platform -eq 'linux') { Get-LinuxSlots $Config $probe $null } else { Get-WindowsSlots $Config $probe $null -InstallRoot $InstallRoot }
+    $row = @($rows) | Select-Object -First 1
+    if ($row -and $Record.platform -eq 'windows' -and $Record.PSObject.Properties['installPath'] -and $Record.installPath) { $row.InstallPath = [string]$Record.installPath }
+    $row
+}
+
+# Every live composed Linux slot, whatever the count says: a slot waiting to be retired still runs on compose.
+function Get-ComposedLinuxSlots($Inventory) { @(Get-LinuxSlots $Config $Inventory $null | Where-Object Composed) }
+
+# Why no slot can be added now, or $null. Checked once, before any add.
+function Get-AddBlocker($Inventory, $Adds) {
+    $scope = Get-InventoryScope $Inventory
+    if (-not $scope) { return 'no GitHub scope is known (no inventory scope and no github.url).' }
+    $group = Test-RunnerGroup $scope @()
+    if ($group.state -in 'blocked', 'unknown') { return "the runner group check is $($group.state): $(@($group.findings | ForEach-Object { $_.message }) -join ' ')" }
+    $linux = @($Adds | Where-Object { $_.platform -eq 'linux' })
+    $windows = @($Adds | Where-Object { $_.platform -eq 'windows' })
+    if ($windows.Count -and -not $IsWindows) { return 'Windows slots are added only on Windows.' }
+    if ($windows.Count -and -not $InstallRoot) { return 'no -InstallRoot is known for the Windows clones.' }
+    $paths = @(@(if ($linux.Count) { $Root }) + @(if ($windows.Count) { $InstallRoot }))
+    foreach ($disk in @(Get-FreeDiskReport $paths)) {
+        if ($disk.Low) { return "drive $($disk.Drive) has $($disk.FreeGB) GB free, below housekeeping.minFreeGB ($($disk.MinimumGB) GB)." }
+    }
+    if ($linux.Count) {
+        $image = Get-ImageId $Config.linux.image
+        if ($image.State -ne 'present') { return "the image $($Config.linux.image) is $(if ($image.State -eq 'absent') { 'not built' } else { "unknown ($($image.Reason))" })." }
+    }
+    $null
+}
+
+# The compose containers a Linux slot would get: absent, or already this host's compose ones for that slot.
+function Assert-LinuxNamesFree($Row) {
+    foreach ($name in @($Row.Container, $Row.DockerContainer) | Where-Object { $_ }) {
+        $found = Get-ContainerRecord $name
+        if ($found.State -eq 'unknown') { throw "Apply refused: whether a container named $name exists is unknown ($($found.Reason)). Nothing was changed." }
+        if ($found.State -eq 'present' -and -not (Test-OurComposeContainer $found $Row.SlotId)) { throw "Apply refused: a container named $name ($($found.Id)) exists and is not this host's compose $($Row.SlotId). Nothing was changed." }
+    }
+}
+
+function Invoke-AddProvision($Operation, $Step, $Inventory, $Row) {
+    $record = Get-InventorySlot $Inventory $Row.SlotId
+    if (-not $record) {
+        $directory = if ($Row.Platform -eq 'linux') { Join-Path $Root $Row.Directory } else { Join-Path $Row.InstallPath $Config.windows.directory }
+        $record = [pscustomobject][ordered]@{
+            slotId = $Row.SlotId; platform = $Row.Platform; state = 'provisioning'; legacy = $false
+            runnerName = $Row.RunnerName; scope = (Get-InventoryScope $Inventory)
+            registrationDirectory = (Get-CanonicalPath $directory); containers = @()
+            provisionedUtc = [DateTime]::UtcNow.ToString('o'); operationId = $Operation.id
+        }
+        if ($Row.Platform -eq 'windows') { Set-RecordValue $record 'installPath' (Get-CanonicalPath $Row.InstallPath) }
+        Set-RecordValue $Inventory 'slots' @(@($Inventory.slots | Where-Object { $_ }) + $record)
+        Save-Inventory $Inventory
+    } elseif ($record.state -ne 'provisioning') {
+        throw "Apply stopped: $($Row.SlotId) is $($record.state) in the inventory, not provisioning. The journal is kept."
+    }
+    if ($Row.Platform -eq 'linux') { New-Item -ItemType Directory -Force -Path $record.registrationDirectory | Out-Null }
+    Complete-OperationStep $Operation $Step
+}
+
+# The registration the slot's directory holds, checked against the slot's name, recorded in the journal and the inventory.
+function Save-AddRegistration($Operation, $Step, $Inventory, $Record) {
+    $registration = Get-LocalRegistration ([string]$Record.registrationDirectory)
+    if (-not $registration -or -not $registration.agentId) { throw "Apply stopped at register: $($Record.registrationDirectory)\.runner records no agentId. The journal is kept." }
+    if ($registration.agentName -ine $Record.runnerName) { throw "Apply stopped at register: $($Record.registrationDirectory)\.runner is $($registration.agentName), not $($Record.runnerName). The journal is kept." }
+    Set-StepFact $Operation $Step 'runnerId' ([int64]$registration.agentId)
+    Set-RecordValue $Record 'runnerId' ([int64]$registration.agentId)
+    Save-Inventory $Inventory
+}
+
+function Invoke-AddRegister($Operation, $Step, $Inventory, $Row, $Record) {
+    $dir = [string]$Record.registrationDirectory
+    if (-not (Get-LocalRegistration $dir)) {
+        $scope = [string]$Record.scope
+        if ($Row.Platform -eq 'linux') {
+            $arguments = @('configure', '--unattended', '--url', $Config.github.url, '--name', $Record.runnerName, '--labels', ($Row.Labels -join ','), '--work', $Config.linux.workFolder)
+            $orphan = Get-GitHubRunner $scope $Record.runnerName
+            if ($orphan) {
+                "  GitHub already has a runner named $($Record.runnerName) (id $($orphan.Id)) that no registration here owns; it is replaced."
+                $arguments += '--replace'
+            }
+            $token = Get-RunnerToken $scope 'registration'
+            $run = Invoke-Docker (@('run', '--rm', '--mount', "type=bind,source=$dir,target=/runner", $Config.linux.image) + $arguments + @('--token', $token))
+            if ($run.ExitCode -ne 0) {
+                $output = "$($run.Output)".Replace($token, '***')
+                throw "Apply stopped at register: configuring $($Record.runnerName) exited $($run.ExitCode): $output The journal is kept."
+            }
+        } else {
+            $clone = [string]$Record.installPath
+            Sync-RunnerSetupInstance -Clone $clone -InstanceId $Row.InstanceId -SourceCommit (Get-GitCommit $Root) -GitHubUrl $Config.github.url
+            Write-HostSettings -Clone $clone -Settings (New-HostSettings $Config $Row)
+            Install-RunnerSetupInstance -Clone $clone -InstanceId $Row.InstanceId -GitHubUrl $Config.github.url -Labels $Row.HostLabels -Name $Record.runnerName | Out-Host
+        }
+    }
+    Save-AddRegistration $Operation $Step $Inventory $Record
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-AddCreate($Operation, $Step, $Inventory, $Row) {
+    if ($Row.Platform -eq 'linux') {
+        Initialize-LinuxSlotResources $Config $Row
+        $file = Write-LinuxComposeFile (Get-ComposedLinuxSlots $Inventory)
+        $new = [Collections.Generic.List[object]]::new()
+        foreach ($entry in @(Get-StepFact $Step 'new')) { $new.Add($entry) }
+        $journaled = @($new | ForEach-Object { $_.id })
+        $wanted = @(@(if ($Row.DockerContainer) { [pscustomobject]@{ role = 'docker'; name = $Row.DockerContainer; service = "$($Row.SlotId)-docker" } }) + [pscustomobject]@{ role = 'runner'; name = $Row.Container; service = $Row.SlotId })
+        foreach ($item in $wanted) {
+            $found = Get-ContainerRecord $item.name
+            if ($found.State -eq 'unknown') { throw "Apply stopped: whether $($item.name) exists is unknown ($($found.Reason)). The journal is kept." }
+            if ($found.State -eq 'present' -and $found.Id -notin $journaled -and -not (Test-OurComposeContainer $found $Row.SlotId)) { throw "Apply stopped: a container named $($item.name) ($($found.Id)) exists and is not this host's compose $($Row.SlotId). The journal is kept." }
+            $up = Invoke-LinuxCompose -File $file -Verb up -Services @($item.service)
+            if ($up.ExitCode -ne 0) { throw "Apply stopped: compose up $($item.service) exited $($up.ExitCode): $($up.Output) The journal is kept." }
+            $created = Get-ContainerRecord $item.name
+            if ($created.State -ne 'present') { throw "Apply stopped: $($item.name) is $($created.State) after compose up. $($created.Reason) The journal is kept." }
+            if ($created.Id -notin $journaled) {
+                @($new | Where-Object { $_.role -eq $item.role }) | ForEach-Object { [void]$new.Remove($_) }
+                $new.Add([pscustomobject][ordered]@{ role = $item.role; name = $created.Name; id = $created.Id })
+                Set-StepFact $Operation $Step 'new' $new.ToArray()
+            }
+            if ($item.role -eq 'docker' -and -not (Wait-ComposeSidecarReady $item.name)) { throw "Apply stopped: the Docker sidecar $($item.name) did not become ready. The journal is kept." }
+        }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-AddVerify($Operation, $Step, $Record) {
+    $runnerId = [int64]$Record.runnerId
+    $newRunner = @(Get-StepFact (Get-OperationStep $Operation 'create') 'new' | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+    $deadline = [DateTime]::UtcNow.AddSeconds([int]$Config.lifecycle.startTimeoutSeconds)
+    while ($true) {
+        $why = $null
+        if ($Record.platform -eq 'linux') {
+            $container = Get-ContainerRecord $newRunner.id
+            if ($container.State -ne 'present' -or $container.Name -ne $newRunner.name) { $why = "the container $($newRunner.name) ($($newRunner.id)) is $($container.State) $($container.Reason)" }
+            elseif (-not $container.Running) { $why = "the container $($newRunner.name) is not running" }
+        }
+        if (-not $why) {
+            $listing = Get-ScopeRunners ([string]$Record.scope)
+            $match = if ($listing.State -eq 'known') { $listing.Runners | Where-Object { [int64]$_.id -eq $runnerId } | Select-Object -First 1 }
+            $why = if ($listing.State -ne 'known') { "GitHub could not be read ($($listing.Reason))" }
+            elseif (-not $match) { "GitHub has no runner with id $runnerId" }
+            elseif ($match.name -ne $Record.runnerName) { "GitHub's runner $runnerId is named $($match.name), not $($Record.runnerName)" }
+            elseif ($match.status -ne 'online') { "GitHub reports runner $runnerId $($match.status)" }
+        }
+        if (-not $why) { break }
+        if ([DateTime]::UtcNow -ge $deadline) { throw "Apply stopped at verify of $($Record.slotId): $why. The journal is kept; rerun Apply to check again." }
+        Start-Sleep -Seconds ([Math]::Max(1, [int]$Config.lifecycle.pollSeconds))
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-AddCommit($Operation, $Step, $Inventory, $Record) {
+    if ($Record.platform -eq 'linux') {
+        $containers = @(foreach ($entry in Get-RunnerFirst @(Get-StepFact (Get-OperationStep $Operation 'create') 'new')) {
+                $found = Get-ContainerRecord $entry.id
+                if ($found.State -ne 'present') { throw "Apply stopped at commit: the new container $($entry.name) ($($entry.id)) is $($found.State). $($found.Reason) The journal is kept." }
+                [ordered]@{ role = $entry.role; id = $found.Id; name = $found.Name; image = $found.Image; labels = $found.Labels }
+            })
+        Set-RecordValue $Record 'containers' $containers
+    } else {
+        $clone = [string]$Record.installPath
+        $registration = Get-LocalRegistration ([string]$Record.registrationDirectory)
+        Set-RecordValue $Record 'workPath' (Resolve-RunnerWorkFolder $(if ($registration.workFolder) { $registration.workFolder } else { $Config.windows.workFolder }) $Record.registrationDirectory)
+        Set-RecordValue $Record 'sourceCommit' (Get-GitCommit $clone)
+        Set-RecordValue $Record 'generatedSettingsHash' (Get-HostSettingsRecord -Clone $clone)
+    }
+    $Record.state = 'active'
+    Set-RecordValue $Record 'addedUtc' ([DateTime]::UtcNow.ToString('o'))
+    Save-Inventory $Inventory
+    Complete-OperationStep $Operation $Step
+    Remove-HostOperation
+}
+
+function Invoke-SlotAdd($Inventory, $Operation, [string] $SlotId, [string] $Platform) {
+    if ($Operation) { $Platform = [string]$Operation.platform }
+    $row = Get-RecordRow ([pscustomobject]@{ slotId = $SlotId; platform = $Platform; legacy = $false; containers = @() })
+    if (-not $row) { throw "Apply stopped: no $Platform slot $SlotId can be named." }
+    if ($Platform -eq 'windows' -and -not $row.InstallPath) { throw "Apply stopped: no -InstallRoot is known for $SlotId's clone." }
+    if (-not $Operation) {
+        if ($Platform -eq 'linux') { Assert-LinuxNamesFree $row }
+        $Operation = New-HostOperation -Kind $AddKind -SlotId $SlotId -Steps $AddSteps
+        Set-RecordValue $Operation 'platform' $Platform
+        Write-HostOperation $Operation
+        "Adding $SlotId ($($row.RunnerName)): operation $($Operation.id)."
+    } else { "Resuming operation $($Operation.id) ($AddKind) on $SlotId." }
+    foreach ($step in @($Operation.steps)) {
+        if ($step.state -eq 'done') { continue }
+        $record = Get-InventorySlot $Inventory $SlotId
+        if ($step.name -ne 'provision' -and -not $record) { throw "Apply stopped: the inventory has no slot $SlotId although operation $($Operation.id) provisioned it. The journal is kept." }
+        switch ($step.name) {
+            'provision' { Invoke-AddProvision $Operation $step $Inventory $row }
+            'register' { Invoke-AddRegister $Operation $step $Inventory $row $record }
+            'create' { Invoke-AddCreate $Operation $step $Inventory $row }
+            'verify' { Invoke-AddVerify $Operation $step $record }
+            'commit' { Invoke-AddCommit $Operation $step $Inventory $record }
+            default { throw "Apply stopped: operation $($Operation.id) has an unknown step '$($step.name)'. The journal is kept." }
+        }
+        "  $($step.name): done"
+    }
+    $record = Get-InventorySlot $Inventory $SlotId
+    "$SlotId is active as $($record.runnerName) with runner id $($record.runnerId)."
+}
+
+# A drain that ended without a hold: the slot goes back to active and the journal is deleted, so nothing is half-retired.
+function Undo-RetireStart($Inventory, $Record, [string] $Why) {
+    $Record.state = 'active'
+    Save-Inventory $Inventory
+    Remove-HostOperation
+    throw "Apply stopped: $Why The retire of $($Record.slotId) was not started (state back to active, journal deleted); rerun Apply -Retire when it is idle."
+}
+
+function Invoke-RetireWithdraw($Operation, $Step, $Inventory, $Record) {
+    if ($null -eq (Get-StepFact $Step 'heldBefore')) {
+        Set-StepFact $Operation $Step 'heldBefore' (Get-HeldBefore (Join-Path ([string]$Record.registrationDirectory) 'maintenance.json'))
+    }
+    if ($Record.state -ne 'retiring') {
+        $Record.state = 'retiring'
+        Save-Inventory $Inventory
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-RetireDrain($Operation, $Step, $Inventory, $Record) {
+    $dir = [string]$Record.registrationDirectory
+    $file = Join-Path $dir 'maintenance.json'
+    if (-not (Get-StepFact (Get-OperationStep $Operation 'withdraw') 'heldBefore')) {
+        if ($Record.platform -eq 'linux') {
+            $runner = @($Record.containers | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+            $busy = if ($runner) { Get-RunnerBusyCheck $runner.name } else { { $false } }
+            $drain = Enter-RunnerMaintenance -StateFile $file -RunnerDirectory $dir -IsBusy $busy -Reason 'retire' -TimeoutMinutes $Config.lifecycle.drainTimeoutMinutes
+            if ($drain.Outcome -eq 'timeout') { Undo-RetireStart $Inventory $Record $drain.Retained }
+            if ($drain.Outcome -eq 'failed') { throw "Apply stopped in the drain of $($Record.slotId): $(@($drain.Failures) -join ' ') The journal is kept; rerun Apply -Retire." }
+        } else {
+            $result = Invoke-InstanceAction $Record 'Maintenance'
+            if ($result.ExitCode -ne 0) {
+                if (Test-Path -LiteralPath $file) { throw "Apply stopped in the drain of $($Record.slotId) (exit $($result.ExitCode)): $($result.Output) The journal is kept; rerun Apply -Retire." }
+                Undo-RetireStart $Inventory $Record "$($Record.slotId) did not drain (exit $($result.ExitCode)): $($result.Output)"
+            }
+        }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-RetireStop($Operation, $Step, $Record) {
+    if ($Record.platform -eq 'linux') {
+        foreach ($entry in Get-RunnerFirst @($Record.containers)) {
+            $found = Get-ContainerRecord $entry.id
+            if ($found.State -eq 'absent') { continue }
+            if ($found.State -eq 'unknown') { throw "Apply stopped: whether $($entry.name) ($($entry.id)) exists is unknown ($($found.Reason)). The journal is kept." }
+            if ($found.Name -ne $entry.name) { throw "Apply stopped: the recorded container $($entry.id) is now named $($found.Name), not $($entry.name). The journal is kept." }
+            $stop = Stop-LinuxContainer $found.Id
+            if ($stop.Result -eq 'failed') { throw "Apply stopped: $($stop.Detail) The journal is kept." }
+        }
+    }
+    # A Windows slot was stopped and held by its own Maintenance action in the drain.
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-RetireDeregister($Operation, $Step, $Inventory, $Record) {
+    $scope = if ($Record.scope) { [string]$Record.scope } else { Get-InventoryScope $Inventory }
+    $runner = Get-GitHubRunner $scope $Record.runnerName
+    if (-not $runner) { "  GitHub has no runner named $($Record.runnerName); nothing to remove there." }
+    elseif ($Record.runnerId -and [int64]$runner.Id -ne [int64]$Record.runnerId) { "  GitHub's $($Record.runnerName) is id $($runner.Id), not the recorded $($Record.runnerId); it is not this slot's and is left alone." }
+    else {
+        try { Remove-GitHubRunner $scope $runner.Id }
+        catch { if ($_.Exception.Message -notmatch '404|Not Found') { throw } }
+    }
+    Set-StepFact $Operation $Step 'deregistered' $true
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-RetireClearLocal($Operation, $Step, $Record) {
+    foreach ($name in '.runner', '.credentials', '.credentials_rsaparams') {
+        $path = Join-Path ([string]$Record.registrationDirectory) $name
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-RetireRemoveContainers($Operation, $Step, $Record) {
+    if ($Record.platform -eq 'linux') {
+        foreach ($entry in Get-RunnerFirst @($Record.containers)) {
+            $found = Get-ContainerRecord $entry.id
+            if ($found.State -eq 'absent') { continue }
+            if ($found.State -eq 'unknown') { throw "Apply stopped: whether $($entry.name) ($($entry.id)) exists is unknown ($($found.Reason)). The journal is kept." }
+            if ($found.Name -ne $entry.name -and -not (Test-OurComposeContainer $found $Record.slotId)) { throw "Apply stopped: the recorded container $($entry.id) is now named $($found.Name), not $($entry.name); it was left alone. The journal is kept." }
+            $removed = Remove-LinuxContainer $found.Id
+            if ($removed.Result -eq 'failed') { throw "Apply stopped: $($removed.Detail) The journal is kept." }
+        }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-RetireCommit($Operation, $Step, $Inventory, $Record) {
+    $Record.state = 'retired'
+    Set-RecordValue $Record 'retiredUtc' ([DateTime]::UtcNow.ToString('o'))
+    Save-Inventory $Inventory
+    if ($Record.platform -eq 'linux') { Write-LinuxComposeFile (Get-ComposedLinuxSlots $Inventory) | Out-Null }
+    Complete-OperationStep $Operation $Step
+    Remove-HostOperation
+}
+
+function Invoke-SlotRetire($Inventory, $Operation, [string] $SlotId) {
+    $record = Get-InventorySlot $Inventory $SlotId
+    if (-not $record) { throw "Apply stopped: the inventory has no slot $SlotId to retire." }
+    if (-not $Operation) {
+        if ($record.state -ne 'active') { throw "Apply refused: $SlotId is $($record.state), not active." }
+        if (-not $record.registrationDirectory) { throw "Apply refused: $SlotId records no registration directory." }
+        $Operation = New-HostOperation -Kind $RetireKind -SlotId $SlotId -Steps $RetireSteps
+        Set-RecordValue $Operation 'platform' ([string]$record.platform)
+        Write-HostOperation $Operation
+        "Retiring $SlotId ($($record.runnerName), id $($record.runnerId)): operation $($Operation.id)."
+    } else { "Resuming operation $($Operation.id) ($RetireKind) on $SlotId." }
+    foreach ($step in @($Operation.steps)) {
+        if ($step.state -eq 'done') { continue }
+        switch ($step.name) {
+            'withdraw' { Invoke-RetireWithdraw $Operation $step $Inventory $record }
+            'drain' { Invoke-RetireDrain $Operation $step $Inventory $record }
+            'stop' { Invoke-RetireStop $Operation $step $record }
+            'deregister' { Invoke-RetireDeregister $Operation $step $Inventory $record }
+            'clear-local' { Invoke-RetireClearLocal $Operation $step $record }
+            'remove-containers' { Invoke-RetireRemoveContainers $Operation $step $record }
+            'commit' { Invoke-RetireCommit $Operation $step $Inventory $record }
+            default { throw "Apply stopped: operation $($Operation.id) has an unknown step '$($step.name)'. The journal is kept." }
+        }
+        "  $($step.name): done"
+    }
+    "$SlotId is retired. What it left on disk (directory, clone, volumes) stays until Apply -Prune."
+}
+
+# windows-legacy goes only once win01 runs: active, with a runner ID GitHub reports online. Returns why not, or $null.
+function Get-LegacyRetireBlocker($Inventory) {
+    $win01 = Get-InventorySlot $Inventory 'win01'
+    if (-not $win01 -or $win01.state -ne 'active' -or -not $win01.runnerId) { return 'win01 is not active yet.' }
+    $listing = Get-ScopeRunners $(if ($win01.scope) { [string]$win01.scope } else { Get-InventoryScope $Inventory })
+    if ($listing.State -ne 'known') { return "GitHub could not be read to see win01 online ($($listing.Reason))." }
+    $runner = $listing.Runners | Where-Object { [int64]$_.id -eq [int64]$win01.runnerId } | Select-Object -First 1
+    if (-not $runner -or $runner.status -ne 'online') { return "GitHub does not report win01 (id $($win01.runnerId)) online." }
+    $null
+}
+
+# --- Apply -Prune: what a migration kept for rollback, and what retired slots left.
+
+# A kept container is removed only when the recorded ID still names a stopped container with the recorded name; one that is
+# gone is dropped from the record; anything else is kept and reported.
+function Invoke-PruneKept($Inventory, $Slot) {
+    $changed = $false
+    $remaining = [Collections.Generic.List[object]]::new()
+    foreach ($entry in Get-RunnerFirst @($Slot.keptForRollback)) {
+        $found = Get-ContainerRecord $entry.id
+        $keep = $null
+        switch ($found.State) {
+            'absent' { "$($Slot.slotId): $($entry.name) ($($entry.id)) is already gone; record dropped." }
+            'unknown' { $keep = "whether it exists is unknown ($($found.Reason))" }
+            default {
+                if ($found.Id -ne $entry.id) { $keep = "docker reports it as $($found.Id), not the recorded ID" }
+                elseif ($found.Name -ne $entry.name) { $keep = "it is now named $($found.Name), not $($entry.name)" }
+                elseif ($found.Running -ne $false) { $keep = 'it is running' }
+                else {
+                    $remove = Invoke-Docker @('rm', $entry.id)
+                    $after = Get-ContainerRecord $entry.id
+                    if ($after.State -eq 'absent') { "$($Slot.slotId): removed $($entry.name) ($($entry.id))." }
+                    else { $keep = "docker rm exited $($remove.ExitCode): $($remove.Output) and it is still $($after.State)" }
+                }
+            }
+        }
+        if ($keep) {
+            $remaining.Add($entry)
+            $script:HostFailed = $true
+            [Console]::Error.WriteLine("$($Slot.slotId): kept $($entry.name) ($($entry.id)): $keep. Nothing else under that name is touched.")
+        } else { $changed = $true }
+    }
+    Set-RecordValue $Slot 'keptForRollback' $remaining.ToArray()
+    $changed
+}
+
+# Removes a Docker volume or network by name; gone already counts as removed. Returns why it is kept, or $null.
+function Remove-DockerObject([string] $Kind, [string] $Name) {
+    $result = Invoke-Docker @($Kind, 'rm', $Name)
+    if ($result.ExitCode -eq 0) { return $null }
+    if ($null -ne $result.ExitCode -and $result.Output -match 'No such|not found') { return $null }
+    "docker $Kind rm $Name exited $($result.ExitCode): $($result.Output)"
+}
+
+# What a retired slot left: the Linux directory and volumes (and the sidecar network), or the Windows clone. The clone of
+# windows-legacy is this checkout and is never removed. The slot becomes pruned only when nothing is left.
+function Invoke-PruneRetired($Slot) {
+    $kept = [Collections.Generic.List[string]]::new()
+    $row = Get-RecordRow $Slot
+    if ($Slot.platform -eq 'linux') {
+        $dir = [string]$Slot.registrationDirectory
+        if ($dir -and (Test-Path -LiteralPath $dir)) {
+            if (-not (Test-PathUnder $dir $Root)) { $kept.Add("$dir is not inside $Root") }
+            elseif (-not (Remove-PathBounded -Path $dir)) { $kept.Add("$dir is still in use") }
+        }
+        $volumes = @($row.Volumes.Cache)
+        if ($Config.linux.docker.mode -eq 'sidecar') { $volumes += @($row.Volumes.DockerData, $row.Volumes.DockerCerts, $row.Volumes.Work, $row.Volumes.Runtimes) }
+        elseif ($Config.linux.docker.mode -eq 'dind') { $volumes += $row.Volumes.Dind }
+        foreach ($volume in $volumes | Where-Object { $_ }) { $why = Remove-DockerObject 'volume' $volume; if ($why) { $kept.Add($why) } }
+        if ($row.Network) { $why = Remove-DockerObject 'network' $row.Network; if ($why) { $kept.Add($why) } }
+    } else {
+        $clone = [string]$Slot.installPath
+        if ($clone -and (Test-PathUnder $clone $Root)) { "$($Slot.slotId): $clone is this checkout; it is kept (only its registration was removed)." }
+        elseif ($clone -and (Test-Path -LiteralPath $clone)) {
+            if ((Split-Path $clone -Leaf) -cnotmatch '^win\d{2}$') { $kept.Add("$clone is not an instance clone (winNN)") }
+            elseif (-not (Remove-PathBounded -Path $clone)) { $kept.Add("$clone is still in use") }
+        }
+    }
+    if ($kept.Count) {
+        $script:HostFailed = $true
+        [Console]::Error.WriteLine("$($Slot.slotId): not fully pruned: $($kept -join '; '). It stays retired; rerun Apply -Prune.")
+        return $false
+    }
+    $Slot.state = 'pruned'
+    Set-RecordValue $Slot 'prunedUtc' ([DateTime]::UtcNow.ToString('o'))
+    "$($Slot.slotId): pruned."
+    $true
+}
+
 function Invoke-Prune($Inventory) {
     $operation = Read-HostOperation
     if ($operation.State -eq 'readable') { throw "Apply -Prune refused: the operation $($operation.Value.kind) ($($operation.Value.id)) is unfinished; finish it with Apply (or Apply -Rollback) first." }
     $changed = $false
-    $any = $false
-    foreach ($slot in @($Inventory.slots | Where-Object { $_ -and $_.PSObject.Properties['keptForRollback'] -and @($_.keptForRollback).Count })) {
-        $any = $true
-        $remaining = [Collections.Generic.List[object]]::new()
-        foreach ($entry in Get-RunnerFirst @($slot.keptForRollback)) {
-            $found = Get-ContainerRecord $entry.id
-            $keep = $null
-            switch ($found.State) {
-                'absent' { "$($slot.slotId): $($entry.name) ($($entry.id)) is already gone; record dropped." }
-                'unknown' { $keep = "whether it exists is unknown ($($found.Reason))" }
-                default {
-                    if ($found.Id -ne $entry.id) { $keep = "docker reports it as $($found.Id), not the recorded ID" }
-                    elseif ($found.Name -ne $entry.name) { $keep = "it is now named $($found.Name), not $($entry.name)" }
-                    elseif ($found.Running -ne $false) { $keep = 'it is running' }
-                    else {
-                        $remove = Invoke-Docker @('rm', $entry.id)
-                        $after = Get-ContainerRecord $entry.id
-                        if ($after.State -eq 'absent') { "$($slot.slotId): removed $($entry.name) ($($entry.id))." }
-                        else { $keep = "docker rm exited $($remove.ExitCode): $($remove.Output) and it is still $($after.State)" }
-                    }
-                }
-            }
-            if ($keep) {
-                $remaining.Add($entry)
-                $script:HostFailed = $true
-                [Console]::Error.WriteLine("$($slot.slotId): kept $($entry.name) ($($entry.id)): $keep. Nothing else under that name is touched.")
-            } else { $changed = $true }
-        }
-        $slot | Add-Member -Force -NotePropertyName keptForRollback -NotePropertyValue $remaining.ToArray()
+    $withKept = @($Inventory.slots | Where-Object { $_ -and $_.PSObject.Properties['keptForRollback'] -and @($_.keptForRollback).Count })
+    $retired = @($Inventory.slots | Where-Object { $_ -and $_.state -eq 'retired' })
+    if (-not $withKept.Count -and -not $retired.Count) { 'Nothing is kept for rollback; nothing to prune.'; return }
+    foreach ($slot in $withKept) {
+        $results = @(Invoke-PruneKept $Inventory $slot)
+        $results | Select-Object -SkipLast 1
+        if ($results[-1] -eq $true) { $changed = $true }
     }
-    if (-not $any) { 'Nothing is kept for rollback; nothing to prune.'; return }
-    if ($changed) {
-        $Inventory | Add-Member -Force -NotePropertyName generation -NotePropertyValue ([int]$Inventory.generation + 1)
-        Write-HostInventory $Inventory
+    foreach ($slot in $retired) {
+        $results = @(Invoke-PruneRetired $slot)
+        $results | Select-Object -SkipLast 1
+        if ($results[-1] -eq $true) { $changed = $true }
     }
+    if ($changed) { Save-Inventory $Inventory }
 }
 
 function Invoke-Apply {
@@ -972,15 +1407,59 @@ function Invoke-Apply {
             Invoke-MigrationRollback $inventory $op
             return
         }
+        if ($ExpectPlan) {
+            $reviewed = Get-HostPlan
+            if ($reviewed.planHash -ne $ExpectPlan) { throw "Apply refused: the plan is now $($reviewed.planHash), not the reviewed $ExpectPlan. Nothing was changed; review -Action Plan again." }
+        }
+        $acted = $false
         if ($op) {
-            if ($op.kind -ne $MigrationKind) { throw "Apply refused: the unfinished operation $($op.kind) ($($op.id)) is not one this version of Apply finishes." }
             if ($op.PSObject.Properties['rollingBack'] -and $op.rollingBack) { throw "Apply refused: operation $($op.id) was being rolled back. Finish that with Apply -Rollback." }
-            Invoke-LegacyMigration $inventory $op
-            return
+            switch ($op.kind) {
+                $MigrationKind { Invoke-LegacyMigration $inventory $op }
+                $AddKind { Invoke-SlotAdd $inventory $op $op.slotId }
+                $RetireKind { Invoke-SlotRetire $inventory $op $op.slotId }
+                default { throw "Apply refused: the unfinished operation $($op.kind) ($($op.id)) is not one this version of Apply finishes." }
+            }
+            $acted = $true
+            $inventory = Assert-HostInventoryUsable 'Apply'
         }
         $row = @(Get-LinuxSlots $Config $inventory | Where-Object { $_.SlotId -eq 'linux-01' -and $_.Legacy -and -not $_.New -and -not $_.Composed }) | Select-Object -First 1
-        if ($row) { Invoke-LegacyMigration $inventory $null; return }
-        'Nothing to migrate: the pre-pool Linux runner is not in the inventory, or already runs on compose. Other plan changes (add, retire, update) are not applied by this version; see -Action Plan.'
+        if ($row) {
+            Invoke-LegacyMigration $inventory $null
+            $acted = $true
+            $inventory = Assert-HostInventoryUsable 'Apply'
+        }
+        $plan = Get-HostPlan
+        $adds = @($plan.changes | Where-Object { $_.kind -eq 'add' })
+        $retires = @($plan.changes | Where-Object { $_.kind -eq 'retire' })
+        if ($adds.Count) {
+            $blocker = Get-AddBlocker $inventory $adds
+            if ($blocker) {
+                $script:HostFailed = $true
+                [Console]::Error.WriteLine("Apply added no slot ($(@($adds | ForEach-Object { $_.slotId }) -join ', ')): $blocker")
+            } else {
+                foreach ($add in $adds) {
+                    Invoke-SlotAdd $inventory $null $add.slotId $add.platform
+                    $inventory = Assert-HostInventoryUsable 'Apply'
+                }
+            }
+            $acted = $true
+        }
+        foreach ($change in $retires) {
+            $acted = $true
+            if (-not $Retire) {
+                "Not retired: $($change.slotId) ($($change.runnerName)) is no longer wanted; rerun Apply -Retire to retire it."
+                $script:ApplyExit = 3
+                continue
+            }
+            if ($change.Contains('after')) {
+                $why = Get-LegacyRetireBlocker $inventory
+                if ($why) { "Deferred: $($change.slotId) is retired only after $($change.after): $why"; $script:ApplyExit = 3; continue }
+            }
+            Invoke-SlotRetire $inventory $null $change.slotId
+            $inventory = Assert-HostInventoryUsable 'Apply'
+        }
+        if (-not $acted) { 'Nothing to migrate, add or retire: the slots match the settings. Update changes are not applied by this version; see -Action Plan.' }
     }
 }
 
@@ -1025,7 +1504,7 @@ try {
         'AutoStart' { Invoke-AutoStart; exit [int]$script:HostFailed }
         'Hold' { Invoke-Hold; exit [int]$script:HostFailed }
         'Resume' { Invoke-Resume; exit [int]$script:HostFailed }
-        'Apply' { Invoke-Apply; exit [int]$script:HostFailed }
+        'Apply' { Invoke-Apply; exit $(if ($script:HostFailed) { 1 } else { [int]$script:ApplyExit }) }
         'Startup' { Set-StartupEntry; exit 0 }
         'Plan' {
             $plan = Get-HostPlan

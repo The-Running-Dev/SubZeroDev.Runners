@@ -414,8 +414,8 @@ registrations through `Registration.ps1`. Never commit on `main`; one pull reque
 - **Windows runner in a dedicated VM.** Same `windows\` folder and scripts, run inside a VM
   built for it; the supervisor is still started explicitly (`Manage-WindowsRunner.ps1 -Action Start`).
 - **Linux stays a container.** Only the host it runs on may change.
-- **Host manager `Apply`.** Adding and retiring slots, legacy Linux migration and `Update` are planned
-  ([design](design/30-slices.md)); today the host manager reports (`Plan`, `Status`) and holds and resumes.
+- **Host manager `Update`.** Image and clone updates are planned ([design](design/30-slices.md)); today
+  `Apply` migrates the legacy Linux runner and adds and retires slots ([host management](docs/host-management.md)).
 - **Dev Drive.** Still supported in Windows 11 (only the Dev Home app was retired). A ReFS
   volume with Defender performance mode, at least 50 GB, created from Settings or as a VHDX.
   Fits `windows\_work`, `windows\_nuget` and other caches; Microsoft advises keeping SDKs
