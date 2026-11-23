@@ -296,14 +296,18 @@ function Get-LinuxSlots($Config, $Inventory, $Count = $Config.linux.count) {
         $slotId = "linux-$nn"
         $record = Get-InventorySlot $Inventory $slotId
         $legacy = [bool]($record -and $record.legacy)
+        $live = [bool]($record -and $record.state -in 'provisioning', 'active')
+        $recordedRunner = if ($record) { @($record.containers | Where-Object { $_ -and $_.role -eq 'runner' }) | Select-Object -First 1 }
         if ($legacy -and $number -ne 1) { throw "Inventory marks $slotId legacy; only slot 01 can be the pre-pool runner." }
         $suffix = if ($legacy) { '' } else { "-$nn" }
         [pscustomobject][ordered]@{
             Platform = 'linux'
             Number = $number
             SlotId = $slotId
-            New = -not ($record -and $record.state -in 'provisioning', 'active')
+            New = -not $live
             Legacy = $legacy
+            # In the compose file: a live slot, and for the pre-pool slot only once Apply has moved it onto its compose containers.
+            Composed = $live -and (-not $legacy -or ($recordedRunner -and $recordedRunner.name -eq "$($Config.linux.container)-$nn"))
             RunnerName = $(if ($legacy) { $Config.linux.name } else { "$($Config.linux.name).$hostId.$nn" })
             Directory = "$($Config.linux.directory)$suffix"
             Container = "$($Config.linux.container)-$nn"

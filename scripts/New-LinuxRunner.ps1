@@ -54,7 +54,7 @@ function Invoke-LinuxImageBuild($ImageBuild) {
 function Get-ComposeSlots {
     $inventory = Read-HostInventory
     if ($inventory.State -ne 'readable') { return @() }
-    $slots = @(Get-LinuxSlots $Config $inventory.Value | Where-Object { -not $_.Legacy -and -not $_.New })
+    $slots = @(Get-LinuxSlots $Config $inventory.Value | Where-Object { $_.Composed })
     if ($Slot) { $slots = @($slots | Where-Object { $_.SlotId -eq $Slot }) }
     $slots
 }
@@ -154,6 +154,12 @@ try {
         [Console]::Error.WriteLine("The host inventory cannot be read ($($hostInventory.Reason)); refusing to guess which containers exist. Fix or restore $($hostInventory.Path) (Manage-RunnerHost -Action Status explains it).")
         exit 1
     }
+    $hostOperation = Read-HostOperation
+    if ($hostOperation.State -ne 'absent') {
+        $what = if ($hostOperation.State -eq 'readable') { "the unfinished operation $($hostOperation.Value.kind) ($($hostOperation.Value.id)) on $($hostOperation.Value.slotId)" } else { "the operation journal $($hostOperation.Path), which cannot be read ($($hostOperation.Reason))," }
+        [Console]::Error.WriteLine("Refused: $what may be changing these containers. Finish it with Manage-RunnerHost -Action Apply first (or Apply -Rollback).")
+        exit 1
+    }
     $composeSlots = @(Get-ComposeSlots)
     if ($Slot -and -not $composeSlots.Count) {
         [Console]::Error.WriteLine("$Slot is not a compose slot in the host inventory (the pre-pool runner and unknown slots are not handled by -Slot).")
@@ -186,7 +192,7 @@ try {
         $imageBuild = Get-LinuxImageBuild
         $current = Get-LinuxImageContextHash $linux.image
         if ($Build -or $current -ne $imageBuild.Hash) { Invoke-LinuxImageBuild $imageBuild }
-        $allSlots = @(Get-LinuxSlots $Config (Read-HostInventory).Value | Where-Object { -not $_.Legacy -and -not $_.New })
+        $allSlots = @(Get-LinuxSlots $Config (Read-HostInventory).Value | Where-Object { $_.Composed })
         $composeFile = Get-LinuxComposeFilePath $Root
         $yaml = ConvertTo-LinuxComposeYaml $Config $allSlots $Root $PSScriptRoot
         if (-not (Test-Path -LiteralPath $composeFile) -or [IO.File]::ReadAllText($composeFile) -ne $yaml) { Write-FileAtomic $composeFile $yaml }
