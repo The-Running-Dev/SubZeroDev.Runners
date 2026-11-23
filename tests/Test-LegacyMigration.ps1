@@ -343,7 +343,7 @@ foreach ($point in @(
         $result = Invoke-Apply $f
         Assert-Exit $result 0 'Resuming operation'
         Assert-Migrated $f
-    }.GetNewClosure()
+    }
 }
 
 Test-Case 'A failed compose up keeps the journal and the pre-pool runner stopped and held; rerunning Apply finishes it' {
