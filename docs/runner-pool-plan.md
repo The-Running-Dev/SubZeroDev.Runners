@@ -326,7 +326,7 @@ nothing for another project's tests or packaging.
 | HotCorners | `ci.yml` `dotnet` (ActionTemplates input `os`) | Windows | all, until checked per project | non-UI tests, if they cross-build |
 | HotCorners | `release.yml` (`environment: release`) | Windows | all | no |
 | HotCorners | `claude-code-review.yml` | Linux | — | — |
-| Cleaner | `ci.yml` `dotnet` (ActionTemplates input `os`) | Windows | all, until checked per project | to be checked |
+| Cleaner | `ci.yml` `dotnet` (ActionTemplates input `os`; on the pool since L4-1) | Windows | all, until checked per project | to be checked |
 | Licensing | `ci.yml` `linux`, `package` | Linux | — | already Linux; needs Docker in the slot (image builds, acceptance topology), which dind provides |
 | Licensing | `ci.yml` `windows` | Windows | all: registry machine identity, 64- and 32-bit processes | no |
 | Licensing | `container.yml` `image` | Linux, ActionTemplates input `runs-on` (needs Docker) | — | already Linux; dind provides Docker |
@@ -345,7 +345,7 @@ the last to change in any repository.
 | L1 local | the BuildAgent build passes against the pinned image on a workstation | passed |
 | L2 workflow | the GitHub check passes on a self-hosted slot | **passed** on beast's `win02` ([run 45393284264](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393284264)), from a throwaway branch that changed only `runs-on`. `build.yml` on main (PR #4 merged) still targets GitHub-hosted `windows-latest`. |
 | L3 target host | on beast, after Apply: scale, hold, reboot and concurrency acceptance (handoff) | **passed** 2026-11-24 (S9, #34); step 2 not applicable. Evidence: [l3-beast-acceptance.md](l3-beast-acceptance.md) |
-| L4 generalization | each job that moves passes L2 on the pool; a job whose stage moves into BuildAgent also passes L1 ([runner-pool-l4.md](../handoffs/runner-pool-l4.md)) | not started; slices planned, D5 open |
+| L4 generalization | each job that moves passes L2 on the pool; a job whose stage moves into BuildAgent also passes L1 ([runner-pool-l4.md](../handoffs/runner-pool-l4.md)) | in progress. D5 approved (repository variables). L4-1 Cleaner `ci.yml` passed L2 on hosted and on the pool ([run 45487347854](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/actions/runs/45487347854)) and runs on the pool. |
 
 Mocked tests in this repository are L0 and are reported separately from all of these.
 
