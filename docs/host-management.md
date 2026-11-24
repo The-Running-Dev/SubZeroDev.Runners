@@ -166,8 +166,12 @@ Adding runs five journaled steps:
 | `commit` | Records the containers (or clone) and marks the slot `active` |
 
 Before anything changes, Apply refuses to add when the runner group allows public repositories, free disk is below
-`housekeeping.minFreeGB`, the image is not built, or a target container name is held by a container that is not this
-host's compose slot, or whose state Docker cannot report. Unknown is never taken as absent.
+`housekeeping.minFreeGB`, or a target container name is held by a container that is not this host's compose slot, or
+whose state Docker cannot report. Unknown is never taken as absent.
+
+The Linux adds need the image. When it is missing (a fresh host) or was built from another context, Plan lists a
+`build-image` change ahead of them, and Apply builds the image before the first Linux add. If the build fails, or Docker
+cannot say whether the image exists, Apply adds no Linux slot and exits 1. The Windows adds go ahead either way.
 
 A slot the counts no longer want is reported and left alone (exit 3) unless `-Retire` is given. Retiring takes the
 highest number first and runs seven journaled steps: `withdraw` (records whether it was held, marks it `retiring`),
