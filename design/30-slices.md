@@ -51,7 +51,7 @@ Acceptance: the README covers settings, host manager actions, slot names, held a
 Out of scope: target-host execution.
 
 ## S9 — Target-host acceptance on beast (L3)
-Status: todo
+Status: done
 Depends on: S8
 Blocked by: the owner's go-ahead in chat to run the L3 steps on beast, a real host with live registrations.
 Acceptance: the handoff's L3 steps 1–7 run on beast and are recorded in the pull request.
