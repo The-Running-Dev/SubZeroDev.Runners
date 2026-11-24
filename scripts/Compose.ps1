@@ -301,6 +301,32 @@ function Get-LinuxImageContextHash([string] $Image) {
     if ($value -and $value -ne '<no value>') { $value }
 }
 
+# The image build: its build arguments and the hash of what it is built from. Downloads and verifies the runner archive
+# (RunnerArchive.ps1) when it is not there yet.
+function Get-LinuxImageBuild($Config, [string] $RootDirectory) {
+    # One runner version for both platforms (runners.json runnerVersion), downloaded and checked against the SHA-256 GitHub
+    # publishes; the Dockerfile checks it again and fails when either build argument is missing.
+    $archive = Get-RunnerArchive -Platform linux-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $RootDirectory 'downloads') | Select-Object -Last 1
+    $buildArguments = [ordered]@{ BASE_IMAGE = $Config.linux.baseImage; RUNNER_VERSION = $Config.runnerVersion; RUNNER_SHA256 = $archive.Sha256 }
+    [pscustomobject]@{ Arguments = $buildArguments; Hash = (Get-LinuxBuildContextHash $RootDirectory $buildArguments) }
+}
+
+function Invoke-LinuxImageBuild($Config, [string] $RootDirectory, $ImageBuild) {
+    $arguments = @('build', '--pull', '--label', "$ContextHashLabel=$($ImageBuild.Hash)")
+    foreach ($name in $ImageBuild.Arguments.Keys) { $arguments += @('--build-arg', "$name=$($ImageBuild.Arguments[$name])") }
+    & $Docker @arguments -f (Join-Path $RootDirectory 'linux\Dockerfile') -t $Config.linux.image $RootDirectory | Out-Host
+    if ($LASTEXITCODE) { throw 'Image build failed.' }
+}
+
+# The context hash the image should carry, without downloading anything: $null when the runner archive is not downloaded,
+# so the context cannot be hashed (Plan then does not report the image's context).
+function Get-LinuxExpectedContextHash($Config, [string] $RootDirectory) {
+    $archive = Join-Path (Join-Path $RootDirectory 'downloads') "actions-runner-linux-x64-$($Config.runnerVersion).tar.gz"
+    if (-not (Test-Path -LiteralPath $archive)) { return $null }
+    $arguments = [ordered]@{ BASE_IMAGE = $Config.linux.baseImage; RUNNER_VERSION = $Config.runnerVersion; RUNNER_SHA256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() }
+    Get-LinuxBuildContextHash $RootDirectory $arguments
+}
+
 # Whether a container was created by compose. Unknown (docker cannot be asked) counts as compose, so -Update fails closed.
 function Get-ContainerComposeProject([string] $Name) {
     $inspect = Invoke-Docker @('container', 'inspect', '--format', '{{ index .Config.Labels "com.docker.compose.project" }}', $Name)

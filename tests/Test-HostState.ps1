@@ -479,7 +479,7 @@ Test-Case 'Plan after Adopt: migrate linux-01, retire windows-legacy after win01
     $calls = Get-Calls $fixture
     Assert ($calls.Count -gt 0 -and -not ($calls | Where-Object { $_ -match '(^| )-X ' })) "Plan made a GitHub call that is not a read:`n$($calls -join "`n")"
     $docker = Get-Calls $fixture 'docker.log'
-    Assert (-not ($docker | Where-Object { $_ -notmatch '^(container|image) inspect ' })) "Plan made a Docker call that is not an inspect:`n$($docker -join "`n")"
+    Assert (-not ($docker | Where-Object { $_ -notmatch '^((container|image) inspect |system df )' })) "Plan made a Docker call that is not a read:`n$($docker -join "`n")"
     Assert ((Get-StateListing $fixture) -eq $before) 'Plan changed the host state (inventory, journal or lock.json).'
 
     $settings = Get-Content -Raw -LiteralPath (Join-Path $fixture.Clone 'runners.local.json') | ConvertFrom-Json

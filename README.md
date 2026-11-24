@@ -122,7 +122,7 @@ setup options. See [the Windows runbook](docs/windows-two-runners.md) for detail
 
 | Script | Does |
 | --- | --- |
-| `Manage-RunnerHost.ps1 -Action Init\|Adopt\|Plan\|Status\|AutoStart\|Hold\|Resume\|Startup [-Slot] [-Json]` | The host manager, run from the host's own checkout: records which slots (`linux-01`, `win01`, ...) this host owns, compares them with settings, Docker and GitHub (`Plan` exits 3 when something differs; it changes nothing), holds and resumes a slot across restarts, and starts the Windows runners at host start or sign-in without ending a hold. See [Host management](docs/host-management.md) |
+| `Manage-RunnerHost.ps1 -Action Init\|Adopt\|Plan\|Status\|Apply\|Update\|AutoStart\|Hold\|Resume\|Startup [-Slot] [-Version] [-Json]` | The host manager, run from the host's own checkout: records which slots (`linux-01`, `win01`, ...) this host owns, compares them with settings, Docker and GitHub (`Plan` exits 3 when something differs and reports disk and memory; it changes nothing), applies migrations, adds, retires and updates (`Update -Version` pins the BuildAgent release by digest), holds and resumes a slot across restarts, and starts the Windows runners at host start or sign-in without ending a hold. See [Host management](docs/host-management.md) |
 | `Get-LinuxRunnerStatus.ps1 [-Json]` | Read-only, one line per Linux slot: container state and whether the image, build context, compose definition and compose file are current |
 | `Start-Runners.ps1` | Reapplies ignore rules, trims logs, starts the Windows supervisor if `supervisor.pid` names none, starts Docker Desktop if needed, then the Docker sidecar (in sidecar mode) and the Linux container. Logs to `windows\_diag\Startup_*-utc.log`; on failure shows a toast that opens that log |
 | `Stop-Runners.ps1 [-TimeoutMinutes] [-Force]` | Drains, then stops the Windows runner, the Linux container and the sidecar. Draining withdraws each runner's custom labels at GitHub (no new job is assigned), waits up to `lifecycle.drainTimeoutMinutes` (or `-TimeoutMinutes`) for the running job, restores the labels afterwards. A job that outlasts the deadline is **not** cancelled: that runner keeps running and the report names it (exit 1). `-Force` stops at once and cancels the running job. Registrations stay |
@@ -414,8 +414,8 @@ registrations through `Registration.ps1`. Never commit on `main`; one pull reque
 - **Windows runner in a dedicated VM.** Same `windows\` folder and scripts, run inside a VM
   built for it; the supervisor is still started explicitly (`Manage-WindowsRunner.ps1 -Action Start`).
 - **Linux stays a container.** Only the host it runs on may change.
-- **Host manager `Update`.** Image and clone updates are planned ([design](design/30-slices.md)); today
-  `Apply` migrates the legacy Linux runner and adds and retires slots ([host management](docs/host-management.md)).
+- **Host manager `Update`.** `Update -Version x.y.z` pins the BuildAgent image by digest and recreates each slot in its
+  own drain; `Apply` migrates the legacy Linux runner, adds, retires and updates slots ([host management](docs/host-management.md)).
 - **Dev Drive.** Still supported in Windows 11 (only the Dev Home app was retired). A ReFS
   volume with Defender performance mode, at least 50 GB, created from Settings or as a VHDX.
   Fits `windows\_work`, `windows\_nuget` and other caches; Microsoft advises keeping SDKs

@@ -77,3 +77,8 @@ Rejected: ignoring unproven registrations.
 Context: a Plan over an unreadable Docker or clone said "No changes", and its hash equalled a clean host's.
 Chosen: any `unknown` finding exits 1 ("Plan is incomplete"); drift/blocked findings exit 3; the hash covers changes plus unknown/drift/blocked findings. A recorded Linux container that is gone, or a Linux slot with no container record, is container drift.
 Rejected: treating unread state as absent.
+
+### 2026-11-24 — S7: Update records each replaced digest with its version; a downgrade is judged by version, not by order
+Context: a plain list of replaced digests called a move forward after a rollback "Rolling back", and flagged the newer digest restored after a rollback as a downgrade.
+Chosen: `inventory.buildAgent.previous` holds `{image, version}`; Update calls it a rollback only when the new version is lower than the recorded one, and Plan/Apply block a settings digest only when it is a replaced one whose version is not newer than the recorded one. Update accepts only `x.y.z`.
+Rejected: resolving floating tags, and editing `.wslconfig` or Docker Desktop to fit the memory figures (Plan only reports them; the Windows figure is advisory).
