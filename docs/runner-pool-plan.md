@@ -2,7 +2,8 @@
 
 One host, N Linux slots and N Windows slots, set from the host's own settings. BuildAgent does the build work that
 does not need Windows; Windows slots run what does. The implementation slices are in
-[handoffs/runner-pool.md](../handoffs/runner-pool.md). This revision answers the red-team review of 9c2d603, records
+[handoffs/runner-pool.md](../handoffs/runner-pool.md) (S1–S9) and [handoffs/runner-pool-l4.md](../handoffs/runner-pool-l4.md)
+(L4, moving the repositories). This revision answers the red-team review of 9c2d603, records
 the owner's decisions D1–D4, and resolves four ownership and lifecycle contradictions (C1–C4) found against the code.
 Every fact below was checked against main (3a7eaf8) and GitHub on 2026-11-10. Observed status and its cause are kept
 apart: a cause that was not checked is labelled **not verified**.
@@ -19,8 +20,10 @@ apart: a cause that was not checked is labelled **not verified**.
 | GitHub | AbsoluteZeroDev is on the Free plan. One runner group, `Default`: visibility `all`, `allows_public_repositories: false`. One public repository exists (`SubZeroDev.Platform.Updater`). Runner groups are available on Free since 2024-10-17. |
 | Telemetry | SubZeroDev.Dashboard `runner-telemetry-v1`: strict schema, at most 32 instances, reads `Manage-WindowsRunner.ps1 -Action Status -Json` and `Get-BuildAgentStatus.ps1 -Json`, keyed by `hostId`. Linux is not reported. |
 
-Every workflow in the org targets `[self-hosted, subzerodev, Linux|Windows]` or the label `subzerodev-windows`. Any
-slot of the right OS can take any of these jobs, so **the pool needs no workflow change in any repository.**
+On 2026-11-10 every workflow in the org targeted `[self-hosted, subzerodev, Linux|Windows]` or the label
+`subzerodev-windows`, so any slot of the right OS could take any of these jobs. **Superseded:** the same day each
+repository moved back to GitHub-hosted runners, so every move onto the pool is now a workflow change (see
+[runner-pool-l4.md](../handoffs/runner-pool-l4.md)).
 
 ## Decided
 
@@ -311,7 +314,8 @@ public repositories. Registration passes `--runnergroup` when the setting names 
 
 ## Rollout per job
 
-The pool serves every job below without workflow changes. "Into BuildAgent" is optional, done per job, after that
+Every job below runs on GitHub-hosted runners today (checked 2026-11-24); the slices that move them are in
+[runner-pool-l4.md](../handoffs/runner-pool-l4.md). "Into BuildAgent" is optional, done per job, after that
 project's cross-build has been verified (L1 and L2 below). One WPF project cross-building in HollowMoon proves
 nothing for another project's tests or packaging.
 
@@ -319,13 +323,13 @@ nothing for another project's tests or packaging.
 | --- | --- | --- | --- | --- |
 | HollowMoon | `build.yml` `build` (PR #4) | Windows | WPF tests | game, Core tests, Windows-targeted test build (done in PR #4) |
 | HollowMoon | `release.yml` | Windows | installer, signing, publish | game bundle, after `build.yml` passes L3 |
-| HotCorners | `ci.yml` `dotnet` (ActionTemplates, `os: ["subzerodev-windows"]`) | Windows | all, until checked per project | non-UI tests, if they cross-build |
+| HotCorners | `ci.yml` `dotnet` (ActionTemplates input `os`) | Windows | all, until checked per project | non-UI tests, if they cross-build |
 | HotCorners | `release.yml` (`environment: release`) | Windows | all | no |
 | HotCorners | `claude-code-review.yml` | Linux | — | — |
-| Cleaner | `ci.yml` `dotnet` (ActionTemplates, `os: ["subzerodev-windows"]`) | Windows | all, until checked per project | to be checked |
+| Cleaner | `ci.yml` `dotnet` (ActionTemplates input `os`) | Windows | all, until checked per project | to be checked |
 | Licensing | `ci.yml` `linux`, `package` | Linux | — | already Linux; needs Docker in the slot (image builds, acceptance topology), which dind provides |
 | Licensing | `ci.yml` `windows` | Windows | all: registry machine identity, 64- and 32-bit processes | no |
-| Licensing | `container.yml` `image` | set by ActionTemplates `container.yml` | — | check its `runs-on` before relying on the pool |
+| Licensing | `container.yml` `image` | Linux, ActionTemplates input `runs-on` (needs Docker) | — | already Linux; dind provides Docker |
 | Licensing | `claude-code-review.yml` | Linux | — | — |
 | Media | `ci.yml` `web`, `linux` | Linux | — | already Linux |
 | Media | `ci.yml` `dotnet`, `windows-package` | Windows | workloads install, tests, packaging | to be checked per project |
@@ -339,9 +343,9 @@ the last to change in any repository.
 | Level | Meaning | HollowMoon PR #4 (2026-11-24) |
 | --- | --- | --- |
 | L1 local | the BuildAgent build passes against the pinned image on a workstation | passed |
-| L2 workflow | the GitHub check passes on a self-hosted slot | **passed** on beast's `win02` ([run 45393284264](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393284264)), from a throwaway branch that changed only `runs-on`. PR #4's own check still targets GitHub-hosted `windows-latest`. |
+| L2 workflow | the GitHub check passes on a self-hosted slot | **passed** on beast's `win02` ([run 45393284264](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393284264)), from a throwaway branch that changed only `runs-on`. `build.yml` on main (PR #4 merged) still targets GitHub-hosted `windows-latest`. |
 | L3 target host | on beast, after Apply: scale, hold, reboot and concurrency acceptance (handoff) | **passed** 2026-11-24 (S9, #34); step 2 not applicable. Evidence: [l3-beast-acceptance.md](l3-beast-acceptance.md) |
-| L4 generalization | each other repository reaches L1 and L2 for each job it moves | not started |
+| L4 generalization | each job that moves passes L2 on the pool; a job whose stage moves into BuildAgent also passes L1 ([runner-pool-l4.md](../handoffs/runner-pool-l4.md)) | not started; slices planned, D5 open |
 
 Mocked tests in this repository are L0 and are reported separately from all of these.
 
