@@ -54,6 +54,58 @@ workspace, a non-numeric `lifecycle`/`housekeeping` value. Each runner gets `git
 | `lifecycle` | Drain deadline, supervisor restart delay, backoff, the quick-exit threshold and `startTimeoutSeconds` (how long `Start` waits for the supervisor to initialize, default 60) |
 | `logs`, `housekeeping` | Log age and size caps, cleanup retries, the free-disk warning level |
 | `hostId`, `linux.count`, `windows.count`, `windows.startAtSignIn`, `github.runnerGroup` | The [host manager's](docs/host-management.md) settings: this host's ID, the slot counts (`null` = unmanaged, otherwise 0-16), whether the host starts the Windows runners at sign-in, and the runner group the runners belong to |
+| `housekeeping.minFreeGB`, `buildAgent.estimate.memory` | The free disk below which `Apply` refuses to add a slot, and the Windows memory estimate `Plan` reports (advisory, not enforced) |
+
+Three files are merged, later wins: `runners.json` (committed defaults), `runners.host.json` (written by the host manager
+into each Windows slot's clone; never edit it) and `runners.local.json` (yours). `Manage-RunnerHost.ps1 -Action Init`
+writes the counts and `hostId` into `runners.local.json`; `Update -Version` writes `buildAgent.image` there. Image and
+runner pins are digests and exact versions only.
+
+## Host manager
+
+`scripts\Manage-RunnerHost.ps1` owns the runners of one host, from the host's own checkout. The
+[host management guide](docs/host-management.md) has every step; this is the short version.
+
+**Slot names.** Each runner is a slot. Numbers count up from the highest ever recorded and are never reused.
+
+| Slot | Container or clone | Registered as |
+| --- | --- | --- |
+| `linux-01` (pre-pool) | `subzerodev-runner-linux` until `Apply` migrates it, then `subzerodev-runner-linux-01` | `subzerodev.runner.linux` (kept) |
+| `linux-NN` | `subzerodev-runner-linux-NN`, with its sidecar, network and volumes ending in `-NN` | `subzerodev.runner.linux.<hostId>.NN` |
+| `winNN` | Its own clone, `%LOCALAPPDATA%\SubZeroDev\Runners\winNN` | `subzerodev.runner.windows.<hostId>.winNN` |
+| `windows-legacy` | This checkout's own single-clone install; retired once `win01` is online, never removed | Its existing name |
+
+`hostId` defaults to the lower-cased computer name. The inventory of owned slots is
+`%LOCALAPPDATA%\SubZeroDev\Runners\host\inventory.json`; an unreadable one is refused, never treated as empty.
+
+**Actions.**
+
+| Action | Changes | Does |
+| --- | --- | --- |
+| `Init`, `Adopt` | Settings, inventory | Write the counts and `hostId`; record the runners this host can prove it owns |
+| `Plan [-Json]` | Nothing | What `Apply` would do, drift, blocked findings, disk and memory. Exit 0 nothing to do, 3 changes, 1 unreadable |
+| `Status [-Json]` | Nothing | Each slot as GitHub, Docker and disk report it |
+| `Apply [-ExpectPlan <hash>] [-Retire] [-Prune] [-Rollback]` | Runners | Migrate `linux-01`, add slots, update drifted ones; `-Retire` also removes surplus slots; `-Prune` removes what retired slots and the migration left |
+| `Update -Version x.y.z` | Settings, runners | Pin the BuildAgent release by digest, then apply |
+| `Hold -Slot`, `Resume -Slot` | One slot | Drain and stop a slot until you resume it |
+| `AutoStart`, `Startup` | Windows supervisors, Startup folder | Start the Windows slots at sign-in; write or remove the Startup entry |
+
+Every journaled operation (migrate, add, retire, update) is finished by rerunning `Apply` after a crash or failure.
+
+**Held and resume.** `Hold` drains the slot (the running job is not cancelled), stops it and keeps its
+`maintenance.json`. While that record exists, the Windows supervisor idles and the Linux entrypoint waits, so a held slot
+stays held across reboots, Docker restarts, sign-ins, `AutoStart` and `Apply` (an update skips it as `deferred: held`).
+`Resume` is the only host action that ends the hold: it restores the labels, deletes the record and starts exactly one
+listener. `Manage-WindowsRunner.ps1 -Action Start` also ends one instance's maintenance when you run it yourself.
+
+**Reboot sequence.** Nothing is a service or a scheduled task, and setup never enables automatic sign-in:
+
+1. Windows starts and you sign in.
+2. Docker Desktop starts and restarts the Linux containers (`restart: always`); held ones wait in the entrypoint.
+3. With `windows.startAtSignIn: true` and `Startup` run once, the Startup entry runs `AutoStart`, which waits for Docker
+   (`buildAgent.docker.readyTimeoutSeconds`) and starts each active Windows slot's supervisor. Without it, run
+   `Manage-RunnerHost.ps1 -Action AutoStart` yourself.
+4. Held slots stay held; `Resume` them when you want them back.
 
 ## One-command Windows setup
 
@@ -414,8 +466,6 @@ registrations through `Registration.ps1`. Never commit on `main`; one pull reque
 - **Windows runner in a dedicated VM.** Same `windows\` folder and scripts, run inside a VM
   built for it; the supervisor is still started explicitly (`Manage-WindowsRunner.ps1 -Action Start`).
 - **Linux stays a container.** Only the host it runs on may change.
-- **Host manager `Update`.** `Update -Version x.y.z` pins the BuildAgent image by digest and recreates each slot in its
-  own drain; `Apply` migrates the legacy Linux runner, adds, retires and updates slots ([host management](docs/host-management.md)).
 - **Dev Drive.** Still supported in Windows 11 (only the Dev Home app was retired). A ReFS
   volume with Defender performance mode, at least 50 GB, created from Settings or as a VHDX.
   Fits `windows\_work`, `windows\_nuget` and other caches; Microsoft advises keeping SDKs
