@@ -12,7 +12,7 @@ the commands run, their exit codes, slot states, runner IDs and run links. Times
 | Settings | `runners.local.json` here was given the live install's `github.url` (`https://github.com/AbsoluteZeroDev`), `windows.workFolder` and `linux.docker.mode: dind`; see `design/90-decisions.md` |
 | GitHub | `gh` scopes `admin:org, gist, repo, workflow` (the owner added `admin:org`). Runners: `subzerodev.runner.linux` id 9 offline, `subzerodev.runner.windows` id 8 offline. Group `Default`: visibility all, `allows_public_repositories` false |
 | Docker | Docker Desktop was stopped; it was launched without changing settings, and the engine (29.9.3) answered after about 7 minutes. No containers, volumes or runner image existed |
-| WSL | No `.wslconfig` (no memory cap). Docker Desktop's own `AutoStart` setting is `false`; Windows auto sign-in is off (`AutoAdminLogon=0`). Neither was changed |
+| WSL | No `.wslconfig` (no memory cap). Windows auto sign-in is off (`AutoAdminLogon=0`). Docker Desktop starts at sign-in from its `HKCU\...\Run` entry. Nothing here was changed |
 
 ## 1. Adopt, then Plan
 
@@ -92,3 +92,80 @@ Before the reboot:
 - GitHub: `linux-02` (67) shows only `self-hosted,X64,Linux`, so its custom labels are withdrawn.
 - `win02`'s record (`phase held`) saved its labels. As designed, the Windows hold put them back once the listener stopped (`scripts/Lifecycle.ps1` `Stop-WindowsRunner -Hold`). No `win02` process runs, and GitHub reported id 69 offline at 11:50:20.
 - Containers: `linux-01` up and healthy with one `Runner.Listener` (pid 754); `linux-02` exited (143).
+
+The owner rebooted beast and signed in by hand (auto sign-in is off). Boot time was 12:01:45. In order:
+
+- Docker Desktop started at sign-in from its `Run` entry at 12:03:13, and its engine answered.
+- The Startup entry's `AutoStart` started both Windows supervisors: win01 pid 10048 at 12:03:38, and win02 pid 9916 at 12:03:41.
+- The `restart: always` containers came back. `linux-01` was listening by 12:03:30.
+
+After the reboot, before Resume:
+
+| Slot | Container / supervisor | Listener | Record |
+| --- | --- | --- | --- |
+| linux-01 | up, healthy | one (`Runner.Listener run`, pid 340) | none; GitHub online |
+| linux-02 | up, healthy; entrypoint logs `Held: /runner/maintenance.json exists; no listener starts until the owner resumes this runner.` | none | `held`; GitHub offline |
+| win01 | supervisor `running` (pid 10048) | one (pid 11936) | none; GitHub online |
+| win02 | supervisor `maintenance` (pid 9916) | none | `held`; GitHub offline |
+
+`Status` (exit 0) showed the same picture. It also reported a `commit` drift on win01 and win02: the clones are at
+`5324104`, while this checkout had moved on to the evidence commit `5ae098c`.
+
+```
+Manage-RunnerHost.ps1 -Action Resume -Slot linux-02   -> exit 0  linux-02: resumed; the listener starts.
+Manage-RunnerHost.ps1 -Action Resume -Slot win02      -> exit 0  win02: already running (pid 9916) - in maintenance, no listener until maintenance ends
+```
+
+Win02's message was printed before the supervisor noticed the record was gone. Afterwards:
+
+- Both maintenance records are deleted.
+- `linux-02` has one listener (pid 392), with its custom labels back at GitHub.
+- `win02`'s supervisor is `running` with one listener (pid 2436).
+- GitHub reported 67 and 69 online at 12:04:42.
+
+Side note: `linux-01`'s runner updated itself to 2.338.2 (`runnerVersion` pins 2.338.0 for new images).
+
+## 5. Recreate linux-02 while a job runs on linux-01
+
+Steps 5 and 6 ran in the same window. The step 6 docs smoke job was the job running on `linux-01`. To make it land on
+`linux-01` (the smoke checks it ran on id 66), `linux-02` was held during the dispatch (12:24:40) and resumed
+(12:26:01) once the job was running on `linux-01` (12:25:53, `Runner.Worker` pid 1955).
+
+```
+Manage-RunnerHost.ps1 -Action Resume -Slot linux-02   -> exit 0  (12:26:01)
+New-LinuxRunner.ps1 -Slot linux-02                    -> exit 0  (12:26:10 to 12:26:43)
+```
+
+| | Before | After |
+| --- | --- | --- |
+| linux-01 container | `84734efa2dd1...`, started 12:03:22 | `84734efa2dd1...`, started 12:03:22 (unchanged) |
+| linux-01 job | `Runner.Worker` pid 1955 | pid 1955 still running; the job finished `success` at 12:32:42 |
+| linux-02 container | `1c0ce8d0e64f...`, started 12:03:20 | `e4fecc2ba931...`, started 12:26:39; the inventory records the new ID (generation 15) |
+| GitHub labels | 66 and 67 `subzerodev,subzerodev-linux` | the same; both online and idle |
+
+The job on `linux-01`
+([docs smoke run 45393380763](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393380763), job
+`Docs smoke / Build`, 12:25:38 to 12:32:42) finished untouched.
+
+## 6. Concurrent L2 runs and the WSL memory peak
+
+| Run | Workflow | Runner | Result |
+| --- | --- | --- | --- |
+| [45393284264](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393284264) | HollowMoon `build.yml` (L2 for HollowMoon#4) | `subzerodev.runner.windows.beast.win02` (69), 12:25:04 to 12:28:12 | success |
+| [45393380763](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393380763) | `self-hosted-docs-smoke.yml` from `tests/linux-runner-docs-smoke.yml` | Build on `subzerodev.runner.linux.beast.01` (66), 12:25:38 to 12:32:42; `Verify smoke evidence` on GitHub-hosted | success |
+
+How the two runs were set up:
+
+- **HollowMoon `build.yml`.** Since [HollowMoon#4](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/pull/4), it runs on `windows-latest`. So it was dispatched from a throwaway branch `l3/beast-windows-build` (commit `32f81d5`), changing only `runs-on` to `[self-hosted, subzerodev, Windows]`. That had the owner's go-ahead. No PR was opened, and the branch was deleted afterwards.
+- **Docs smoke consumer.** The consumer is SubZeroDev.HollowMoon. `Invoke-Smoke.ps1 -Action Prepare` (exit 0) opened [HollowMoon#6](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/pull/6), which the owner merged at 12:24:16 (`e540f4f`).
+- **Docs smoke dispatch.** `Invoke-Smoke.ps1 -Action Run` stopped before dispatch (exit 1). Its host probe targets the pre-pool container `subzerodev-runner-linux` ([#33](https://github.com/The-Running-Dev/SubZeroDev.Runners/issues/33)). The workflow was dispatched directly instead, with `correlation_id=l3beast20261124122531`, `expected_runner_name=subzerodev.runner.linux.beast.01` and `expected_runner_id=66`. Its `verify` job checked the site artifact and the runner identity.
+
+WSL memory was sampled every 5 s from 12:24:40 to 12:33:22, 75 samples:
+
+| Measure | Peak | Estimate in Plan |
+| --- | --- | --- |
+| `VmmemWSL` working set (Windows side) | 12.6 GB at 12:32:04 | Linux limits 2 × 8 GB = 16 GB (enforced), plus Windows BuildAgent 2 × 8 GB = 16 GB (advisory) |
+| Memory used inside the VM (`free`, docker-desktop) | 6.34 GB at 12:32:04 | |
+| `linux-01` container (`docker stats`) | 4.96 GB of its 8 GiB limit | 8 GB |
+
+The VM sees 62.8 GB, and no `.wslconfig` cap is set. The peak stayed well under the 32 GB the plan adds up.
