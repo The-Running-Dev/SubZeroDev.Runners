@@ -5,6 +5,7 @@ $ErrorActionPreference='Stop'
 $repo=Split-Path $PSScriptRoot -Parent
 . (Join-Path $repo 'scripts/docs-smoke/Consumer.ps1')
 $realConfirm=${function:Confirm-SmokeDownload}
+$realResolve=${function:Get-SmokeRunnerContainer}
 function Assert($Condition,[string]$Message){if(-not $Condition){throw $Message}}
 function Reject([scriptblock]$Action,[string]$Pattern){try{&$Action|Out-Null}catch{Assert ($_.Exception.Message -match $Pattern) "Unexpected error: $($_.Exception.Message)";return};throw "Expected rejection: $Pattern"}
 $files=@(Get-SmokeConsumerFiles $repo)
@@ -27,7 +28,8 @@ function Reset-Fixture {
 }
 function Invoke-SmokeGh { throw 'Unexpected real GitHub boundary.' }
 function Get-SmokeEligibility { [pscustomobject]@{registrationEligible=$true;availableNow=$fixture.Ready;repository='fixture/consumer';runnerId=7;runnerName='fixture-linux'} }
-function Invoke-SmokeHostProbe {param($Root,$ReportPath)$fixture.Probes++;'{}'|Set-Content $ReportPath}
+function Invoke-SmokeHostProbe {param($Root,$ReportPath,$RunnerContainer)$fixture.Probes++;$fixture.ProbedContainer=$RunnerContainer;'{}'|Set-Content $ReportPath}
+function Get-SmokeRunnerContainer {param($Root,$RunnerRegistration)$fixture.ResolvedRegistration=$RunnerRegistration;'fixture-runner-container'}
 function Start-Sleep {param($Seconds)}
 function Get-SmokeSnapshot {
     param($Repository,$Ref)
@@ -89,6 +91,8 @@ try {
     $fixture.BaseFiles=$files
     Invoke-Case success|Out-Null
     Assert ($fixture.Dispatches -eq 1 -and $fixture.Probes -eq 1 -and $fixture.Downloads -eq 1) 'Successful Run did not execute all stages.'
+    Assert ($fixture.ProbedContainer -eq 'fixture-runner-container') "The probe was not given the registration's container (#33): '$($fixture.ProbedContainer)'."
+    Assert ($fixture.ResolvedRegistration -like '*linux*runner*.runner') "The container was not resolved from the runner registration: '$($fixture.ResolvedRegistration)'."
     Assert ((Read-Case success).last.status -eq 'success' -and -not (Read-Case success).active) 'Success state is incomplete.'
 
     Reset-Fixture;$fixture.BaseFiles=$files;$fixture.LostResponse=$true
@@ -164,5 +168,27 @@ try {
     $fixture.BadSite=$false;$fixture.JobRunnerId=99
     Reject {&$realConfirm 'fixture/consumer' $expected (Join-Path $temp 'evidence-bad-runner') $image} 'job records'
     Write-Output 'PASS: downloaded archive content is checked independently; wrong site and wrong actual GitHub runner ID are rejected (downloads/API mocked).'
+
+    # The probe targets the container that runs the given registration (#33), read from a temporary host inventory.
+    $oldLocalAppData=$env:LOCALAPPDATA
+    try {
+        . (Join-Path $repo 'scripts/RunnerConfig.ps1'); . (Join-Path $repo 'scripts/HostState.ps1')
+        $config=Read-RunnerConfig -Root $repo
+        function Set-Inventory($Value){$path=Get-HostInventoryPath;New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force|Out-Null;$copy=[ordered]@{schema=$HostInventorySchema;version=$HostStateVersion};foreach($k in $Value.Keys){$copy[$k]=$Value[$k]};ConvertTo-Json -InputObject $copy -Depth 20|Set-Content -LiteralPath $path}
+        $legacyDir=Join-Path $repo $config.linux.directory
+        $env:LOCALAPPDATA=Join-Path $temp 'no-inventory'
+        Assert ((&$realResolve $repo (Join-Path $legacyDir '.runner')) -eq $config.linux.container) 'Without an inventory the pre-pool registration did not resolve to the pre-pool container.'
+        $env:LOCALAPPDATA=Join-Path $temp 'pool'
+        Set-Inventory @{generation=1;hostId='fixture';github=@{scope='orgs/fixture'};slots=@(
+            @{slotId='linux-01';platform='linux';state='active';legacy=$true;runnerId=1;containers=@(@{role='runner';name=$config.linux.container;id='a'*64})}
+            @{slotId='linux-02';platform='linux';state='active';legacy=$false;runnerId=2;containers=@(@{role='runner';name="$($config.linux.container)-02";id='b'*64})})}
+        Assert ((&$realResolve $repo (Join-Path "$legacyDir-02" '.runner')) -eq "$($config.linux.container)-02") 'A pool slot registration did not resolve to its compose container.'
+        Assert ((&$realResolve $repo (Join-Path $legacyDir '.runner')) -eq $config.linux.container) 'The unmigrated pre-pool slot did not resolve to its own container.'
+        Set-Inventory @{generation=2;hostId='fixture';github=@{scope='orgs/fixture'};slots=@(
+            @{slotId='linux-01';platform='linux';state='active';legacy=$true;runnerId=1;containers=@(@{role='runner';name="$($config.linux.container)-01";id='c'*64})})}
+        Assert ((&$realResolve $repo (Join-Path $legacyDir '.runner')) -eq "$($config.linux.container)-01") 'The migrated pre-pool slot did not resolve to its compose container.'
+        Reject {&$realResolve $repo (Join-Path $temp 'elsewhere/.runner')} 'not the registration of a Linux runner'
+        Write-Output 'PASS: the probe container is the one that runs the registration: pre-pool without an inventory, compose for pool and migrated slots, refused otherwise.'
+    } finally { $env:LOCALAPPDATA=$oldLocalAppData }
     $global:LASTEXITCODE=0
 }finally{Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue}

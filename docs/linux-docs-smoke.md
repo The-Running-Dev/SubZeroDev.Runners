@@ -55,6 +55,10 @@ and the host's signed-in GitHub CLI session:
 ./scripts/docs-smoke/Invoke-Smoke.ps1 -Action Prepare
 ```
 
+On a host whose Linux runners are pool slots ([host management](host-management.md)), name the slot's registration,
+for example `-RunnerRegistration linux/runner-01/.runner`. `Run` probes the container the host inventory records for
+that slot (`subzerodev-runner-linux-01`). It refuses a registration that no Linux slot of this checkout holds.
+
 For repository registration, this discovers that exact repository. For organization
 registration, add `-Repository '<org>/<existing consumer>'`; it does not choose an
 arbitrary repository. Prepare verifies eligibility and opens a consumer PR adding

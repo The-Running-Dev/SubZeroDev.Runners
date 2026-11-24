@@ -61,7 +61,15 @@ exec "$SZR_PROBE_TEST_PWSH" -NoProfile -File "$SZR_PROBE_TEST_SCRIPT" "$@"
         Assert (@($calls | Where-Object { $_.Arguments -contains 'rm' -and $_.Arguments -contains '-f' -and $_.Arguments -contains $result.container }).Count -eq 1) 'Known test container was not cleaned up.'
         Assert (@($calls | Where-Object { $_.Arguments -contains 'prune' -or $_.Arguments -contains 'stop' -or $_.Arguments -contains 'restart' }).Count -eq 0) 'Probe touched unrelated Docker lifecycle.'
     }
-    Write-Output 'PASS: nested bind and self-update probe commands, failure propagation, unique-object cleanup (external Docker mocked).'
+    # A pool slot (#33): every call goes to the named runner container, never to the pre-pool one.
+    $env:SZR_PROBE_TEST_STATE = Join-Path $temp 'calls-slot.jsonl'; $env:SZR_PROBE_TEST_FAIL = '0'
+    $slotResult = Join-Path $temp 'result-slot.json'
+    & (Join-Path $repo 'tests/Invoke-LinuxJobContainerProbe.ps1') -DockerCommand $wrapper -OutputPath $slotResult -RunnerContainer 'subzerodev-runner-linux-01' | Out-Null
+    $slotCalls = @(Get-Content $env:SZR_PROBE_TEST_STATE | ForEach-Object { , @($_ | ConvertFrom-Json) })
+    Assert ((Get-Content -Raw $slotResult | ConvertFrom-Json).runnerContainer -eq 'subzerodev-runner-linux-01') 'The probe report does not name the slot container.'
+    Assert (@($slotCalls | Where-Object { $_ -notcontains 'subzerodev-runner-linux-01' }).Count -eq 0) 'A probe call did not target the slot container.'
+    Assert (@($slotCalls | Where-Object { $_ -contains 'subzerodev-runner-linux' }).Count -eq 0) 'A probe call targeted the pre-pool container.'
+    Write-Output 'PASS: nested bind and self-update probe commands, failure propagation, unique-object cleanup, slot container (external Docker mocked).'
 } finally {
     $env:SZR_PROBE_TEST_STATE=$oldState; $env:SZR_PROBE_TEST_FAIL=$oldFail
     $env:SZR_PROBE_TEST_PWSH=$oldPwsh; $env:SZR_PROBE_TEST_SCRIPT=$oldFake
