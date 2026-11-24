@@ -49,7 +49,8 @@ The bootstrap permits scripts/modules for its current PowerShell process only; i
 the machine's or user's persistent execution policy, and enforced organization policy still applies.
 
 Defaults: two instances (`win01`, `win02`) in `%LOCALAPPDATA%\SubZeroDev\Runners`, registered to
-`AbsoluteZeroDev`; each supervisor is started directly (nothing starts it again after a restart). The `_setup` directory is a reserved controller checkout;
+`AbsoluteZeroDev`; each supervisor is started directly. After a restart nothing starts it again unless the host manager's
+Startup entry is on ([AutoStart](#host-manager-autostart-retire-and-prune)). The `_setup` directory is a reserved controller checkout;
 each instance has its own clone. All clones use one resolved source commit for that run. Package
 installs requiring a reboot stop setup and ask you to rerun after the reboot; setup never reboots for you.
 Use a unique Windows computer name per host; setup refuses existing runner-name conflicts rather than
@@ -66,7 +67,8 @@ taking another machine's registration.
 Rerunning skips working prerequisites, retains saved names/workspaces/custom labels, keeps the original
 instance spelling, and only advances clean runner clones. Dirty checkouts, local commits that would be
 discarded, another clone/instance identity, and a different saved GitHub target stop setup. For a custom
-target, repeat the same `-GitHubUrl` on reruns. Lowering `-Count` never uninstalls additional instances.
+target, repeat the same `-GitHubUrl` on reruns. Lowering `-Count` never uninstalls additional instances; the host
+manager's `Apply -Retire` and `Apply -Prune` do ([Retire and Prune](#host-manager-autostart-retire-and-prune)).
 No `--replace`, `git reset`, `git clean`, auto-logon or host reboot is performed.
 
 Every instance also gets a `subzerodev-host-<computer>` label. Only the first two receive
@@ -371,12 +373,14 @@ Run these from the instance's clone as the runner's user (`Manage-WindowsRunner.
 | `Stop` | Drains, then stops the supervisor and runner. Registration stays |
 | `Restart` | `Stop`, then `Start` |
 | `Maintenance` | Drains and stops, and keeps the supervisor idle (`maintenance.json`) until `Start` |
+| `AutoStart` | Starts the supervisor like `Start` but leaves maintenance alone: a held or maintained instance stays idle. Used by the host manager after sign-in |
 
 The supervisor restarts a runner that exits, with a growing delay when it exits quickly (30 s, doubling to 10 min), shows one
 toast per failure streak and leaves the evidence in `supervisor.json` and the per-launch `_diag\Console_*-utc.log`.
 
 There is no scheduled task, Run entry, service or watchdog: the supervisor runs only because `Start` (or `Start-Runners.ps1`,
-or the installer) launched it. If it dies, or the PC restarts, it stays down: `Status` exits 1 while it is down without having
+the installer, or the host manager's Startup entry through `AutoStart`) launched it. If it dies it stays down, and after a
+restart it stays down unless that Startup entry is on: `Status` exits 1 while it is down without having
 been stopped, the `Recovery` row says so, and the fix is `Manage-WindowsRunner.ps1 -Action Start`. Automatic supervisor
 recovery is not promised. When a supervisor does start over a dead predecessor it keeps the one-per-instance mutex, does not
 start `run.cmd` while `maintenance.json` exists, and waits (`waiting-for-orphan`) while a listener left by the dead supervisor
@@ -407,6 +411,31 @@ exits non-zero naming the job that was kept. `-Force` stops immediately, cancels
 (the job's workspace and any containers it started are not cleaned until the next job-completed hook or the trim). If
 withdrawing the labels fails, no stop is attempted. A workflow that targets only the default labels (`self-hosted`,
 `Windows`, `X64`) is not held back by a drain.
+
+## Host manager: AutoStart, Retire and Prune
+
+On a host managed by `scripts\Manage-RunnerHost.ps1` ([host management](host-management.md)), each Windows slot `winNN`
+is one of these instances, in `%LOCALAPPDATA%\SubZeroDev\Runners\winNN`, registered as
+`subzerodev.runner.windows.<hostId>.winNN`. Run the host manager from the host's own checkout.
+
+**AutoStart.** Set `windows.startAtSignIn: true` in `runners.local.json`, then run
+`Manage-RunnerHost.ps1 -Action Startup` once. It writes `SubZeroDev Runners AutoStart.cmd` into your per-user Startup folder
+(and removes it when the setting is `false`). At each sign-in that entry runs `Manage-RunnerHost.ps1 -Action AutoStart`,
+which waits for Docker for up to `buildAgent.docker.readyTimeoutSeconds`, then runs
+`Manage-WindowsRunner.ps1 -Action AutoStart` in each active Windows slot. It never ends maintenance: a held slot stays held
+until `Manage-RunnerHost.ps1 -Action Resume -Slot winNN`. With no inventory it starts nothing. It is not a service and it
+does not sign you in; setup never enables automatic sign-in, so the runners start when you sign in.
+
+**Retire.** With `windows.count` lower than the active slots, `Plan` and `Apply` report the surplus (exit 3) and change
+nothing. `Apply -Retire` removes it, highest number first, one journaled slot at a time: withdraw the labels, drain through
+the instance's `Maintenance` action, stop, deregister at GitHub, clear the local runner files, and record the slot `retired`.
+A drain that reaches its deadline puts the slot back to active with its labels, deletes the journal and fails; nothing is
+deregistered. A crash or other failure is finished by rerunning `Apply -Retire`. The clone stays on disk.
+
+**Prune.** `Apply -Prune` deletes what retired slots left: the Windows clone (only a directory whose name matches
+`win` and two digits; this checkout is never removed) and, for Linux slots, the directory, volumes and network. A slot is
+marked `pruned` only when nothing is left; a partial removal keeps it `retired` and exits 1, and the next `-Prune` tries
+again. The `windows-legacy` slot (this checkout's single-clone install) is retired once `win01` is online and is never pruned.
 
 ## Evidence: what is checked where
 

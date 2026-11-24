@@ -45,7 +45,7 @@ Acceptance: `Manage-RunnerHost -Action Update` writes the digest before any recr
 Out of scope: editing `.wslconfig`, auto sign-in or Docker Desktop settings.
 
 ## S8 — Docs
-Status: todo
+Status: done
 Depends on: S7
 Acceptance: the README covers settings, host manager actions, slot names, held and resume semantics, and the reboot sequence; `docs/windows-two-runners.md` covers AutoStart, Retire and Prune.
 Out of scope: target-host execution.
