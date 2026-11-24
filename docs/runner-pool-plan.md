@@ -256,7 +256,8 @@ optional and not part of the pool rollout.
 A single-clone Windows install (a runner name without `.win<nn>`, like `subzerodev.runner.windows`) is adopted only
 when its clone is found on the host and its `.runner` `agentId` matches GitHub's ID for that name. Whether such a
 clone exists on beast, and whether it is the registration GitHub reports offline as id 8, is **not verified**; Adopt
-answers it on the host. If adopted, Apply adds `win01`, `win02` … through the per-instance path (C1), and retires the
+answers it on the host. In the L3 run (2026-11-24) Adopt did not prove id 8, so it stays unowned.
+If adopted, Apply adds `win01`, `win02` … through the per-instance path (C1), and retires the
 single-clone registration with `-Retire` (D2) only after `win01` is online. If no clone proves id 8, the manager does
 not touch it, and Plan lists it as an unowned registration for the owner to remove.
 
@@ -335,11 +336,11 @@ the last to change in any repository.
 
 ### Validation levels
 
-| Level | Meaning | HollowMoon PR #4 today |
+| Level | Meaning | HollowMoon PR #4 (2026-11-24) |
 | --- | --- | --- |
 | L1 local | the BuildAgent build passes against the pinned image on a workstation | passed |
-| L2 workflow | the GitHub check passes on a self-hosted slot | **not run.** Status (verified 2026-11-10): run 42847206551 queued since 15:42 UTC; the only registered runner with `self-hosted, subzerodev, Windows`, id 8, is offline. Cause of the offline state: **not verified**. |
-| L3 target host | on beast, after Apply: scale, hold, reboot and concurrency acceptance (handoff) | not done |
+| L2 workflow | the GitHub check passes on a self-hosted slot | **passed** on beast's `win02` ([run 45393284264](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393284264)), from a throwaway branch that changed only `runs-on`. PR #4's own check still targets GitHub-hosted `windows-latest`. |
+| L3 target host | on beast, after Apply: scale, hold, reboot and concurrency acceptance (handoff) | **passed** 2026-11-24 (S9, #34); step 2 not applicable. Evidence: [l3-beast-acceptance.md](l3-beast-acceptance.md) |
 | L4 generalization | each other repository reaches L1 and L2 for each job it moves | not started |
 
 Mocked tests in this repository are L0 and are reported separately from all of these.
