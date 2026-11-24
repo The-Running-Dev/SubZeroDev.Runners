@@ -68,6 +68,7 @@ Invoke-FakeKill $dir $line
 $path = Join-Path $dir 'world.json'
 $world = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
 if ($line -match '-X POST .*registration-token') { 'faketoken'; exit 0 }
+if ($line -match 'repos/actions/runner/releases/tags/') { $world.release | ConvertTo-Json -Depth 8; exit 0 }
 if ($line -match '-X DELETE .*actions/runners/(\d+)$') {
     if ($world.deleteNotFound) { [Console]::Error.WriteLine('HTTP 404: Not Found'); exit 1 }
     $id = [int64]$Matches[1]
@@ -115,7 +116,18 @@ switch ($args[0]) {
         $ref = $args[-1]
         $id = $state.images.$ref
         if (-not $id) { [Console]::Error.WriteLine("Error response from daemon: No such image: $ref"); exit 1 }
+        if ($line -match 'runners\.context') { $label = if ($state.labels) { $state.labels.$ref }; if ($label) { $label } else { '<no value>' }; exit 0 }
         $id; exit 0
+    }
+    'build' {
+        $tag = $args[[array]::IndexOf($args, '-t') + 1]
+        $label = ($args[[array]::IndexOf($args, '--label') + 1] -split '=', 2)[1]
+        if (-not $state.images) { $state | Add-Member -Force images ([pscustomobject]@{}) }
+        if (-not $state.labels) { $state | Add-Member -Force labels ([pscustomobject]@{}) }
+        $state.images | Add-Member -Force -NotePropertyName $tag -NotePropertyValue ('sha256:' + ('b' * 64))
+        $state.labels | Add-Member -Force -NotePropertyName $tag -NotePropertyValue $label
+        Save-State
+        'built (fake)'; exit 0
     }
     'run' {
         $mount = $args[[array]::IndexOf($args, '--mount') + 1]
@@ -254,10 +266,21 @@ function Set-Count($Fixture, [string] $Platform, $Count) {
     $settings | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $path
 }
 
-function New-Fixture([int] $Linux = 1, [int] $Windows = 0, [hashtable] $Local = @{}) {
+function New-Fixture([int] $Linux = 1, [int] $Windows = 0, [hashtable] $Local = @{}, [switch] $NoImage) {
     $clone = New-CaseDirectory
     Copy-Item (Join-Path $repo 'runners.json') $clone
     Copy-Item (Join-Path $repo 'scripts') (Join-Path $clone 'scripts') -Recurse
+    if ($NoImage) {
+        # A fresh host: no image yet, so Apply builds it from this context. The runner archive is already downloaded and
+        # the fake release publishes its SHA-256, so nothing is fetched.
+        Copy-Item (Join-Path $repo '.dockerignore') $clone
+        New-Item -ItemType Directory -Path (Join-Path $clone 'linux'), (Join-Path $clone 'downloads') | Out-Null
+        foreach ($file in 'Dockerfile', 'entrypoint.sh', 'healthcheck.sh') { Copy-Item (Join-Path $repo "linux\$file") (Join-Path $clone 'linux') }
+        $archiveName = 'actions-runner-linux-x64-{0}.tar.gz' -f $Config.runnerVersion
+        $archive = Join-Path $clone "downloads\$archiveName"
+        [IO.File]::WriteAllText($archive, 'fake runner archive')
+        $archiveSha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
     Add-Content -LiteralPath (Join-Path $clone 'scripts\WindowsRunnerSetup.ps1') -Value $windowsOverrides
     # LOCALAPPDATA is outside the clone: the Windows slots' clones must not sit under the checkout.
     $shim = Join-Path $clone 'shim'; $ghState = Join-Path $clone 'gh'; $localAppData = New-CaseDirectory
@@ -282,7 +305,8 @@ function New-Fixture([int] $Linux = 1, [int] $Windows = 0, [hashtable] $Local = 
     New-Item -ItemType Directory -Path $fixture.State -Force | Out-Null
     Write-Raw (Join-Path $fixture.State 'inventory.json') (ConvertTo-StateJson $HostInventorySchema @{ generation = 1; hostId = 'testhost'; github = @{ scope = 'orgs/AbsoluteZeroDev' }; slots = @() })
     Set-World $fixture @{ runners = @(); groups = @(@{ id = 1; name = 'Default'; allows_public_repositories = $false; visibility = 'all' }); deleteNotFound = $false; registerOffline = $false }
-    Set-Docker $fixture ([ordered]@{ busy = $false; failOn = @(); unknownFor = @(); networks = @(); volumes = @(); images = @{ $Config.linux.image = $imageId }; containers = @() })
+    Set-Docker $fixture ([ordered]@{ busy = $false; failOn = @(); unknownFor = @(); networks = @(); volumes = @(); images = $(if ($NoImage) { @{} } else { @{ $Config.linux.image = $imageId } }); containers = @() })
+    if ($NoImage) { Update-World $fixture { param($w) $w | Add-Member -Force release ([pscustomobject]@{ assets = @(@{ name = $archiveName; digest = "sha256:$archiveSha" }) }) } }
     $fixture
 }
 function Use-Fixture($Fixture, [scriptblock] $Body) {
@@ -517,11 +541,10 @@ Test-Case 'Apply -Prune removes what a retired slot left (directory, volumes, ne
 
 # --- blockers and the reviewed plan -----------------------------------------------------------------------------------
 
-Test-Case 'A public runner group, low disk or a missing image refuses the add before anything changes' {
+Test-Case 'A public runner group or low disk refuses the add before anything changes' {
     foreach ($setup in @(
             @{ Why = 'public'; Local = @{}; Change = { param($f) Update-World $f { param($w) $w.groups[0].allows_public_repositories = $true } } }
-            @{ Why = 'minFreeGB'; Local = @{ housekeeping = @{ minFreeGB = 100000 } }; Change = { param($f) } }
-            @{ Why = 'not built'; Local = @{}; Change = { param($f) Update-Docker $f { param($s) $s.images = @{} } } })) {
+            @{ Why = 'minFreeGB'; Local = @{ housekeeping = @{ minFreeGB = 100000 } }; Change = { param($f) } })) {
         $f = New-Fixture -Local $setup.Local
         & $setup.Change $f
         $result = Invoke-Apply $f
@@ -530,6 +553,37 @@ Test-Case 'A public runner group, low disk or a missing image refuses the add be
         Assert (-not (Get-Operation $f) -and -not @((Get-Inventory $f).slots).Count) "Something changed with a blocker ($($setup.Why))."
         Assert (-not @(Get-Log $f 'docker.log' | Where-Object { $_ -match '^(run|compose)' }).Count) "Something was created with a blocker ($($setup.Why))."
     }
+}
+
+Test-Case 'A fresh host with no image: Plan lists the build, Apply builds it once and adds the Linux and Windows slots (#32)' {
+    $f = New-Fixture -Linux 1 -Windows 1 -NoImage
+    $plan = Invoke-Script $f 'Manage-RunnerHost.ps1' @('-Action', 'Plan', '-Json')
+    Assert-Exit $plan 3 'build-image'
+    $changes = @(($plan.Output -replace '(?s)^[^{]*', '' | ConvertFrom-Json).changes)
+    $build = [array]::FindIndex($changes, [Predicate[object]] { param($c) $c.kind -eq 'build-image' })
+    $linuxAdd = [array]::FindIndex($changes, [Predicate[object]] { param($c) $c.kind -eq 'add' -and $c.platform -eq 'linux' })
+    Assert ($build -ge 0 -and $changes[$build].reason -eq 'not built') "Plan does not list the image build: $($plan.Output)"
+    Assert ($build -lt $linuxAdd) 'Plan lists the image build after the Linux add it is needed for.'
+    Assert (-not @(Get-Log $f 'docker.log' | Where-Object { $_ -match '^build ' }).Count) 'Plan built the image.'
+    $result = Invoke-Apply $f
+    Assert-Exit $result 0 'linux-01 is active'
+    Assert-LinuxActive $f 1
+    Assert ((Get-Slot $f 'win01').state -eq 'active') 'win01 was not added.'
+    Assert (@(Get-Log $f 'docker.log' | Where-Object { $_ -match '^build ' }).Count -eq 1) 'The image was not built exactly once.'
+    $after = Invoke-Script $f 'Manage-RunnerHost.ps1' @('-Action', 'Plan', '-Json')
+    $left = @(([regex]::Match($after.Output, '(?s)\{.*\}').Value | ConvertFrom-Json).changes | Where-Object { $_.kind -in 'build-image', 'add' })
+    Assert (-not $left.Count) "Plan still lists a build or an add after Apply: $($left | ConvertTo-Json -Compress)"
+}
+
+Test-Case 'A failed image build refuses only the Linux adds; the Windows add goes ahead (#32)' {
+    $f = New-Fixture -Linux 1 -Windows 1 -NoImage
+    Update-Docker $f { param($s) $s.failOn = @('^build ') }
+    $result = Invoke-Apply $f
+    Assert-Exit $result 1 'Apply added no Linux slot'
+    Assert ($result.Output -match 'could not be built') "The refusal does not say the build failed: $($result.Output)"
+    Assert (-not (Get-Slot $f 'linux-01')) 'linux-01 was recorded although the image could not be built.'
+    Assert (-not @(Get-Log $f 'docker.log' | Where-Object { $_ -match '^(run|compose)' }).Count) 'A Linux container was created without an image.'
+    Assert ((Get-Slot $f 'win01').state -eq 'active') 'The Windows add was held back by the Linux image.'
 }
 
 Test-Case 'Apply -ExpectPlan refuses when the plan is not the reviewed one, and applies when it is' {

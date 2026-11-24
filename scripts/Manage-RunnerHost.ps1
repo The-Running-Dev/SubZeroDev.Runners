@@ -295,6 +295,15 @@ function Get-HostPlan([switch] $Resources) {
                 foreach ($item in $drift | Where-Object { $_.state -eq 'unknown' }) { & $finding 'unknown' $slot.SlotId $item.message }
             }
         }
+        # A Linux add needs the image: Apply builds it first when it is missing or stale, so the plan says so.
+        $linuxAdd = @($plan.changes | Where-Object { $_.kind -eq 'add' -and $_.platform -eq 'linux' }) | Select-Object -First 1
+        if ($linuxAdd) {
+            $image = Get-ImageId $Config.linux.image
+            if ($image.State -eq 'unknown') { & $finding 'unknown' 'image' "Whether the image $($Config.linux.image) exists is unknown ($($image.Reason))." }
+            elseif ($image.State -eq 'absent' -or (& $imageStale)) {
+                $plan.changes.Insert($plan.changes.IndexOf($linuxAdd), [ordered]@{ kind = 'build-image'; platform = 'linux'; image = $Config.linux.image; reason = $(if ($image.State -eq 'absent') { 'not built' } else { 'image-context' }) })
+            }
+        }
         $scope = Get-InventoryScope $inv
         $group = Test-RunnerGroup $scope @($live | Where-Object { $_.runnerId } | ForEach-Object { [int64]$_.runnerId })
         foreach ($item in $group.findings) { $plan.findings.Add($item) }
@@ -1102,10 +1111,22 @@ function Get-AddBlocker($Inventory, $Adds) {
     foreach ($disk in @(Get-FreeDiskReport $paths)) {
         if ($disk.Low) { return "drive $($disk.Drive) has $($disk.FreeGB) GB free, below housekeeping.minFreeGB ($($disk.MinimumGB) GB)." }
     }
-    if ($linux.Count) {
-        $image = Get-ImageId $Config.linux.image
-        if ($image.State -ne 'present') { return "the image $($Config.linux.image) is $(if ($image.State -eq 'absent') { 'not built' } else { "unknown ($($image.Reason))" })." }
-    }
+    $null
+}
+
+# Before Linux adds: builds the image when it is missing or was built from another context (S4: the image is rebuilt on a
+# mismatch), so a fresh host needs no separate build step. Returns why the Linux adds cannot go ahead, or $null. Only the
+# Linux adds depend on it: the Windows adds go ahead either way.
+function Get-LinuxImageBlocker {
+    $image = Get-ImageId $Config.linux.image
+    if ($image.State -eq 'unknown') { return "whether the image $($Config.linux.image) exists is unknown ($($image.Reason))." }
+    if ($image.State -eq 'present' -and -not (Test-LinuxImageStale)) { return $null }
+    try {
+        $build = Get-LinuxImageBuild $Config $Root
+        Write-Host "Building $($Config.linux.image) on $($Config.linux.baseImage)."
+        Invoke-LinuxImageBuild $Config $Root $build
+    } catch { return "the image $($Config.linux.image) could not be built: $($_.Exception.Message)" }
+    if ((Get-ImageId $Config.linux.image).State -ne 'present') { return "the image $($Config.linux.image) is still not there after building it." }
     $null
 }
 
@@ -1717,6 +1738,15 @@ function Invoke-ApplyChanges($inventory, $op, [switch] $Rebuild) {
             $script:HostFailed = $true
             [Console]::Error.WriteLine("Apply added no slot ($(@($adds | ForEach-Object { $_.slotId }) -join ', ')): $blocker")
         } else {
+            $linuxAdds = @($adds | Where-Object { $_.platform -eq 'linux' })
+            if ($linuxAdds.Count) {
+                $imageBlocker = Get-LinuxImageBlocker
+                if ($imageBlocker) {
+                    $script:HostFailed = $true
+                    [Console]::Error.WriteLine("Apply added no Linux slot ($(@($linuxAdds | ForEach-Object { $_.slotId }) -join ', ')): $imageBlocker")
+                    $adds = @($adds | Where-Object { $_.platform -ne 'linux' })
+                }
+            }
             foreach ($add in $adds) {
                 Invoke-SlotAdd $inventory $null $add.slotId $add.platform
                 $inventory = Assert-HostInventoryUsable 'Apply'

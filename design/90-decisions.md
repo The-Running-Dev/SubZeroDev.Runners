@@ -7,6 +7,11 @@ Append-only. Newest at the top. The rejected alternatives are the point — with
 
 ---
 
+### 2026-11-24 - #32: Apply builds a missing or stale Linux image before the Linux adds; only the Linux adds wait on it
+Context: The S6 entry has Apply's add preflight refuse on a missing image, and the only build in Apply ran after the adds and only when a composed Linux slot already existed. So on a fresh host no host-manager action could add a slot (#32), and the image check also held back the Windows adds. The S4 entry says the image is rebuilt when its context hash does not match.
+Chosen: Plan lists a `build-image` change (reason `not built` or `image-context`) ahead of the first Linux add. Apply builds the image with `Get-LinuxImageBuild` and `Invoke-LinuxImageBuild` before the Linux adds. A failed build, or an image Docker cannot report, refuses only the Linux adds (exit 1). The Windows adds go ahead. The other preflight checks still refuse every add before anything changes. This departs from the S6 entry's "a missing image" refusal.
+Rejected: Keeping the refusal and adding a separate build-only action (one more step on every fresh host, for no protection the build does not already give). Building in Plan (Plan never changes anything). Letting the Linux image hold back the Windows adds.
+
 ### 2026-11-24 - S9: run L3 from the D:\Temp checkout the owner chose, so the pre-pool runners stay unowned and step 2 does not apply
 Context: The host manager acts on the checkout it runs from (`scripts/Common.ps1` `$Root`). Beast's pre-pool registrations (`linux/runner/.runner`, `windows/.runner`, and `github.url` in `runners.local.json`) are only in `D:\Dropbox\Projects\SubZeroDev.Runners`. The owner chose `D:\Temp\SubZeroDev.Runners` when asked.
 Chosen: Run every L3 step from `D:\Temp\SubZeroDev.Runners`. Its git-ignored `runners.local.json` was given the live install's `github.url`, `windows.workFolder` and `linux.docker.mode: dind`; without `github.url`, Apply has no scope to register into. Adopt proved no slot. Runners 8 and 9 are reported unowned and left alone. Step 2 (the migration) is recorded as not applicable: there was no pre-pool registration in this checkout and no pre-pool container in Docker. Step 3's single-clone case is the unproven one: reported, not retired.
