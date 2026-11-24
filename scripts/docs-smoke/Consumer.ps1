@@ -94,8 +94,27 @@ function Prepare-SmokeConsumer([string] $Repository, [string] $DefaultBranch, $F
 function Get-SmokeEligibility([string] $Root, [string] $Registration, [string] $Repository, [bool] $AllowUnavailable) {
     & (Join-Path $Root 'scripts/docs-smoke/Get-SmokeEligibility.ps1') -RunnerRegistration $Registration -Repository $Repository -AllowUnavailable:$AllowUnavailable | ConvertFrom-Json
 }
-function Invoke-SmokeHostProbe([string] $Root, [string] $ReportPath) {
-    & (Join-Path $Root 'tests/Invoke-LinuxJobContainerProbe.ps1') -OutputPath $ReportPath | Out-Host
+function Invoke-SmokeHostProbe([string] $Root, [string] $ReportPath, [string] $RunnerContainer) {
+    & (Join-Path $Root 'tests/Invoke-LinuxJobContainerProbe.ps1') -OutputPath $ReportPath -RunnerContainer $RunnerContainer | Out-Host
+}
+# The container that runs the registration in $RunnerRegistration: the host inventory's Linux slot whose directory holds it
+# (its compose container once composed; the pre-pool container before migration), or, with no inventory, the pre-pool
+# runner's container for linux.directory. Anything else is refused rather than guessed.
+function Get-SmokeRunnerContainer([string] $Root, [string] $RunnerRegistration) {
+    . (Join-Path $Root 'scripts/RunnerConfig.ps1')
+    . (Join-Path $Root 'scripts/HostState.ps1')
+    $config = Read-RunnerConfig -Root $Root
+    $full = { param([string] $Path) [IO.Path]::GetFullPath($Path).TrimEnd('\', '/') }
+    $directory = & $full (Split-Path $RunnerRegistration -Parent)
+    $inventory = Read-HostInventory
+    if ($inventory.State -eq 'unreadable') { throw "The host inventory cannot be read ($($inventory.Reason)), so the runner's container is unknown. Nothing was dispatched." }
+    if ($inventory.State -eq 'readable') {
+        foreach ($slot in @(Get-LinuxSlots $config $inventory.Value 16 | Where-Object { -not $_.New })) {
+            if ((& $full (Join-Path $Root $slot.Directory)) -ieq $directory) { return $(if ($slot.Composed) { $slot.Container } else { $config.linux.container }) }
+        }
+    }
+    if ((& $full (Join-Path $Root $config.linux.directory)) -ieq $directory) { return $config.linux.container }
+    throw "$RunnerRegistration is not the registration of a Linux runner of this checkout$(if ($inventory.State -eq 'readable') { ' that the host inventory records' }). Nothing was dispatched."
 }
 function Assert-SmokeRun($Run, $Expected) {
     if (($Expected.id -and $Run.id -ne $Expected.id) -or $Run.id -le 0 -or
@@ -186,7 +205,9 @@ function Invoke-DocsSmoke {
             Write-Host 'Resuming the saved dispatch; no new workflow will be dispatched.'
         } else {
             if (-not $eligible.availableNow) { throw 'Runner must be online and idle before a new dispatch. No run was dispatched.' }
-            Invoke-SmokeHostProbe $Root (Join-Path $StateDirectory ('probe-'+[guid]::NewGuid().ToString('N')+'.json'))
+            $container = Get-SmokeRunnerContainer $Root $RunnerRegistration
+            Write-Host "Probing the runner container $container."
+            Invoke-SmokeHostProbe $Root (Join-Path $StateDirectory ('probe-'+[guid]::NewGuid().ToString('N')+'.json')) $container
             # Re-read the branch after the probe and refuse changes before dispatch.
             if ((Get-SmokeSnapshot $Repository $Ref).sha -cne $snapshot.sha) { throw 'Consumer ref changed during the probe. Nothing dispatched; review and retry.' }
             $state.active=@{id=0;correlation=[guid]::NewGuid().ToString('N');ref=$Ref;sha=$snapshot.sha;runnerId=$eligible.runnerId;runnerName=$eligible.runnerName}
