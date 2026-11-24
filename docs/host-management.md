@@ -37,9 +37,10 @@ means "no change on that side".
 | `AutoStart` | What runs at host start and sign-in: waits for Docker (up to `buildAgent.docker.readyTimeoutSeconds`), then starts each active Windows slot's supervisor. It never ends maintenance. Linux slots need nothing: Docker restarts their containers and the entrypoint waits while a slot is held |
 | `Hold -Slot <id>` | Drains the slot, stops it and keeps its maintenance record. Nothing starts it again until `Resume` |
 | `Resume -Slot <id>` | The only path that ends the maintenance Hold began: restores labels, deletes the record, starts the one listener (starting a stopped Linux container first) |
-| `Apply` | Migrates the legacy `linux-01` onto its compose containers (see [Legacy Linux migration](#legacy-linux-migration)), or resumes an unfinished migration. Exit 0 when done or nothing to do |
+| `Apply [-ExpectPlan <hash>]` | Migrates the legacy `linux-01` (see [Legacy Linux migration](#legacy-linux-migration)), then adds the slots the counts want (see [Adding and retiring slots](#adding-and-retiring-slots)), or resumes an unfinished operation. Exit 0 when done or nothing to do; 3 when a surplus slot was not retired; 1 on a refusal or failure. With `-ExpectPlan` it refuses, changing nothing, when the plan is not the reviewed one |
+| `Apply -Retire` | Also retires the slots the counts no longer want: drains, deregisters and removes them |
 | `Apply -Rollback` | Before the migration is verified: removes the new containers and restarts the pre-pool ones. The inventory is not changed |
-| `Apply -Prune` | Removes the pre-pool containers a finished migration kept for rollback |
+| `Apply -Prune` | Removes the pre-pool containers a finished migration kept for rollback, and what retired slots left on disk |
 | `Startup` | Applies `windows.startAtSignIn`: writes or removes the per-user Startup entry that runs `AutoStart` |
 
 Typical first run on an existing host:
@@ -136,3 +137,44 @@ or a step failed), run `Apply` again to finish it, or `Apply -Rollback` to go ba
 
 `-Prune` removes a kept container only when its recorded ID still names a stopped container with the recorded name. A
 renamed, running or unreadable one is kept and reported (exit 1); one already gone is dropped from the record.
+
+## Adding and retiring slots
+
+Set `linux.count` and `windows.count` in `runners.local.json` (or run `Init`), review with `Plan`, then apply:
+
+```powershell
+.\scripts\Manage-RunnerHost.ps1 -Action Plan -Json                    # note the planHash
+.\scripts\Manage-RunnerHost.ps1 -Action Apply -ExpectPlan <planHash>  # add; refuses if the plan changed since
+.\scripts\Manage-RunnerHost.ps1 -Action Apply -Retire                 # also retire slots no longer wanted
+.\scripts\Manage-RunnerHost.ps1 -Action Apply -Prune                  # later: remove what retired slots left
+```
+
+Each slot gets the next number above the highest ever recorded; a retired or pruned number is never reused. A Linux
+slot `NN` is `subzerodev-runner-linux-NN` with its sidecar, network and volumes ending in `-NN`, registered as
+`subzerodev.runner.linux.<hostId>.NN`. A Windows slot `winNN` is its own clone at
+`%LOCALAPPDATA%\SubZeroDev\Runners\winNN`, registered as `subzerodev.runner.windows.<hostId>.winNN`.
+
+Adding runs five journaled steps:
+
+| Step | Does |
+| --- | --- |
+| `provision` | Records the slot as `provisioning` (Windows: with its clone path) |
+| `register` | Linux: registers the runner with GitHub through the image (the token is never printed); Windows: creates the slot's clone, writes its `runners.host.json` and installs the instance. Records the runner ID from `.runner` |
+| `create` | Linux: creates the network and volumes, writes the compose file and starts the sidecar, then the runner |
+| `verify` | Waits (`lifecycle.startTimeoutSeconds`) for the container to run and GitHub to report the recorded runner ID online. On failure Apply stops and keeps the journal; rerun it to check again |
+| `commit` | Records the containers (or clone) and marks the slot `active` |
+
+Before anything changes, Apply refuses to add when the runner group allows public repositories, free disk is below
+`housekeeping.minFreeGB`, the image is not built, or a target container name is held by a container that is not this
+host's compose slot, or whose state Docker cannot report. Unknown is never taken as absent.
+
+A slot the counts no longer want is reported and left alone (exit 3) unless `-Retire` is given. Retiring takes the
+highest number first and runs seven journaled steps: `withdraw` (records whether it was held, marks it `retiring`),
+`drain` (closes admission, waits for the running job; on timeout the journal is deleted, admission reopened and the slot
+stays `active`), `stop`, `deregister` (deletes the recorded runner ID; one GitHub no longer has counts as done),
+`clear-local` (removes `.runner` and the credentials), `remove-containers`, and `commit` (marks it `retired` and rewrites
+the compose file). Volumes, the network and the directory stay until `Apply -Prune`, which removes them and marks the
+slot `pruned`; a slot that could not be fully pruned stays `retired` and is tried again next time (exit 1).
+
+A run killed or failed part-way is finished by running `Apply` again (with `-Retire` for a retire). Apply holds the host
+lock: a second Apply waits for the first, then finds its work done.

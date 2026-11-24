@@ -40,6 +40,7 @@ bash tests/Test-LinuxRunnerRuntimes.sh
 | `Test-Maintenance` | AutoStart keeps maintenance; Hold and Resume; the Startup entry |
 | `Test-Compose` | Compose generation, per-slot recreate, the image context hash, runtime isolation mount, Linux status |
 | `Test-LegacyMigration` | The legacy Linux migration with a kill in each step, failures, rollback, prune and refusals, against a fake Docker and GitHub |
+| `Test-SlotScaling` | Adding and retiring slots: scale, ownership, unknown state, a kill in each add and retire step, verify failure, drain timeout, prune, blockers, `-ExpectPlan` and two concurrent Applies |
 | `Test-LinuxRunnerUpdate` | The guarded Linux updater with synthetic native calls and admission |
 | `Test-LinuxJobContainerMounts`, `Test-LinuxJobContainerProbe` | Job-container mounts and the opt-in probe against a fake Docker |
 | `Test-BuildAgentProvisioning` | BuildAgent provisioning and resumable setup state |
