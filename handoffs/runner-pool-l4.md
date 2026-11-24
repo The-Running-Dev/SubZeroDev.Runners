@@ -39,21 +39,22 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
 
 | | Question | Proposed | Why |
 | --- | --- | --- | --- |
-| D5 | How does a repository fall back to hosted runners when beast is down? | **(b)** a repository variable per OS selects the runner; unset means hosted. | The 2026-11-10 move back was about availability. With (a), label-only `runs-on`, a job waits for beast for up to 24 hours and falling back takes a PR in each repository. With (b) it is one variable change, and no PR. |
+| D5 | How does a repository fall back to hosted runners when beast is down? | **(b)**, approved 2026-11-24: a repository variable per OS selects the runner; unset means hosted. | The 2026-11-10 move back was about availability. With (a), label-only `runs-on`, a job waits for beast for up to 24 hours and falling back takes a PR in each repository. With (b) it is one variable change, and no PR. |
 | D6 | Do release, signing and deploy jobs move? | **Not in L4 by default.** Each one moves only on the owner's explicit yes, in L4-7. | They hold signing and publishing secrets and environment approvals. Slots run privileged dind (D1), so a workflow on the same host could reach them. |
-
-Until D5 is decided, L4-1 does not start.
 
 ## The switch (D5 (b))
 
 - Repository variables are `SUBZERODEV_WINDOWS_RUNS_ON` and `SUBZERODEV_LINUX_RUNS_ON`.
   - The self-hosted values are `subzerodev-windows` and `subzerodev-linux`, the pool's existing labels.
-  - L4-1 checks whether an organization variable reaches a private repository on the Free plan. The later slices use an org variable only if it does.
+  - They are repository variables. On the Free plan an organization variable does not reach a private repository
+    (GitHub Docs, "Using secrets in GitHub Actions"), so each slice sets its own.
 - Direct jobs use `runs-on: ${{ vars.SUBZERODEV_WINDOWS_RUNS_ON || 'windows-latest' }}`, and the same with the Linux variable and `ubuntu-latest`.
 - Jobs that call an ActionTemplates workflow:
   - The list input becomes `os: ${{ format('["{0}"]', vars.SUBZERODEV_WINDOWS_RUNS_ON || 'windows-latest') }}`.
   - The label inputs (`runs-on`, `utility-runs-on`) take the Linux expression.
-  - No template changes.
+  - ActionTemplates gates rejected an expression in any `with:` input. [ActionTemplates #54](https://github.com/The-Running-Dev/GitHub-ActionTemplates/pull/54)
+    (`a73c2e3`) lets the runner inputs (`os`, `pack-os`, `runs-on`, `utility-runs-on`) take one, so a caller pins
+    `a73c2e3` or a later release.
 - The slice sets the variable for the L2 run on its PR's head. Until the PR merges, main's workflows don't read the variable, so setting it early changes nothing there. The variable stays set after the merge, and clearing it is the rollback.
 
 ## Gate for each job
@@ -69,10 +70,16 @@ Until D5 is decided, L4-1 does not start.
 
 0. **Plan (this repository).** This handoff. Correct the plan's per-job rollout and validation tables to match the
    inventory above.
-1. **Cleaner `ci.yml`.**
-   - Add the switch to `os` and `utility-runs-on`, then set both variables.
-   - This is the smallest Windows job, and it proves the switch and the `dotnet.yml` input expressions.
-   - Record whether an org variable would have worked.
+1. **Cleaner `ci.yml`.** Done 2026-11-24, [Cleaner #30](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/pull/30).
+   - L2 on head `3fdc591`, [run 45487347854](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/actions/runs/45487347854):
+     - hosted (variables cleared): attempt 1 passed;
+     - pool (variables set): attempt 3 passed, with Test on `beast.win01` and Result on `beast.linux.02`.
+   - Attempt 2 on the pool failed `On_this_machine_the_reported_total_matches_the_space_Windows_says_came_back`. The test measures free space on the whole C: volume, which beast shares with Dropbox, Docker and the other slots. It was 113 MiB off against a 100 MiB tolerance, and passed on rerun. It can fail again on beast.
+   - Needed first:
+     - [ActionTemplates #54](https://github.com/The-Running-Dev/GitHub-ActionTemplates/pull/54), so gates accept the runner expressions;
+     - [Cleaner #31](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/pull/31), which fixed 14 CsWinRT1032 test-build errors from the `windows-latest` image of 2026-11-16. That image fails Cleaner's main too.
+   - Cleaner's `Main` ruleset required secret-scanning alert resolution while secret scanning is off, which blocked every merge. The rule was removed on the owner's yes, matching HotCorners and Media.
+   - Org variables don't reach private repositories on Free, so the later slices also use repository variables.
 2. **HotCorners `ci.yml` and `claude-code-review.yml`.**
    - Switch both.
    - On a Linux slot the review job uses its secrets. D1 allows this because the owner is the only writer.
@@ -83,6 +90,7 @@ Until D5 is decided, L4-1 does not start.
 4. **Media `ci.yml` (`web`, `linux`, `dotnet`, `windows-package`).**
    - Media used most of the Windows minutes in October.
    - `dotnet` calls `dotnet.yml@v2`, a moving tag. The slice keeps the reference as it is; pinning it is that repository's own change.
+     The switch needs a `v2` release that includes ActionTemplates #54 before this slice starts.
    - The `wasm-tools` workload install runs per job. Check its time on a slot against the hosted run.
 5. **HollowMoon `build.yml`, `self-hosted-docs-smoke.yml` `verify`, and Architecture `docs.yml`.**
    - `build.yml` turns the throwaway-branch L2 from 2026-11-24 into the merged state.
@@ -101,6 +109,6 @@ Until D5 is decided, L4-1 does not start.
 
 ## Unchanged
 
-- The pool's labels, BuildAgent, ActionTemplates, and every `environment:` with its protection rules.
+- The pool's labels, BuildAgent, ActionTemplates beyond #54, and every `environment:` with its protection rules.
 - Triggers, secrets and artifact retention in each workflow.
 - No repository variable is set before its slice starts.
