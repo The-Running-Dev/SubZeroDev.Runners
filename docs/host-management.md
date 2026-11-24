@@ -4,7 +4,8 @@
 what would change. It runs in the host's own checkout (not in a Windows instance clone) and needs PowerShell 7.2+.
 
 Design background is in the [runner pool plan](runner-pool-plan.md). This guide covers the actions that exist today.
-`Apply` migrates the legacy Linux runner; adding and retiring slots and `Update` are planned slices and are not available yet.
+`Apply` migrates the legacy Linux runner, adds and retires slots and updates drifted ones; `Update` moves the BuildAgent
+image to a release.
 
 ## Concepts
 
@@ -178,3 +179,32 @@ slot `pruned`; a slot that could not be fully pruned stays `retired` and is trie
 
 A run killed or failed part-way is finished by running `Apply` again (with `-Retire` for a retire). Apply holds the host
 lock: a second Apply waits for the first, then finds its work done.
+
+## Updates
+
+```powershell
+.\scripts\Manage-RunnerHost.ps1 -Action Update -Version 1.5.0   # move buildAgent.image to that release
+.\scripts\Manage-RunnerHost.ps1 -Action Apply                   # finish an interrupted update, or a deferred slot
+```
+
+`Update` takes an exact release only (`1.5.0`); `latest`, `1` or `1.4` are refused, as is a tag the registry cannot
+resolve, before anything changes. It resolves the tag to its digest and writes it into `runners.local.json`
+(`buildAgent.image`, other keys kept) and the inventory, with the digest it replaced, before anything is recreated. It
+then rebuilds the Linux image on it (when `linux.baseImage` follows `buildAgent.image`) and applies.
+
+After any adds and retires, `Apply` updates each slot whose containers, image or clone differ from the settings, one at
+a time, inside that slot's drain (journaled `drain`, `change`, `resume`, `verify`, `commit`): a Linux slot's own compose
+services are recreated (sidecar, then runner; the registration is kept), a Windows slot's clone is synced and its runner
+started again. A held slot is skipped (`deferred: held`); a busy one that does not drain in time is left running as it
+is (`deferred: busy`). Either exits 3; rerun `Apply` once it is resumed or idle.
+
+An earlier release through `Update` is a rollback and is said so. A digest `Update` replaced that comes back in the
+settings (an old `runners.local.json` restored) is a blocked downgrade: `Plan` reports it and `Apply` refuses until the
+settings are restored or the rollback is made with `Update`.
+
+## Resources
+
+`Plan` ends with a read-only resources section: each slot volume's size, the free space on Docker's data drive against
+`housekeeping.minFreeGB`, the Linux memory the slots are limited to (enforced), the Windows BuildAgent estimate
+(`buildAgent.estimate.memory`; advisory, not enforced) and the `[wsl2] memory` cap in `.wslconfig`. A Linux total above
+that cap is a warning. Nothing here edits `.wslconfig`, auto sign-in or Docker Desktop settings.

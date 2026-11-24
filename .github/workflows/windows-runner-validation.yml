@@ -84,6 +84,9 @@ jobs:
       - name: Verify adding and retiring slots, their failure recovery and concurrency
         shell: pwsh
         run: ./tests/Test-SlotScaling.ps1
+      - name: Verify updates, downgrade refusal, deferred slots and the resources report
+        shell: pwsh
+        run: ./tests/Test-Updates.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)

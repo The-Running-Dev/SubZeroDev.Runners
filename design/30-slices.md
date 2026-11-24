@@ -39,7 +39,7 @@ Acceptance: Apply with add and retire operations, `-Retire`, `-Prune`, `-ExpectP
 Out of scope: Update.
 
 ## S7 — Updates and resources
-Status: todo
+Status: done
 Depends on: S6
 Acceptance: `Manage-RunnerHost -Action Update` writes the digest before any recreate; Plan reports disk and memory figures, the Windows-side one advisory; the handoff's Updates tests pass.
 Out of scope: editing `.wslconfig`, auto sign-in or Docker Desktop settings.

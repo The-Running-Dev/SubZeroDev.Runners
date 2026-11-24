@@ -352,7 +352,7 @@ Test-Case 'Scale: Apply adds linux-01 and linux-02 with their own names, network
     Assert (-not (Get-Operation $f)) 'The journal was not removed.'
     Assert ($result.Output -notmatch 'faketoken') 'The registration token was printed.'
     Assert ((Get-Inventory $f).generation -ge 2) 'The inventory generation was not bumped.'
-    Assert-Exit (Invoke-Apply $f) 0 'Nothing to migrate, add or retire'
+    Assert-Exit (Invoke-Apply $f) 0 'Nothing to migrate, add, retire or update'
 }
 
 if ($IsWindows) {
@@ -447,7 +447,7 @@ Test-Case 'A slot no longer wanted is not retired without -Retire; with it the h
     Assert-Retired $f 2
     Assert-LinuxActive $f 1
     Assert (@(Get-Log $f 'calls.log' | Where-Object { $_ -match '-X DELETE .*runners/\d+/labels' }).Count -ge 1) 'Admission was not closed before the drain.'
-    Assert-Exit (Invoke-Apply $f) 0 'Nothing to migrate, add or retire'
+    Assert-Exit (Invoke-Apply $f) 0 'Nothing to migrate, add, retire or update'
 }
 
 foreach ($point in @(
@@ -568,7 +568,7 @@ Test-Case 'Concurrency: a second Apply waits for the first and does not repeat i
         Assert ($first.WaitForExit(60000) -and $second.WaitForExit(60000)) 'An Apply did not finish.'
         Assert ($first.ExitCode -eq 0) "The first Apply exited $($first.ExitCode): $(Get-Content -Raw -LiteralPath $firstOut) $(Get-Content -Raw -LiteralPath "$firstOut.err")"
         Assert ($second.ExitCode -eq 0) "The second Apply exited $($second.ExitCode): $(Get-Content -Raw -LiteralPath "$firstOut.2") $(Get-Content -Raw -LiteralPath "$firstOut.2.err")"
-        Assert ((Get-Content -Raw -LiteralPath "$firstOut.2") -match 'Nothing to migrate, add or retire') 'The second Apply did not find the work done.'
+        Assert ((Get-Content -Raw -LiteralPath "$firstOut.2") -match 'Nothing to migrate, add, retire or update') 'The second Apply did not find the work done.'
         Assert (@(Get-Log $f 'calls.log' | Where-Object { $_ -match '-X DELETE .*actions/runners/\d+$' }).Count -eq 1) 'The runner was deregistered more than once.'
         Assert-Retired $f 2
         Assert-LinuxActive $f 1

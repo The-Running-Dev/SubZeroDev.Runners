@@ -34,22 +34,6 @@ param([switch] $Build, [switch] $Update, [int] $TimeoutMinutes, [switch] $Force,
 . "$PSScriptRoot\Compose.ps1"
 if (-not $PSBoundParameters.ContainsKey('TimeoutMinutes')) { $TimeoutMinutes = $Config.lifecycle.drainTimeoutMinutes }
 
-# The image and the hash of what it was built from. $buildArguments are the Dockerfile's build arguments.
-function Get-LinuxImageBuild {
-    # One runner version for both platforms (runners.json runnerVersion), downloaded and checked against the SHA-256 GitHub
-    # publishes; the Dockerfile checks it again and fails when either build argument is missing.
-    $archive = Get-RunnerArchive -Platform linux-x64 -Version $Config.runnerVersion -DownloadDirectory (Join-Path $Root 'downloads') | Select-Object -Last 1
-    $buildArguments = [ordered]@{ BASE_IMAGE = $Config.linux.baseImage; RUNNER_VERSION = $Config.runnerVersion; RUNNER_SHA256 = $archive.Sha256 }
-    [pscustomobject]@{ Arguments = $buildArguments; Hash = (Get-LinuxBuildContextHash $Root $buildArguments) }
-}
-
-function Invoke-LinuxImageBuild($ImageBuild) {
-    $arguments = @('build', '--pull', '--label', "$ContextHashLabel=$($ImageBuild.Hash)")
-    foreach ($name in $ImageBuild.Arguments.Keys) { $arguments += @('--build-arg', "$name=$($ImageBuild.Arguments[$name])") }
-    & $Docker @arguments -f (Join-Path $Root 'linux\Dockerfile') -t $Config.linux.image $Root
-    if ($LASTEXITCODE) { throw 'Image build failed.' }
-}
-
 # Compose slots: the inventory's live, non-legacy Linux slots (optionally one). Anything else leaves the legacy path as it was.
 function Get-ComposeSlots {
     $inventory = Read-HostInventory
@@ -189,9 +173,9 @@ try {
 
     if ($composeSlots.Count) {
         # Compose path. The image is checked against its build context on every run, and rebuilt when it is missing or stale.
-        $imageBuild = Get-LinuxImageBuild
+        $imageBuild = Get-LinuxImageBuild $Config $Root
         $current = Get-LinuxImageContextHash $linux.image
-        if ($Build -or $current -ne $imageBuild.Hash) { Invoke-LinuxImageBuild $imageBuild }
+        if ($Build -or $current -ne $imageBuild.Hash) { Invoke-LinuxImageBuild $Config $Root $imageBuild }
         $allSlots = @(Get-LinuxSlots $Config (Read-HostInventory).Value | Where-Object { $_.Composed })
         $composeFile = Get-LinuxComposeFilePath $Root
         $yaml = ConvertTo-LinuxComposeYaml $Config $allSlots $Root $PSScriptRoot
@@ -204,8 +188,8 @@ try {
     }
 
     if ($Build) {
-        $imageBuild = Get-LinuxImageBuild
-        Invoke-LinuxImageBuild $imageBuild
+        $imageBuild = Get-LinuxImageBuild $Config $Root
+        Invoke-LinuxImageBuild $Config $Root $imageBuild
     }
     $registered = Test-Path -LiteralPath (Join-Path $LinuxRunner '.runner')
     $maintenanceFile = Get-LinuxMaintenanceFile

@@ -24,11 +24,21 @@
 #           removed at GitHub and locally; windows-legacy only once win01 is online). -ExpectPlan <planHash> refuses before
 #           any change when the plan is not the one reviewed. Apply -Prune removes what is kept for rollback and what retired
 #           slots left on disk (directory, clone, volumes). Exit 0: done; 3: a retire was skipped or deferred; 1: failed.
-#           Update changes are not applied by this version.
+#           After the adds and retires Apply updates each drifted slot, one at a time, inside that slot's drain: a Linux
+#           slot is recreated on its own compose services (sidecar, then runner; never down), a Windows slot's clone is
+#           synced, its host settings written and its runner started again. A held slot is skipped (deferred: held), a
+#           busy one that does not drain in time is left as it is (deferred: busy). A stale BuildAgent digest (one Update
+#           replaced) is reported as a downgrade and Apply refuses it.
+#   Update -Version x.y.z  resolves the BuildAgent image tag to its digest, writes buildAgent.image into runners.local.json
+#           and the inventory before anything is recreated, rebuilds the Linux image on it, then applies like Apply. A
+#           floating tag (latest) is refused. An earlier version is a rollback and is said so.
 #
-# Plan and Status take no lock and change nothing. Init, Adopt, AutoStart, Hold, Resume and Apply take the host lock.
+# Plan also reports resources: slot volumes, the Docker data drive's free space, the memory the slots are limited to and
+# the Windows BuildAgent estimate (advisory), against the .wslconfig memory cap (read only, never edited).
+#
+# Plan and Status take no lock and change nothing. Init, Adopt, AutoStart, Hold, Resume, Apply and Update take the host lock.
 param(
-    [Parameter(Mandatory)] [ValidateSet('Init', 'Adopt', 'Plan', 'Status', 'AutoStart', 'Hold', 'Resume', 'Startup', 'Apply')] [string] $Action,
+    [Parameter(Mandatory)] [ValidateSet('Init', 'Adopt', 'Plan', 'Status', 'AutoStart', 'Hold', 'Resume', 'Startup', 'Apply', 'Update')] [string] $Action,
     # The slot Hold and Resume act on, e.g. linux-01 or win02.
     [string] $Slot,
     [ValidateRange(0, 16)] [Nullable[int]] $LinuxCount,
@@ -44,6 +54,8 @@ param(
     [switch] $Retire,
     # Apply: the planHash -Action Plan printed. Apply refuses before any change when the plan is no longer that one.
     [string] $ExpectPlan,
+    # Update: the BuildAgent release to move to, e.g. 1.4.2. Resolved to its digest; floating tags are refused.
+    [string] $Version,
     [switch] $Json,
     # Where the Windows instance clones live (winNN). The setup default.
     [string] $InstallRoot = $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'SubZeroDev\Runners' })
@@ -55,6 +67,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\Lifecycle.ps1"
 . "$PSScriptRoot\Compose.ps1"
 . "$PSScriptRoot\Housekeeping.ps1"
+. "$PSScriptRoot\RunnerArchive.ps1"
 . "$PSScriptRoot\WindowsRunnerSetup.ps1"
 
 $PlanSchema = 'subzerodev.runners.host-plan'
@@ -214,7 +227,7 @@ function Get-SlotDrift($Slot) {
 
 # --- Plan.
 
-function Get-HostPlan {
+function Get-HostPlan([switch] $Resources) {
     $inventory = Read-HostInventory
     $operation = Read-HostOperation
     $plan = [ordered]@{
@@ -234,6 +247,21 @@ function Get-HostPlan {
             $plan.changes.Add([ordered]@{ kind = 'finish-operation'; operationId = $op.id; operation = $op.kind; slotId = $op.slotId })
         }
         $live = @($inv.slots | Where-Object { $_ -and $_.state -in 'provisioning', 'active' })
+        $downgrade = Get-DowngradeFinding $inv
+        if ($downgrade) { $plan.findings.Add($downgrade) }
+        # Whether the built Linux image is not the one the settings build (base image, runner version, archive): read once,
+        # and only when the image exists and the runner archive is downloaded, so Plan never downloads or builds anything.
+        $cache = @{}
+        $imageStale = {
+            if (-not $cache.ContainsKey('stale')) {
+                $cache.stale = $false
+                if ((Get-ImageId $Config.linux.image).State -eq 'present') {
+                    $expected = Get-LinuxExpectedContextHash $Config $Root
+                    if ($expected -and (Get-LinuxImageContextHash $Config.linux.image) -ne $expected) { $cache.stale = $true }
+                }
+            }
+            $cache.stale
+        }
         foreach ($side in @(
                 @{ Platform = 'linux'; Count = $Config.linux.count; Slots = { Get-LinuxSlots $Config $inv } }
                 @{ Platform = 'windows'; Count = $Config.windows.count; Slots = { Get-WindowsSlots $Config $inv -InstallRoot $InstallRoot } })) {
@@ -262,6 +290,7 @@ function Get-HostPlan {
                 }
                 $drift = @(Get-SlotDrift $record)
                 $reasons = @($drift | Where-Object { $_.state -eq 'drift' } | ForEach-Object kind | Select-Object -Unique)
+                if ($slot.Platform -eq 'linux' -and $slot.Composed -and -not $reasons.Count -and (& $imageStale)) { $reasons = @('image-context') }
                 if ($reasons.Count) { $plan.changes.Add([ordered]@{ kind = 'update'; platform = $slot.Platform; slotId = $slot.SlotId; reasons = $reasons }) }
                 foreach ($item in $drift | Where-Object { $_.state -eq 'unknown' }) { & $finding 'unknown' $slot.SlotId $item.message }
             }
@@ -273,6 +302,11 @@ function Get-HostPlan {
     }
     # What the plan cannot tell apart from "nothing to do" is part of it: a finding that is unknown, drift or blocked.
     $plan.planHash = Get-PlanHash ([ordered]@{ changes = $plan.changes; findings = @($plan.findings | Where-Object { $_.severity -in 'unknown', 'drift', 'blocked' }) })
+    # Resources are read only for the owner: not hashed, and a warning never changes the exit code.
+    if ($Resources) {
+        $plan.resources = Get-HostResources $(if ($inventory.State -eq 'readable') { $inventory.Value })
+        foreach ($warning in $plan.resources.warnings) { & $finding 'warning' 'resources' $warning }
+    }
     $plan
 }
 
@@ -290,6 +324,93 @@ function Get-UnownedRunners($Inventory, [string] $Scope) {
             [ordered]@{ severity = 'unowned'; subject = 'unowned'; runnerId = [int64]$runner.id; runnerName = $runner.name; message = "GitHub runner $($runner.name) (id $($runner.id)) carries this host's names but no registration here proves it. It is never changed; remove it at GitHub if it is not needed." }
         }
     }
+}
+
+# A BuildAgent digest that Update replaced, back in the settings (an older runners.local.json restored, say): a downgrade
+# nobody asked for. Update -Version with the older release is how a rollback is asked for.
+function Get-DowngradeFinding($Inventory) {
+    $recorded = if ($Inventory -and $Inventory.PSObject.Properties['buildAgent']) { $Inventory.buildAgent }
+    if (-not $recorded -or -not $recorded.image) { return }
+    $current = [string]$Config.buildAgent.image
+    if ($current -eq $recorded.image) { return }
+    # A replaced digest is a downgrade unless it is known to be a later release than the recorded one (a rollback then
+    # restored settings from before it).
+    $entry = @($recorded.previous | Where-Object { $_ -and $_.image -eq $current }) | Select-Object -First 1
+    if (-not $entry) { return }
+    if ($entry.version -and $recorded.version -and [version]$entry.version -gt [version]$recorded.version) { return }
+    [ordered]@{
+        severity = 'blocked'; subject = 'buildAgent'
+        message = "buildAgent.image is $current, a digest Update replaced with $($recorded.image)$(if ($recorded.version) { " ($($recorded.version))" }). That is a downgrade and is not applied; restore buildAgent.image in runners.local.json, or roll back with -Action Update -Version <release>."
+    }
+}
+
+# '8g', '512m', '24GB', '1.5GB', '12kB' as bytes, or $null.
+function ConvertTo-ByteCount([string] $Size) {
+    if ($Size -notmatch '^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)(i?b)?\s*$') { return $null }
+    $power = @{ '' = 0; 'k' = 1; 'm' = 2; 'g' = 3; 't' = 4 }[$Matches[2].ToLowerInvariant()]
+    [double]$Matches[1] * [Math]::Pow(1024, $power)
+}
+
+function Format-GB([double] $Bytes) { '{0:0.#} GB' -f ($Bytes / 1GB) }
+
+# The memory cap of the WSL 2 VM Docker Desktop runs Linux containers in: [wsl2] memory= in .wslconfig. Read only.
+function Get-WslMemoryCap {
+    $path = if ($env:SZR_WSLCONFIG) { $env:SZR_WSLCONFIG } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.wslconfig' }
+    $result = [ordered]@{ file = $path; memory = $null; bytes = $null }
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $result }
+    $section = $null
+    foreach ($line in Get-Content -LiteralPath $path) {
+        if ($line -match '^\s*\[(.+?)\]\s*$') { $section = $Matches[1].Trim().ToLowerInvariant(); continue }
+        if ($section -eq 'wsl2' -and $line -match '^\s*memory\s*=\s*([^#;\s]+)') { $result.memory = $Matches[1]; $result.bytes = ConvertTo-ByteCount $Matches[1] }
+    }
+    $result
+}
+
+# What Plan reports about disk and memory. Nothing here is hashed or changes the exit code: a warning is for the owner.
+function Get-HostResources($Inventory) {
+    $warnings = [Collections.Generic.List[string]]::new()
+    $linuxRows = @(if ($Inventory) { Get-LinuxSlots $Config $Inventory $null })
+    $windowsCount = if ($null -ne $Config.windows.count) { [int]$Config.windows.count } elseif ($Inventory) { @($Inventory.slots | Where-Object { $_ -and $_.platform -eq 'windows' -and $_.state -in 'provisioning', 'active' }).Count } else { 0 }
+
+    $volumes = [ordered]@{ state = 'known'; items = [Collections.Generic.List[object]]::new(); reason = $null }
+    $names = @{}
+    foreach ($row in $linuxRows) { foreach ($p in $row.Volumes.PSObject.Properties) { if ($p.Value) { $names[[string]$p.Value] = $row.SlotId } } }
+    if ($names.Count) {
+        $df = Invoke-Docker @('system', 'df', '-v', '--format', '{{json .Volumes}}')
+        $listed = $null
+        if ($df.ExitCode -eq 0) { try { $listed = @($df.Output | ConvertFrom-Json) } catch { $listed = $null } }
+        if ($null -eq $listed) {
+            $volumes.state = 'unknown'; $volumes.reason = "docker system df -v could not be read: $($df.Output)"
+            $warnings.Add("Slot volume sizes are unknown ($($volumes.reason)).")
+        } else {
+            foreach ($item in $listed | Where-Object { $_ -and $names.ContainsKey([string]$_.Name) } | Sort-Object Name) {
+                $volumes.items.Add([ordered]@{ slotId = $names[[string]$item.Name]; name = [string]$item.Name; size = [string]$item.Size })
+            }
+        }
+    }
+
+    $dataPath = if ($env:SZR_DOCKER_DATA) { $env:SZR_DOCKER_DATA } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Docker' }
+    $disk = [ordered]@{ path = $dataPath; drive = $null; freeGB = $null; minimumGB = [double]$Config.housekeeping.minFreeGB; low = $null }
+    try {
+        $report = @(Get-FreeDiskReport @($dataPath)) | Select-Object -First 1
+        if ($report) { $disk.drive = $report.Drive; $disk.freeGB = $report.FreeGB; $disk.low = $report.Low }
+        if ($report.Low) { $warnings.Add("Docker's data drive $($report.Drive) has $($report.FreeGB) GB free, below housekeeping.minFreeGB ($($report.MinimumGB) GB).") }
+    } catch { $warnings.Add("The free space of Docker's data drive ($dataPath) cannot be read: $($_.Exception.Message)") }
+
+    $perLinux = ConvertTo-ByteCount $Config.linux.memory
+    if ($Config.linux.docker.mode -eq 'sidecar' -and $Config.linux.docker.memory) { $perLinux += ConvertTo-ByteCount $Config.linux.docker.memory }
+    $perWindows = ConvertTo-ByteCount $Config.buildAgent.estimate.memory
+    $linuxTotal = $perLinux * $linuxRows.Count
+    $cap = Get-WslMemoryCap
+    $memory = [ordered]@{
+        linux = [ordered]@{ slots = $linuxRows.Count; perSlot = (Format-GB $perLinux); total = (Format-GB $linuxTotal); basis = 'enforced: linux.memory plus the Docker sidecar limit' }
+        windows = [ordered]@{ slots = $windowsCount; perSlot = (Format-GB $perWindows); total = (Format-GB ($perWindows * $windowsCount)); basis = 'advisory: buildAgent.estimate.memory, not enforced' }
+        wslCap = [ordered]@{ file = $cap.file; memory = $cap.memory }
+    }
+    if ($cap.bytes -and $linuxTotal -gt $cap.bytes) {
+        $warnings.Add("The Linux slots may use $(Format-GB $linuxTotal), more than the WSL memory cap $($cap.memory) in $($cap.file). This is only reported: .wslconfig is never edited here.")
+    }
+    [ordered]@{ volumes = $volumes; dockerData = $disk; memory = $memory; warnings = $warnings.ToArray() }
 }
 
 function Get-PlanHash($Changes) {
@@ -1082,9 +1203,10 @@ function Invoke-AddCreate($Operation, $Step, $Inventory, $Row) {
     Complete-OperationStep $Operation $Step
 }
 
-function Invoke-AddVerify($Operation, $Step, $Record) {
+# The slot's runner is running (Linux: the container the create step journaled) and GitHub reports it online under its name.
+function Invoke-AddVerify($Operation, $Step, $Record, [string] $CreateStep = 'create') {
     $runnerId = [int64]$Record.runnerId
-    $newRunner = @(Get-StepFact (Get-OperationStep $Operation 'create') 'new' | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+    $newRunner = @(Get-StepFact (Get-OperationStep $Operation $CreateStep) 'new' | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
     $deadline = [DateTime]::UtcNow.AddSeconds([int]$Config.lifecycle.startTimeoutSeconds)
     while ($true) {
         $why = $null
@@ -1108,20 +1230,28 @@ function Invoke-AddVerify($Operation, $Step, $Record) {
     Complete-OperationStep $Operation $Step
 }
 
+# The containers a step journaled as new, as the inventory records them (runner first).
+function Get-JournaledContainers($Operation, [string] $StepName) {
+    @(foreach ($entry in Get-RunnerFirst @(Get-StepFact (Get-OperationStep $Operation $StepName) 'new')) {
+            $found = Get-ContainerRecord $entry.id
+            if ($found.State -ne 'present') { throw "Apply stopped at commit: the new container $($entry.name) ($($entry.id)) is $($found.State). $($found.Reason) The journal is kept." }
+            [ordered]@{ role = $entry.role; id = $found.Id; name = $found.Name; image = $found.Image; labels = $found.Labels }
+        })
+}
+
+function Set-WindowsCloneRecord($Record) {
+    $clone = [string]$Record.installPath
+    Set-RecordValue $Record 'sourceCommit' (Get-GitCommit $clone)
+    Set-RecordValue $Record 'generatedSettingsHash' (Get-HostSettingsRecord -Clone $clone)
+}
+
 function Invoke-AddCommit($Operation, $Step, $Inventory, $Record) {
     if ($Record.platform -eq 'linux') {
-        $containers = @(foreach ($entry in Get-RunnerFirst @(Get-StepFact (Get-OperationStep $Operation 'create') 'new')) {
-                $found = Get-ContainerRecord $entry.id
-                if ($found.State -ne 'present') { throw "Apply stopped at commit: the new container $($entry.name) ($($entry.id)) is $($found.State). $($found.Reason) The journal is kept." }
-                [ordered]@{ role = $entry.role; id = $found.Id; name = $found.Name; image = $found.Image; labels = $found.Labels }
-            })
-        Set-RecordValue $Record 'containers' $containers
+        Set-RecordValue $Record 'containers' @(Get-JournaledContainers $Operation 'create')
     } else {
-        $clone = [string]$Record.installPath
         $registration = Get-LocalRegistration ([string]$Record.registrationDirectory)
         Set-RecordValue $Record 'workPath' (Resolve-RunnerWorkFolder $(if ($registration.workFolder) { $registration.workFolder } else { $Config.windows.workFolder }) $Record.registrationDirectory)
-        Set-RecordValue $Record 'sourceCommit' (Get-GitCommit $clone)
-        Set-RecordValue $Record 'generatedSettingsHash' (Get-HostSettingsRecord -Clone $clone)
+        Set-WindowsCloneRecord $Record
     }
     $Record.state = 'active'
     Set-RecordValue $Record 'addedUtc' ([DateTime]::UtcNow.ToString('o'))
@@ -1287,6 +1417,145 @@ function Invoke-SlotRetire($Inventory, $Operation, [string] $SlotId) {
     "$SlotId is retired. What it left on disk (directory, clone, volumes) stays until Apply -Prune."
 }
 
+# --- Apply: updating a drifted slot.
+#
+# update-slot, one journaled operation per slot (steps drain, change, resume, verify, commit): heldBefore is journaled and
+# the runner drained (a busy runner that does not drain in time is left as it is and the journal deleted: deferred: busy),
+# changed (Linux: its own compose services recreated, sidecar then runner, never down; Windows: its clone synced to this
+# checkout and its host settings written), started again (maintenance ended only because this operation began it),
+# verified online at GitHub, and the new containers or clone state recorded.
+
+$UpdateKind = 'update-slot'
+$UpdateSteps = @('drain', 'change', 'resume', 'verify', 'commit')
+
+function Get-SlotMaintenanceFile($Record) { Join-Path ([string]$Record.registrationDirectory) 'maintenance.json' }
+
+# Drains the slot. Returns why it was not drained ("busy: ...") for a runner that stayed busy, else $null.
+function Invoke-UpdateDrain($Operation, $Step, $Record) {
+    $file = Get-SlotMaintenanceFile $Record
+    if ($null -eq (Get-StepFact $Step 'heldBefore')) { Set-StepFact $Operation $Step 'heldBefore' (Get-HeldBefore $file) }
+    if (Get-StepFact $Step 'heldBefore') { throw "Apply stopped: $($Record.slotId) was held before its update began; Resume it, then rerun Apply. The journal is kept." }
+    if ($Record.platform -eq 'linux') {
+        $runner = @($Record.containers | Where-Object { $_.role -eq 'runner' }) | Select-Object -First 1
+        $busy = if ($runner) { Get-RunnerBusyCheck $runner.name } else { { $false } }
+        $drain = Enter-RunnerMaintenance -StateFile $file -RunnerDirectory ([string]$Record.registrationDirectory) -IsBusy $busy -Reason 'update' -TimeoutMinutes $Config.lifecycle.drainTimeoutMinutes
+        if ($drain.Outcome -eq 'timeout') { return "busy: $($drain.Retained)" }
+        if ($drain.Outcome -eq 'failed') { throw "Apply stopped in the drain of $($Record.slotId): $(@($drain.Failures) -join ' ') The journal is kept; rerun Apply." }
+    } else {
+        $result = Invoke-InstanceAction $Record 'Maintenance'
+        if ($result.ExitCode -ne 0) {
+            if (Test-Path -LiteralPath $file) { throw "Apply stopped in the drain of $($Record.slotId) (exit $($result.ExitCode)): $($result.Output) The journal is kept; rerun Apply." }
+            return "busy: $($Record.slotId) did not drain (exit $($result.ExitCode)): $($result.Output)"
+        }
+    }
+    Complete-OperationStep $Operation $Step
+    $null
+}
+
+function Invoke-UpdateChange($Operation, $Step, $Inventory, $Record) {
+    $row = Get-RecordRow $Record
+    if ($Record.platform -eq 'linux') {
+        Initialize-LinuxSlotResources $Config $row
+        $file = Write-LinuxComposeFile (Get-ComposedLinuxSlots $Inventory)
+        $new = [Collections.Generic.List[object]]::new()
+        foreach ($entry in @(Get-StepFact $Step 'new')) { $new.Add($entry) }
+        $recorded = @($Record.containers | ForEach-Object { $_.id })
+        $wanted = @(@(if ($row.DockerContainer) { [pscustomobject]@{ role = 'docker'; name = $row.DockerContainer; service = "$($row.SlotId)-docker" } }) + [pscustomobject]@{ role = 'runner'; name = $row.Container; service = $row.SlotId })
+        foreach ($item in $wanted) {
+            $journaled = @($new | Where-Object { $_.role -eq $item.role } | ForEach-Object { $_.id })
+            $found = Get-ContainerRecord $item.name
+            if ($found.State -eq 'unknown') { throw "Apply stopped: whether $($item.name) exists is unknown ($($found.Reason)). The journal is kept." }
+            if ($found.State -eq 'present' -and $found.Id -in $journaled) {
+                # Recreated by an earlier run of this step.
+            } else {
+                if ($found.State -eq 'present' -and $found.Id -notin $recorded -and -not (Test-OurComposeContainer $found $row.SlotId)) { throw "Apply stopped: a container named $($item.name) ($($found.Id)) exists and is not this host's compose $($row.SlotId). The journal is kept." }
+                $up = Invoke-LinuxCompose -File $file -Verb up -Services @($item.service) -ForceRecreate
+                if ($up.ExitCode -ne 0) { throw "Apply stopped: compose up $($item.service) exited $($up.ExitCode): $($up.Output) The journal is kept." }
+                $created = Get-ContainerRecord $item.name
+                if ($created.State -ne 'present') { throw "Apply stopped: $($item.name) is $($created.State) after compose up. $($created.Reason) The journal is kept." }
+                @($new | Where-Object { $_.role -eq $item.role }) | ForEach-Object { [void]$new.Remove($_) }
+                $new.Add([pscustomobject][ordered]@{ role = $item.role; name = $created.Name; id = $created.Id })
+                Set-StepFact $Operation $Step 'new' $new.ToArray()
+            }
+            if ($item.role -eq 'docker' -and -not (Wait-ComposeSidecarReady $item.name)) { throw "Apply stopped: the Docker sidecar $($item.name) did not become ready. The journal is kept." }
+        }
+    } else {
+        $clone = [string]$Record.installPath
+        Sync-RunnerSetupInstance -Clone $clone -InstanceId $row.InstanceId -SourceCommit (Get-GitCommit $Root) -GitHubUrl $Config.github.url
+        Write-HostSettings -Clone $clone -Settings (New-HostSettings $Config $row)
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-UpdateResume($Operation, $Step, $Record) {
+    if ($Record.platform -eq 'linux') {
+        $held = Get-StepFact (Get-OperationStep $Operation 'drain') 'heldBefore'
+        Complete-OperationMaintenance ([pscustomobject]@{ name = 'resume'; heldBefore = $held }) (Get-SlotMaintenanceFile $Record) ([string]$Record.registrationDirectory) | Out-Null
+    } else {
+        $result = Invoke-InstanceAction $Record 'Start'
+        if ($result.ExitCode -ne 0) { throw "Apply stopped: starting $($Record.slotId) exited $($result.ExitCode): $($result.Output) The journal is kept; rerun Apply." }
+    }
+    Complete-OperationStep $Operation $Step
+}
+
+function Invoke-UpdateCommit($Operation, $Step, $Inventory, $Record) {
+    if ($Record.platform -eq 'linux') { Set-RecordValue $Record 'containers' @(Get-JournaledContainers $Operation 'change') }
+    else { Set-WindowsCloneRecord $Record }
+    Set-RecordValue $Record 'updatedUtc' ([DateTime]::UtcNow.ToString('o'))
+    Save-Inventory $Inventory
+    Complete-OperationStep $Operation $Step
+    Remove-HostOperation
+}
+
+function Invoke-SlotUpdate($Inventory, $Operation, [string] $SlotId, [string[]] $Reasons) {
+    $record = Get-InventorySlot $Inventory $SlotId
+    if (-not $record) { throw "Apply stopped: the inventory has no slot $SlotId to update." }
+    if (-not $Operation) {
+        if ($record.state -ne 'active') { "Not updated: $SlotId is $($record.state), not active."; $script:ApplyExit = 3; return }
+        if (Test-Path -LiteralPath (Get-SlotMaintenanceFile $record)) { "Deferred: $SlotId is held; Resume it, then rerun Apply (deferred: held)."; $script:ApplyExit = 3; return }
+        if ($record.platform -eq 'linux') {
+            $row = @(Get-LinuxSlots $Config $Inventory $null | Where-Object { $_.SlotId -eq $SlotId }) | Select-Object -First 1
+            if (-not $row -or -not $row.Composed) { "Not updated: $SlotId does not run on compose yet."; $script:ApplyExit = 3; return }
+        } elseif ('clone' -in $Reasons -or -not $record.installPath) {
+            $script:HostFailed = $true
+            [Console]::Error.WriteLine("Not updated: $SlotId's clone $($record.installPath) does not exist; it is not recreated by an update.")
+            return
+        }
+        $Operation = New-HostOperation -Kind $UpdateKind -SlotId $SlotId -Steps $UpdateSteps
+        Set-RecordValue $Operation 'platform' ([string]$record.platform)
+        Write-HostOperation $Operation
+        "Updating $SlotId ($($record.runnerName))$(if ($Reasons.Count) { " for $($Reasons -join ', ')" }): operation $($Operation.id)."
+    } else { "Resuming operation $($Operation.id) ($UpdateKind) on $SlotId." }
+    foreach ($step in @($Operation.steps)) {
+        if ($step.state -eq 'done') { continue }
+        switch ($step.name) {
+            'drain' {
+                $deferred = Invoke-UpdateDrain $Operation $step $record
+                if ($deferred) {
+                    Remove-HostOperation
+                    "Deferred: $SlotId is busy and was left as it is; rerun Apply when it is idle (deferred: $deferred)."
+                    $script:ApplyExit = 3
+                    return
+                }
+            }
+            'change' { Invoke-UpdateChange $Operation $step $Inventory $record }
+            'resume' { Invoke-UpdateResume $Operation $step $record }
+            'verify' { Invoke-AddVerify $Operation $step $record -CreateStep 'change' }
+            'commit' { Invoke-UpdateCommit $Operation $step $Inventory $record }
+            default { throw "Apply stopped: operation $($Operation.id) has an unknown step '$($step.name)'. The journal is kept." }
+        }
+        "  $($step.name): done"
+    }
+    "$SlotId is updated."
+}
+
+# Whether the built Linux image is missing or not the one the settings build (base image, runner version, archive).
+function Test-LinuxImageStale {
+    if ((Get-ImageId $Config.linux.image).State -ne 'present') { return $true }
+    $expected = Get-LinuxExpectedContextHash $Config $Root
+    [bool]($expected -and (Get-LinuxImageContextHash $Config.linux.image) -ne $expected)
+}
+
 # windows-legacy goes only once win01 runs: active, with a runner ID GitHub reports online. Returns why not, or $null.
 function Get-LegacyRetireBlocker($Inventory) {
     $win01 = Get-InventorySlot $Inventory 'win01'
@@ -1411,55 +1680,133 @@ function Invoke-Apply {
             $reviewed = Get-HostPlan
             if ($reviewed.planHash -ne $ExpectPlan) { throw "Apply refused: the plan is now $($reviewed.planHash), not the reviewed $ExpectPlan. Nothing was changed; review -Action Plan again." }
         }
-        $acted = $false
-        if ($op) {
-            if ($op.PSObject.Properties['rollingBack'] -and $op.rollingBack) { throw "Apply refused: operation $($op.id) was being rolled back. Finish that with Apply -Rollback." }
-            switch ($op.kind) {
-                $MigrationKind { Invoke-LegacyMigration $inventory $op }
-                $AddKind { Invoke-SlotAdd $inventory $op $op.slotId }
-                $RetireKind { Invoke-SlotRetire $inventory $op $op.slotId }
-                default { throw "Apply refused: the unfinished operation $($op.kind) ($($op.id)) is not one this version of Apply finishes." }
-            }
-            $acted = $true
-            $inventory = Assert-HostInventoryUsable 'Apply'
+        Invoke-ApplyChanges $inventory $op
+    }
+}
+
+# What Apply and Update carry out, under the host lock: an unfinished operation, the legacy migration, adds, retires, then
+# each drifted slot's update, one at a time.
+function Invoke-ApplyChanges($inventory, $op, [switch] $Rebuild) {
+    $downgrade = Get-DowngradeFinding $inventory
+    if ($downgrade) { throw "Apply refused: $($downgrade.message) Nothing was changed." }
+    $acted = $false
+    if ($op) {
+        if ($op.PSObject.Properties['rollingBack'] -and $op.rollingBack) { throw "Apply refused: operation $($op.id) was being rolled back. Finish that with Apply -Rollback." }
+        switch ($op.kind) {
+            $MigrationKind { Invoke-LegacyMigration $inventory $op }
+            $AddKind { Invoke-SlotAdd $inventory $op $op.slotId }
+            $RetireKind { Invoke-SlotRetire $inventory $op $op.slotId }
+            $UpdateKind { Invoke-SlotUpdate $inventory $op $op.slotId @() }
+            default { throw "Apply refused: the unfinished operation $($op.kind) ($($op.id)) is not one this version of Apply finishes." }
         }
-        $row = @(Get-LinuxSlots $Config $inventory | Where-Object { $_.SlotId -eq 'linux-01' -and $_.Legacy -and -not $_.New -and -not $_.Composed }) | Select-Object -First 1
-        if ($row) {
-            Invoke-LegacyMigration $inventory $null
-            $acted = $true
-            $inventory = Assert-HostInventoryUsable 'Apply'
-        }
-        $plan = Get-HostPlan
-        $adds = @($plan.changes | Where-Object { $_.kind -eq 'add' })
-        $retires = @($plan.changes | Where-Object { $_.kind -eq 'retire' })
-        if ($adds.Count) {
-            $blocker = Get-AddBlocker $inventory $adds
-            if ($blocker) {
-                $script:HostFailed = $true
-                [Console]::Error.WriteLine("Apply added no slot ($(@($adds | ForEach-Object { $_.slotId }) -join ', ')): $blocker")
-            } else {
-                foreach ($add in $adds) {
-                    Invoke-SlotAdd $inventory $null $add.slotId $add.platform
-                    $inventory = Assert-HostInventoryUsable 'Apply'
-                }
+        $acted = $true
+        $inventory = Assert-HostInventoryUsable 'Apply'
+    }
+    $row = @(Get-LinuxSlots $Config $inventory | Where-Object { $_.SlotId -eq 'linux-01' -and $_.Legacy -and -not $_.New -and -not $_.Composed }) | Select-Object -First 1
+    if ($row) {
+        Invoke-LegacyMigration $inventory $null
+        $acted = $true
+        $inventory = Assert-HostInventoryUsable 'Apply'
+    }
+    $plan = Get-HostPlan
+    $adds = @($plan.changes | Where-Object { $_.kind -eq 'add' })
+    $retires = @($plan.changes | Where-Object { $_.kind -eq 'retire' })
+    if ($adds.Count) {
+        $blocker = Get-AddBlocker $inventory $adds
+        if ($blocker) {
+            $script:HostFailed = $true
+            [Console]::Error.WriteLine("Apply added no slot ($(@($adds | ForEach-Object { $_.slotId }) -join ', ')): $blocker")
+        } else {
+            foreach ($add in $adds) {
+                Invoke-SlotAdd $inventory $null $add.slotId $add.platform
+                $inventory = Assert-HostInventoryUsable 'Apply'
             }
-            $acted = $true
         }
-        foreach ($change in $retires) {
-            $acted = $true
-            if (-not $Retire) {
-                "Not retired: $($change.slotId) ($($change.runnerName)) is no longer wanted; rerun Apply -Retire to retire it."
-                $script:ApplyExit = 3
-                continue
-            }
-            if ($change.Contains('after')) {
-                $why = Get-LegacyRetireBlocker $inventory
-                if ($why) { "Deferred: $($change.slotId) is retired only after $($change.after): $why"; $script:ApplyExit = 3; continue }
-            }
-            Invoke-SlotRetire $inventory $null $change.slotId
-            $inventory = Assert-HostInventoryUsable 'Apply'
+        $acted = $true
+    }
+    foreach ($change in $retires) {
+        $acted = $true
+        if (-not $Retire) {
+            "Not retired: $($change.slotId) ($($change.runnerName)) is no longer wanted; rerun Apply -Retire to retire it."
+            $script:ApplyExit = 3
+            continue
         }
-        if (-not $acted) { 'Nothing to migrate, add or retire: the slots match the settings. Update changes are not applied by this version; see -Action Plan.' }
+        if ($change.Contains('after')) {
+            $why = Get-LegacyRetireBlocker $inventory
+            if ($why) { "Deferred: $($change.slotId) is retired only after $($change.after): $why"; $script:ApplyExit = 3; continue }
+        }
+        Invoke-SlotRetire $inventory $null $change.slotId
+        $inventory = Assert-HostInventoryUsable 'Apply'
+    }
+    # Updates last, one slot at a time. The Linux image is rebuilt first when the settings build a different one, so
+    # each slot is recreated on it inside its own drain.
+    # Update always checks the image against what the settings build (downloading the runner archive if need be);
+    # Apply only when the plan already shows a Linux update.
+    $updates = @((Get-HostPlan).changes | Where-Object { $_.kind -eq 'update' })
+    $linuxUpdates = @($updates | Where-Object { $_.platform -eq 'linux' }).Count
+    if (($Rebuild -and @(Get-ComposedLinuxSlots $inventory).Count) -or ($linuxUpdates -and (Test-LinuxImageStale))) {
+        $build = Get-LinuxImageBuild $Config $Root
+        if ((Get-ImageId $Config.linux.image).State -ne 'present' -or (Get-LinuxImageContextHash $Config.linux.image) -ne $build.Hash) {
+            "Building $($Config.linux.image) on $($Config.linux.baseImage)."
+            Invoke-LinuxImageBuild $Config $Root $build
+            $updates = @((Get-HostPlan).changes | Where-Object { $_.kind -eq 'update' })
+        }
+    }
+    foreach ($change in $updates) {
+        $acted = $true
+        Invoke-SlotUpdate $inventory $null $change.slotId @($change.reasons)
+        $inventory = Assert-HostInventoryUsable 'Apply'
+    }
+    if (-not $acted) { 'Nothing to migrate, add, retire or update: the slots match the settings.' }
+}
+
+# The digest a BuildAgent release tag resolves to, read from the registry without pulling.
+function Resolve-BuildAgentDigest([string] $Repository, [string] $Release) {
+    $inspect = Invoke-Docker @('buildx', 'imagetools', 'inspect', "${Repository}:$Release")
+    if ($inspect.ExitCode -ne 0) { throw "Update refused: ${Repository}:$Release could not be resolved (exit $($inspect.ExitCode)): $($inspect.Output) Nothing was changed." }
+    if ($inspect.Output -notmatch 'Digest:\s+(sha256:[0-9a-f]{64})') { throw "Update refused: no digest was found for ${Repository}:$Release. Nothing was changed." }
+    "$Repository@$($Matches[1])"
+}
+
+function Invoke-Update {
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Update refused: -Version '$Version' is not an exact release such as 1.4.2. A floating tag (latest, 1, 1.4) is never resolved. Nothing was changed." }
+    Use-HostLock -Kind 'Manage-RunnerHost Update' -Joinable -ScriptBlock {
+        $inventory = Assert-HostInventoryUsable 'Apply'
+        $operation = Read-HostOperation
+        if ($operation.State -eq 'readable') { throw "Update refused: the operation $($operation.Value.kind) ($($operation.Value.id)) is unfinished; finish it with Apply first. Nothing was changed." }
+        $current = [string]$Config.buildAgent.image
+        $repository = $current -replace '@.*$', ''
+        $slash = $repository.LastIndexOf('/')
+        $colon = $repository.LastIndexOf(':')
+        if ($colon -gt $slash) { $repository = $repository.Substring(0, $colon) }
+        $image = Resolve-BuildAgentDigest $repository $Version
+        $recorded = if ($inventory.PSObject.Properties['buildAgent']) { $inventory.buildAgent }
+        # Every digest replaced so far, with its release when known: { image; version }.
+        $previous = [Collections.Generic.List[object]]::new()
+        $known = @(@($recorded.previous | Where-Object { $_ -and $_.image }) +
+            @(if ($recorded -and $recorded.image) { [pscustomobject]@{ image = [string]$recorded.image; version = $recorded.version } }) +
+            [pscustomobject]@{ image = $current; version = $null })
+        foreach ($entry in $known) {
+            if ($entry.image -eq $image -or @($previous | Where-Object { $_.image -eq $entry.image }).Count) { continue }
+            $previous.Add([pscustomobject][ordered]@{ image = [string]$entry.image; version = $entry.version })
+        }
+        if ($image -eq $current) { "buildAgent.image is already $image ($Version)." }
+        elseif ($recorded -and $recorded.version -and [version]$Version -lt [version]$recorded.version) { "Rolling back buildAgent.image to $Version ($image) from $($recorded.version)." }
+        else { "Moving buildAgent.image to $Version ($image)." }
+
+        # The settings first, then the inventory, then anything recreated: a run stopped after this point finishes with Apply.
+        $local = if (Test-Path -LiteralPath $LocalConfig) { Get-Content -Raw -LiteralPath $LocalConfig | ConvertFrom-Json } else { [pscustomobject]@{} }
+        if (-not $local.PSObject.Properties['buildAgent'] -or $local.buildAgent -isnot [pscustomobject]) { $local | Add-Member -Force -NotePropertyName buildAgent -NotePropertyValue ([pscustomobject]@{}) }
+        $local.buildAgent | Add-Member -Force -NotePropertyName image -NotePropertyValue $image
+        Write-FileAtomic $LocalConfig (ConvertTo-Json -InputObject $local -Depth 20)
+        $script:Config = Read-RunnerConfig -Root $Root
+        Set-RecordValue $inventory 'buildAgent' ([pscustomobject][ordered]@{ image = $image; version = $Version; updatedUtc = [DateTime]::UtcNow.ToString('o'); previous = $previous.ToArray() })
+        Save-Inventory $inventory
+        "runners.local.json and the inventory record buildAgent.image $image."
+        if ($local.PSObject.Properties['linux'] -and $local.linux.PSObject.Properties['baseImage'] -and $local.linux.baseImage) {
+            "Note: linux.baseImage in runners.local.json ($($local.linux.baseImage)) overrides the BuildAgent image for the Linux slots; they are not moved."
+        }
+        Invoke-ApplyChanges $inventory $null -Rebuild
     }
 }
 
@@ -1477,6 +1824,17 @@ function Write-PlanText($Plan) {
     }
     foreach ($item in $Plan.findings) { "  [$($item.severity)] $($item.subject): $($item.message)" }
     if ($Plan.planHash) { "planHash: $($Plan.planHash)" }
+    if ($Plan.Contains('resources')) {
+        $r = $Plan.resources
+        'Resources (read only):'
+        if ($r.volumes.state -ne 'known') { "  volumes: unknown" }
+        foreach ($item in $r.volumes.items) { "  volume $($item.name) ($($item.slotId)): $($item.size)" }
+        $d = $r.dockerData
+        "  Docker data $($d.path)$(if ($d.drive) { " on $($d.drive)" }): $(if ($null -ne $d.freeGB) { "$($d.freeGB) GB free" } else { 'free space unknown' }), minimum $($d.minimumGB) GB"
+        "  Linux memory (enforced): $($r.memory.linux.slots) slot(s) x $($r.memory.linux.perSlot) = $($r.memory.linux.total)"
+        "  Windows memory (advisory, not enforced): $($r.memory.windows.slots) slot(s) x $($r.memory.windows.perSlot) = $($r.memory.windows.total)"
+        "  WSL memory cap: $(if ($r.memory.wslCap.memory) { "$($r.memory.wslCap.memory) ($($r.memory.wslCap.file))" } else { 'not set' })"
+    }
 }
 
 function Write-StatusText($Status) {
@@ -1505,9 +1863,10 @@ try {
         'Hold' { Invoke-Hold; exit [int]$script:HostFailed }
         'Resume' { Invoke-Resume; exit [int]$script:HostFailed }
         'Apply' { Invoke-Apply; exit $(if ($script:HostFailed) { 1 } else { [int]$script:ApplyExit }) }
+        'Update' { Invoke-Update; exit $(if ($script:HostFailed) { 1 } else { [int]$script:ApplyExit }) }
         'Startup' { Set-StartupEntry; exit 0 }
         'Plan' {
-            $plan = Get-HostPlan
+            $plan = Get-HostPlan -Resources
             if ($Json) { ConvertTo-Json -InputObject $plan -Depth 20 } else { Write-PlanText $plan }
             if ($plan.inventory.state -eq 'unreadable' -or $plan.operation.state -eq 'unreadable') {
                 [Console]::Error.WriteLine('Plan cannot be computed: the host state cannot be read. Restore the file, or rebuild the inventory with -Action Adopt -ReplaceUnreadable.')
