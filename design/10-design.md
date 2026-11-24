@@ -23,9 +23,11 @@ The full design is [docs/runner-pool-plan.md](../docs/runner-pool-plan.md); the 
 - Host state: `scripts/HostState.ps1` (inventory, journal, `Use-HostLock`) under
   `%LOCALAPPDATA%\SubZeroDev\Runners\host\`.
 - Host manager: `scripts/Manage-RunnerHost.ps1` with Init, Adopt, Plan, Status, Apply, Hold, Resume, AutoStart,
-  Update.
-- Linux slots: `scripts/New-LinuxRunner.ps1` writes `linux/compose.local.yaml`; `linux/entrypoint.sh` waits while
-  held.
+  Startup and Update. Apply also takes `-Retire`, `-Prune`, `-Rollback` and `-ExpectPlan`. Apply runs these as
+  journaled operations: `migrate-legacy-linux`, slot add, slot retire and slot update.
+- Linux slots: `scripts/Compose.ps1` holds the one container spec that `docker run` and compose both read, the compose
+  file and the image context hash. `scripts/New-LinuxRunner.ps1` writes `linux/compose.local.yaml` and recreates
+  slots. `scripts/Get-LinuxRunnerStatus.ps1 -Json` reports one row per slot. `linux/entrypoint.sh` waits while held.
 - Windows slots: `scripts/Manage-WindowsRunner.ps1 -Action AutoStart`, plus the existing `Install-WindowsRunner.ps1`
   and `WindowsRunnerSetup.ps1` instance helpers.
 - Drains through `scripts/Lifecycle.ps1`; registrations through `scripts/Registration.ps1`.
