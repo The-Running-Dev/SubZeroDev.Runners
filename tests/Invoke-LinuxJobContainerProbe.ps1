@@ -8,7 +8,9 @@ container and its configured daemon to be healthy. Run after New-LinuxRunner.ps1
 [CmdletBinding()]
 param(
     [string] $DockerCommand = 'docker',
-    [string] $OutputPath = (Join-Path ([IO.Path]::GetTempPath()) ('linux-job-probe-' + [guid]::NewGuid().ToString('N') + '.json'))
+    [string] $OutputPath = (Join-Path ([IO.Path]::GetTempPath()) ('linux-job-probe-' + [guid]::NewGuid().ToString('N') + '.json')),
+    # The runner container to probe, e.g. a pool slot's subzerodev-runner-linux-01. Default: the pre-pool linux.container.
+    [string] $RunnerContainer
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -17,7 +19,7 @@ $config = Read-RunnerConfig -Root $root
 $dockerPath = (Get-Command $DockerCommand -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $id = [guid]::NewGuid().ToString('N')
 $name = 'szr-docs-probe-' + $id
-$runner = $config.linux.container
+$runner = if ($RunnerContainer) { $RunnerContainer } else { $config.linux.container }
 $work = $config.linux.workFolder.TrimEnd('/') + '/.szr-docs-probe-' + $id
 if ($work -notmatch '^/[A-Za-z0-9_./-]+$' -or $work.Split('/') -contains '..') { throw 'Probe needs a safe absolute Linux workspace path.' }
 function Invoke-ProbeDocker([string[]] $Arguments, [int] $TimeoutSeconds = 120, [switch] $AllowFailure) {
