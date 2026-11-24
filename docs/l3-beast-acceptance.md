@@ -169,3 +169,47 @@ WSL memory was sampled every 5 s from 12:24:40 to 12:33:22, 75 samples:
 | `linux-01` container (`docker stats`) | 4.96 GB of its 8 GiB limit | 8 GB |
 
 The VM sees 62.8 GB, and no `.wslconfig` cap is set. The peak stayed well under the 32 GB the plan adds up.
+
+## 7. Lower windows.count to 1: without -Retire, with -Retire, then -Prune
+
+This step ran with the checkout detached at `5324104`, the commit the Windows clones were installed from. Its scripts
+are identical to the branch's, which differs only by this file. That way Apply had no `commit` drift to update (see
+`design/90-decisions.md`).
+
+```
+Manage-RunnerHost.ps1 -Action Init -WindowsCount 1     -> exit 0  linux.count 2, windows.count 1
+Manage-RunnerHost.ps1 -Action Plan                     -> exit 3
+  retire platform=windows slotId=win02 runnerName=subzerodev.runner.windows.beast.win02 runnerId=69 requires=-Retire
+  planHash e388d1321431ad1cbf68165067ff2105a589cdb9addbc543b247561996ed64dd
+Manage-RunnerHost.ps1 -Action Apply -ExpectPlan e388d132...           -> exit 3 (12:34:37)
+  Not retired: win02 (subzerodev.runner.windows.beast.win02) is no longer wanted; rerun Apply -Retire to retire it.
+```
+
+Nothing was removed. `win02` was still `active` in the inventory, its `.runner` and clone were in place, it had one
+listener, and GitHub still had id 69 online with all its labels.
+
+```
+Manage-RunnerHost.ps1 -Action Apply -Retire -ExpectPlan e388d132...   -> exit 0 (12:35:07 to 12:35:44)
+  Retiring win02 (subzerodev.runner.windows.beast.win02, id 69): operation ef900898-e0ee-4adc-9071-4b47b56cf9c2.
+  withdraw, drain, stop, deregister, clear-local, remove-containers, commit: done
+  win02 is retired. What it left on disk (directory, clone, volumes) stays until Apply -Prune.
+```
+
+`win02` was drained and deregistered: GitHub returns 404 for runner 69, no `win02` listener runs, its `.runner` is
+cleared, and the inventory shows `retired`. Its clone stayed on disk.
+
+```
+Manage-RunnerHost.ps1 -Action Apply -Prune             -> exit 0 (12:35:52)  win02: pruned.
+Manage-RunnerHost.ps1 -Action Status                   -> exit 0
+  linux-01 (66) online; linux-02 (67) online; win01 (68) online; win02 pruned (69): GitHub absent; runner group Default: ok
+Manage-RunnerHost.ps1 -Action Plan                     -> exit 0  No changes.
+```
+
+`%LOCALAPPDATA%\SubZeroDev\Runners\win02` is gone, and `win01` is untouched. GitHub lists 66, 67 and 68 online, plus
+the unowned 8 and 9 offline.
+
+## End state
+
+The beast host runs `linux-01` (66), `linux-02` (67) and `win01` (68) from `D:\Temp\SubZeroDev.Runners`, with
+`linux.count 2` and `windows.count 1`. The pre-pool registrations 8 and 9 are unchanged and offline. The raw command
+output is kept on beast in `D:\Temp\l3-evidence-S9`.
