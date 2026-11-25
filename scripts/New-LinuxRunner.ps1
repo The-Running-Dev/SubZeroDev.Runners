@@ -84,7 +84,9 @@ function Update-ComposeSlot($ComposeSlot, [string] $ComposeFile) {
         return $false
     }
     if ($registered) {
-        $busy = { Invoke-Docker @('exec', $container, 'pgrep', '-f', 'Runner.Worker') | ForEach-Object { $_.ExitCode -eq 0 } }.GetNewClosure()
+        # A GetNewClosure block does not see this script's functions when the script is run from an interactive session.
+        $invokeDocker = ${function:Invoke-Docker}
+        $busy = { & $invokeDocker @('exec', $container, 'pgrep', '-f', 'Runner.Worker') | ForEach-Object { $_.ExitCode -eq 0 } }.GetNewClosure()
         try { $drain = Enter-RunnerMaintenance -StateFile $stateFile -RunnerDirectory $directory -IsBusy $busy -Reason 'replace' -TimeoutMinutes $TimeoutMinutes -Force:$Force }
         catch { [Console]::Error.WriteLine("$($ComposeSlot.SlotId) kept. $($_.Exception.Message)"); return $false }
         if ($drain.Outcome -in 'timeout', 'failed') {

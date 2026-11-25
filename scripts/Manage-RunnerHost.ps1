@@ -800,7 +800,10 @@ function Test-OurComposeContainer($Container, [string] $SlotId) {
 function Get-RunnerFirst($Containers) { @(@($Containers | Where-Object { $_.role -eq 'runner' }) + @($Containers | Where-Object { $_.role -ne 'runner' })) }
 
 function Get-RunnerBusyCheck([string] $Container) {
-    { (Invoke-Docker @('exec', $Container, 'pgrep', '-f', 'Runner.Worker')).ExitCode -eq 0 }.GetNewClosure()
+    # A GetNewClosure block does not see this script's functions when the script is run from an interactive session
+    # (./scripts/Manage-RunnerHost.ps1), so it carries Invoke-Docker itself.
+    $invokeDocker = ${function:Invoke-Docker}
+    { (& $invokeDocker @('exec', $Container, 'pgrep', '-f', 'Runner.Worker')).ExitCode -eq 0 }.GetNewClosure()
 }
 
 function Wait-ComposeSidecarReady([string] $Container) {
