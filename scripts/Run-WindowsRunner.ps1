@@ -17,6 +17,11 @@ try {
     $env:DOTNET_ROOT = $env:DOTNET_INSTALL_DIR
     $env:DOTNET_CLI_HOME = Join-Path $WindowsRunner '_dotnet-home'
     $env:NUGET_PACKAGES = Join-Path $WindowsRunner '_nuget'
+    # Each slot gets its own temp folder. Tools keep caches under %TMP% (Uno puts emscripten's there), and a cache shared with
+    # other slots or the owner's own builds gets erased by whichever build stamped it with a different toolchain, mid-build.
+    $env:TMP = Join-Path $WindowsRunner '_temp'
+    $env:TEMP = $env:TMP
+    New-Item -ItemType Directory -Force $env:TMP | Out-Null
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
     $env:ACTIONS_RUNNER_HOOK_JOB_COMPLETED = Join-Path $PSScriptRoot 'Clear-WindowsActionCache.ps1'

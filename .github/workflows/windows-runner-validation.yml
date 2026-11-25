@@ -90,6 +90,9 @@ jobs:
       - name: Verify closures work when the host scripts are started from a session
         shell: pwsh
         run: ./tests/Test-ClosureScope.ps1
+      - name: Verify each slot's caches and temp folder stay under the slot
+        shell: pwsh
+        run: ./tests/Test-SlotEnvironment.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)
