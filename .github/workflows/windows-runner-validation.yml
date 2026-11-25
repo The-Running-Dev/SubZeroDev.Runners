@@ -87,6 +87,9 @@ jobs:
       - name: Verify updates, downgrade refusal, deferred slots and the resources report
         shell: pwsh
         run: ./tests/Test-Updates.ps1
+      - name: Verify closures work when the host scripts are started from a session
+        shell: pwsh
+        run: ./tests/Test-ClosureScope.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)
