@@ -327,10 +327,10 @@ nothing for another project's tests or packaging.
 | HotCorners | `release.yml` (`environment: release`) | Windows | all | no |
 | HotCorners | `claude-code-review.yml` (on the pool since L4-2) | Linux | — | — |
 | Cleaner | `ci.yml` `dotnet` (ActionTemplates input `os`; on the pool since L4-1) | Windows | all, until checked per project | to be checked |
-| Licensing | `ci.yml` `linux`, `package` | Linux | — | already Linux; needs Docker in the slot (image builds, acceptance topology), which dind provides |
-| Licensing | `ci.yml` `windows` | Windows | all: registry machine identity, 64- and 32-bit processes | no |
-| Licensing | `container.yml` `image` | Linux, ActionTemplates input `runs-on` (needs Docker) | — | already Linux; dind provides Docker |
-| Licensing | `claude-code-review.yml` | Linux | — | — |
+| Licensing | `ci.yml` `linux`, `package` (on the pool since L4-3) | Linux | — | already Linux; needs Docker in the slot (image builds, acceptance topology), which dind provides |
+| Licensing | `ci.yml` `windows` (on the pool since L4-3) | Windows | all: registry machine identity, 64- and 32-bit processes | no |
+| Licensing | `container.yml` `image` (ActionTemplates inputs `runs-on`, `utility-runs-on`; `Result` on the pool since L4-3, `Build` and `Publish` hosted) | Linux, needs Docker | — | already Linux; dind provides Docker. `Publish`'s branch-tip gate needs the `gh` CLI, which the slot lacks |
+| Licensing | `claude-code-review.yml` (on the pool since L4-3) | Linux | — | — |
 | Media | `ci.yml` `web`, `linux` | Linux | — | already Linux |
 | Media | `ci.yml` `dotnet`, `windows-package` | Windows | workloads install, tests, packaging | to be checked per project |
 | Media | `release.yml` `release` (`environment: release`) | Windows | build, test, package, sign, publish | no |
@@ -345,7 +345,7 @@ the last to change in any repository.
 | L1 local | the BuildAgent build passes against the pinned image on a workstation | passed |
 | L2 workflow | the GitHub check passes on a self-hosted slot | **passed** on beast's `win02` ([run 45393284264](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393284264)), from a throwaway branch that changed only `runs-on`. `build.yml` on main (PR #4 merged) still targets GitHub-hosted `windows-latest`. |
 | L3 target host | on beast, after Apply: scale, hold, reboot and concurrency acceptance (handoff) | **passed** 2026-11-24 (S9, #34); step 2 not applicable. Evidence: [l3-beast-acceptance.md](l3-beast-acceptance.md) |
-| L4 generalization | each job that moves passes L2 on the pool; a job whose stage moves into BuildAgent also passes L1 ([runner-pool-l4.md](../handoffs/runner-pool-l4.md)) | in progress. D5 approved (repository variables). L4-1 Cleaner `ci.yml` passed L2 on hosted and on the pool ([run 45487347854](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/actions/runs/45487347854)) and runs on the pool. L4-2 HotCorners `ci.yml` and `claude-code-review.yml` passed L2 on hosted and on the pool ([HotCorners #220](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/pull/220)) and run on the pool. |
+| L4 generalization | each job that moves passes L2 on the pool; a job whose stage moves into BuildAgent also passes L1 ([runner-pool-l4.md](../handoffs/runner-pool-l4.md)) | in progress. D5 approved (repository variables). L4-1 Cleaner `ci.yml` passed L2 on hosted and on the pool ([run 45487347854](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/actions/runs/45487347854)) and runs on the pool. L4-2 HotCorners `ci.yml` and `claude-code-review.yml` passed L2 on hosted and on the pool ([HotCorners #220](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/pull/220)) and run on the pool. L4-3 Licensing `ci.yml` (`linux`, `package`, `windows`), `container.yml` `image` and `claude-code-review.yml` passed L2 on hosted and on the pool ([Licensing #77](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/pull/77)) and run on the pool, except the image's `Build` and `Publish`: `Publish` failed on main because the slot has no `gh`, so both went back to hosted ([Licensing #78](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/pull/78)). The tag-only `publish` stays hosted. |
 
 Mocked tests in this repository are L0 and are reported separately from all of these.
 
