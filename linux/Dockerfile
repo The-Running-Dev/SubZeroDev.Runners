@@ -1,5 +1,5 @@
 # The Linux runner: Docker-BuildAgent (Node, .NET 8/9/10, PowerShell, Git, Docker CLI and opt-in Engine, GitVersion, NUKE)
-# plus the Actions runner, the wasm-tools workload and the few native packages the builds also need.
+# plus the Actions runner, the GitHub CLI, the wasm-tools workload and the few native packages the builds also need.
 # New-LinuxRunner.ps1 -Build passes linux.baseImage from runners.json (a pinned digest) and the runner release it downloaded
 # and verified: RUNNER_VERSION is runners.json runnerVersion, the one version for Windows and Linux; RUNNER_SHA256 is the
 # SHA-256 GitHub publishes for that archive. A build without them fails instead of using an unverified or stale archive.
@@ -18,6 +18,17 @@ HEALTHCHECK --interval=30s --timeout=15s --start-period=90s --retries=3 CMD ["/b
 # Jobs run as root, like the base: no ownership changes, so the base's SDKs and tools are not copied into another layer.
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build python-is-python3 libgtk-3-0 libice6 libsm6 && rm -rf /var/lib/apt/lists/*
+# The GitHub CLI, which hosted runners ship and the ActionTemplates gates call (branch-tip-gate in container.yml Publish).
+# Pinned to one release and checked against the SHA-256 GitHub publishes for its linux_amd64 archive.
+ARG GH_VERSION=2.103.3
+ARG GH_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+RUN archive="/tmp/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+    && curl -fsSL -o "${archive}" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+    && echo "${GH_SHA256}  ${archive}" | sha256sum -c - \
+    && tar -xzf "${archive}" -C /tmp \
+    && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+    && rm -rf "${archive}" "/tmp/gh_${GH_VERSION}_linux_amd64" \
+    && gh --version
 RUN --mount=type=bind,source=downloads,target=/downloads \
     : "${RUNNER_VERSION:?build with New-LinuxRunner.ps1 -Build (RUNNER_VERSION is missing)}" "${RUNNER_SHA256:?build with New-LinuxRunner.ps1 -Build (RUNNER_SHA256 is missing)}" \
     && archive="/downloads/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \

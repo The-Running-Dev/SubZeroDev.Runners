@@ -6,7 +6,7 @@ still owns triggers, logs, checks, secrets and artifacts; the jobs execute here.
 | Runner | Where it runs | `runs-on` |
 | --- | --- | --- |
 | `subzerodev.runner.windows` | Native process under the signed-in user, kept alive by `scripts\Run-WindowsRunner.ps1` | `subzerodev-windows` or `[self-hosted, subzerodev, Windows]` |
-| `subzerodev.runner.linux` | Docker container `subzerodev-runner-linux` on [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent) (Debian 12, .NET 8/9/10, Node 22, PowerShell, Docker CLI and Engine, GitVersion, NUKE) plus wasm-tools, CMake and Ninja | `subzerodev-linux` or `[self-hosted, subzerodev, Linux]` |
+| `subzerodev.runner.linux` | Docker container `subzerodev-runner-linux` on [Docker-BuildAgent](https://github.com/The-Running-Dev/Docker-BuildAgent) (Debian 12, .NET 8/9/10, Node 22, PowerShell, Docker CLI and Engine, GitVersion, NUKE) plus wasm-tools, CMake, Ninja and the GitHub CLI (`gh`, pinned in `linux/Dockerfile`) | `subzerodev-linux` or `[self-hosted, subzerodev, Linux]` |
 
 Each runner takes one job at a time, so one Windows and one Linux job can run together.
 Neither needs inbound ports.
