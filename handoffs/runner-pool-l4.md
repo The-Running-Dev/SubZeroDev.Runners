@@ -80,8 +80,12 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
      - [Cleaner #31](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/pull/31), which fixed 14 CsWinRT1032 test-build errors from the `windows-latest` image of 2026-11-16. That image fails Cleaner's main too.
    - Cleaner's `Main` ruleset required secret-scanning alert resolution while secret scanning is off, which blocked every merge. The rule was removed on the owner's yes, matching HotCorners and Media.
    - Org variables don't reach private repositories on Free, so the later slices also use repository variables.
-2. **HotCorners `ci.yml` and `claude-code-review.yml`.**
-   - Switch both.
+2. **HotCorners `ci.yml` and `claude-code-review.yml`.** Done 2026-11-25, [HotCorners #220](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/pull/220).
+   - Both switched; the template pin moved from `314ba4f` (v2.0.0) to `a73c2e3` (#54). `release.yml` stays hosted (D6).
+   - L2 on head `3c3262b`:
+     - hosted (variables unset): [CI](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/actions/runs/45581726305/attempts/1) and [review](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/actions/runs/45581724664/attempts/1) attempt 1 passed;
+     - pool (variables set): [CI attempt 2](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/actions/runs/45581726305/attempts/2) passed, with Test on `beast.win01` and Result on `beast.linux.02`; [review attempt 3](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/actions/runs/45581724664/attempts/3) passed on `beast.linux.02`.
+   - The pool jobs first queued because every beast runner was offline: beast's clock had drifted (the WSL VM was about 4h20m behind), so the Linux tokens expired and `win01` failed to create a session. Resyncing the Windows clock, `wsl --shutdown` and restarting `win01` brought them back. Review attempt 2 lost its runner during that WSL restart.
    - On a Linux slot the review job uses its secrets. D1 allows this because the owner is the only writer.
 3. **Licensing `ci.yml` (`linux`, `package`, `windows`, `publish`), `container.yml` `image`, and `claude-code-review.yml`.**
    - `linux`, `package` and `image` need Docker in the slot: image builds, the acceptance topology, and the proxy through Docker's host (`c3bad5f`). The Linux slots' dind provides it.

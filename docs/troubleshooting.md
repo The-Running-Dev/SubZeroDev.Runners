@@ -33,6 +33,7 @@ Logs: `windows\_diag\` (runner, console and `Startup_*` logs), `linux\runner\_di
 | Runner is online but jobs queue | The workflow's `runs-on` does not match, or a drain withdrew the custom labels | Use `subzerodev-windows` / `subzerodev-linux`; check for `maintenance.json` and end it with `Start` or `Resume` |
 | Runner idles with no listener | It is held (`maintenance.json` exists) | `Manage-RunnerHost.ps1 -Action Resume -Slot <id>`; the Linux log says `Held: ...` |
 | Linux container restarts or never goes online | Registration missing, or the sidecar daemon is unreachable | Read `docker logs subzerodev-runner-linux` and `linux\runner\_diag\`; `Register-Runners.ps1` fixes a missing registration |
+| Every runner on a host goes offline at once; the Linux log says `The token expired on ...` and the Windows console log says `The runner registration has been deleted from the server` while GitHub still lists it | The host or WSL clock drifted (seen on beast after sleep, WSL about 4h20m behind) | Compare `Get-Date -AsUTC` with `docker run --rm alpine date -u`; elevated `w32tm /resync /force`, then `wsl --shutdown`, start Docker Desktop, and `Manage-WindowsRunner.ps1 -Action Restart` in each Windows clone |
 | Docker is not ready after boot | Docker Desktop is slow or not in Linux-container mode | `AutoStart` waits up to `buildAgent.docker.readyTimeoutSeconds` (default 300); start Docker Desktop and rerun |
 
 ## Stopping, draining and maintenance
