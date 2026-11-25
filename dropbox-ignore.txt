@@ -13,6 +13,7 @@ windows/_work
 windows/_tool
 windows/_nuget
 windows/_dotnet-home
+windows/_temp
 windows/_diag
 windows/runner-console.log
 windows/supervisor.pid
