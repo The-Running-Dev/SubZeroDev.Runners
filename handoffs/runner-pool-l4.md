@@ -109,9 +109,15 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
    - `dotnet` calls `dotnet.yml@v2`, a moving tag. The slice keeps the reference as it is; pinning it is that repository's own change.
      The switch needs a `v2` release that includes ActionTemplates #54 before this slice starts.
    - The `wasm-tools` workload install runs per job. Check its time on a slot against the hosted run.
-5. **HollowMoon `build.yml`, `self-hosted-docs-smoke.yml` `verify`, and Architecture `docs.yml`.**
+5. **HollowMoon `build.yml`, `self-hosted-docs-smoke.yml` `verify`, and Architecture `docs.yml`.** Done 2026-11-26, [HollowMoon #7](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/pull/7) and [Architecture #5](https://github.com/AbsoluteZeroDev/SubZeroDev.Architecture/pull/5).
    - `build.yml` turns the throwaway-branch L2 from 2026-11-24 into the merged state.
-   - Architecture passes the Linux expression as `runs-on` and `utility-runs-on`.
+   - Architecture passes the Linux expression as `runs-on` and `utility-runs-on`, pinned to ActionTemplates `a73c2e3` (#54); `docs.yml` is unchanged since v2.0.0.
+   - HollowMoon L2 on head `6a2293c`:
+     - `build`: [run 45865388300](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45865388300) passed hosted in [attempt 1](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45865388300/attempts/1) (2.2 min) and on `beast.win01` in [attempt 2](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45865388300/attempts/2) (2.1 min);
+     - smoke `verify`: hosted in [run 45867565586](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45867565586) and on `beast.linux.01` in [run 45868495889](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45868495889), both passed.
+   - The smoke's `expected_runner_*` inputs must name the slot that `docs` lands on. With two Linux slots that is a guess, so [run 45865486066](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45865486066) failed `verify` on a mismatch and was redispatched.
+   - Architecture L2 on head `1f120c9`, [run 45865380135](https://github.com/AbsoluteZeroDev/SubZeroDev.Architecture/actions/runs/45865380135): `docs / Build` passed hosted in [attempt 1](https://github.com/AbsoluteZeroDev/SubZeroDev.Architecture/actions/runs/45865380135/attempts/1) (2.4 min) and on `beast.linux.01` in [attempt 2](https://github.com/AbsoluteZeroDev/SubZeroDev.Architecture/actions/runs/45865380135/attempts/2) (5.8 min).
+   - Stays hosted: HollowMoon `release.yml` (D6). Architecture `Deploy` is skipped (`deploy: false`).
 6. **BuildAgent stages (optional, one PR per project).**
    - Only after that job passes L2 on the pool.
    - Each move needs L1 and L2: HotCorners non-UI tests, Cleaner, and Media `dotnet`/`windows-package`, if they cross-build. HollowMoon was done in PR #4.
