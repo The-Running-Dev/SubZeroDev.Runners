@@ -121,3 +121,25 @@ function Get-FreeDiskReport([string[]] $Path) {
         [pscustomobject]@{ Drive = $_; FreeGB = $free; MinimumGB = $minimum; Low = ($free -lt $minimum) }
     }
 }
+
+# Uno.Wasm.Bootstrap shortens Emscripten's paths on Windows by linking $(USERPROFILE)\.uno\emsdk\<version> to the Emscripten
+# pack of whichever .NET built a wasm project first, and reuses that link while the name exists. Every slot and the owner's
+# own builds share it. When its target goes away (an SDK uninstalled, a slot's _tool cleaned or retired), MSBuild sees no
+# folder, mklink fails on the name and every wasm build fails. Removes only junctions whose target is gone, so the next build
+# links the pack of the .NET it runs on; folders and live junctions stay. Returns one line per removed link.
+function Repair-UnoEmsdkLink([Parameter(Mandatory)] [string] $ProfileDirectory) {
+    $root = Join-Path $ProfileDirectory '.uno\emsdk'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return }
+    foreach ($link in Get-ChildItem -LiteralPath $root -Force -Directory -ErrorAction SilentlyContinue) {
+        if ($link.LinkType -ne 'Junction') { continue }
+        $target = @($link.Target)[0]
+        if ($target -and (Test-Path -LiteralPath $target)) { continue }
+        try {
+            # Deletes the reparse point itself; it never follows the link.
+            [IO.Directory]::Delete($link.FullName, $false)
+            "Removed Uno emsdk link $($link.FullName): its target $target is gone."
+        }
+        catch [IO.DirectoryNotFoundException] { }
+        catch { Write-Warning "Could not remove the dangling Uno emsdk link $($link.FullName): $($_.Exception.Message)" }
+    }
+}
