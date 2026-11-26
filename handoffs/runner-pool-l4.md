@@ -122,6 +122,10 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
    - Only after that job passes L2 on the pool.
    - Each move needs L1 and L2: HotCorners non-UI tests, Cleaner, and Media `dotnet`/`windows-package`, if they cross-build. HollowMoon was done in PR #4.
    - Skipping this slice leaves L4 complete.
+   - Started 2026-11-26. The owner chose to run these stages through ActionTemplates `dotnet.yml`, so the template changes first (this overrides "Unchanged" for ActionTemplates).
+   - Done: ActionTemplates [#57](https://github.com/The-Running-Dev/GitHub-ActionTemplates/pull/57), released as [v2.4.0](https://github.com/The-Running-Dev/GitHub-ActionTemplates/releases/tag/v2.4.0) (#58). `dotnet.yml` takes `image-os` and `image` (BuildAgent 2.1.0 by digest; `Test` only, `Pack` stays on the runner) and `split-tests-by-platform` (Windows runners test only `net*-windows`/.NET Framework test projects, the others the rest). `gates` accepts an expression in `image-os`. Its self-test runs the split on `ubuntu-latest` in the image and on `windows-latest`.
+   - Next, one PR each: HotCorners and Cleaner (Core tests in the image, Windows-only tests on Windows), then Media (`dotnet` tests in the image, `windows-package` stays on Windows). Each sets `image-os` from `SUBZERODEV_LINUX_RUNS_ON`, `split-tests-by-platform: true` and `enable-windows-targeting: true`, and needs L1 and L2.
+   - Licensing and HollowMoon are not on `dotnet.yml`; moving them is a separate owner decision.
 7. **Release, signing and deploy jobs (D6).**
    - Only for the jobs the owner names: HotCorners and Media `release.yml`, HollowMoon `release.yml` (`package-signing`, `release`), and Licensing `container.yml` `deploy` (`production`).
    - Each keeps its environment and protection rules.
@@ -130,11 +134,11 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
    - The validation table gets one L4 row per repository ([runner-pool-plan.md](../docs/runner-pool-plan.md#l4-by-repository)).
    - Checked on 2026-11-26 against each repository's main: every non-release job except Licensing `publish` reads its D5 variable (the HollowMoon smoke's `docs` uses the fixed `subzerodev-linux` label), and every variable those jobs read is set.
    - Stay hosted, with their reasons: Licensing `ci.yml` `publish` (tag-only) and the D6 jobs in slice 7.
-   - Slices 6 and 7 are optional and not started.
+   - Slices 6 and 7 are optional. Slice 6 started 2026-11-26 (see above); slice 7 is not started.
    - L4 is done when every non-release job has passed L2 on the pool or has a recorded reason to stay hosted.
 
 ## Unchanged
 
-- The pool's labels, BuildAgent, ActionTemplates beyond #54, and every `environment:` with its protection rules.
+- The pool's labels, BuildAgent, ActionTemplates beyond #54 (except slice 6, #57), and every `environment:` with its protection rules.
 - Triggers, secrets and artifact retention in each workflow.
 - No repository variable is set before its slice starts.
