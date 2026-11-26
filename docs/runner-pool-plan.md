@@ -316,7 +316,7 @@ public repositories. Registration passes `--runnergroup` when the setting names 
 
 ## Rollout per job
 
-Every job below runs on GitHub-hosted runners today (checked 2026-11-24); the slices that move them are in
+Every job below ran on GitHub-hosted runners when L4 started (checked 2026-11-24); "on the pool since" marks the jobs L4 moved. The slices that move them are in
 [runner-pool-l4.md](../handoffs/runner-pool-l4.md). "Into BuildAgent" is optional, done per job, after that
 project's cross-build has been verified (L1 and L2 below). One WPF project cross-building in HollowMoon proves
 nothing for another project's tests or packaging.
@@ -347,7 +347,22 @@ the last to change in any repository.
 | L1 local | the BuildAgent build passes against the pinned image on a workstation | passed |
 | L2 workflow | the GitHub check passes on a self-hosted slot | **passed** on beast's `win02` ([run 45393284264](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/actions/runs/45393284264)), from a throwaway branch that changed only `runs-on`. `build.yml` on main (PR #4 merged) still targets GitHub-hosted `windows-latest`. |
 | L3 target host | on beast, after Apply: scale, hold, reboot and concurrency acceptance (handoff) | **passed** 2026-11-24 (S9, #34); step 2 not applicable. Evidence: [l3-beast-acceptance.md](l3-beast-acceptance.md) |
-| L4 generalization | each job that moves passes L2 on the pool; a job whose stage moves into BuildAgent also passes L1 ([runner-pool-l4.md](../handoffs/runner-pool-l4.md)) | in progress. D5 approved (repository variables). L4-1 Cleaner `ci.yml` passed L2 on hosted and on the pool ([run 45487347854](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/actions/runs/45487347854)) and runs on the pool. L4-2 HotCorners `ci.yml` and `claude-code-review.yml` passed L2 on hosted and on the pool ([HotCorners #220](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/pull/220)) and run on the pool. L4-3 Licensing `ci.yml` (`linux`, `package`, `windows`), `container.yml` `image` and `claude-code-review.yml` passed L2 on hosted and on the pool ([Licensing #77](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/pull/77)) and run on the pool. The image's `Build` and `Publish` went back to hosted after `Publish` failed on main for lack of `gh` ([Licensing #78](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/pull/78)); with `gh` in the slot ([Runners #43](https://github.com/The-Running-Dev/SubZeroDev.Runners/pull/43)) they returned ([Licensing #79](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/pull/79)) and published from main on `beast.linux.02` ([run 45661101149](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/actions/runs/45661101149)). The tag-only `publish` stays hosted. L4-4 Media `ci.yml` (`web`, `linux`, `dotnet`, `windows-package`) passed L2 on hosted and on the pool ([run 45684554656](https://github.com/AbsoluteZeroDev/SubZeroDev.Media/actions/runs/45684554656), [Media #71](https://github.com/AbsoluteZeroDev/SubZeroDev.Media/pull/71)) and runs on the pool, after per-slot TMP and TEMP ([Runners #46](https://github.com/The-Running-Dev/SubZeroDev.Runners/pull/46)); `dotnet` Test took 7.9 min against 22.0 hosted. L4-5 HollowMoon `build.yml` and the docs smoke's `verify` ([HollowMoon #7](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/pull/7)) and Architecture `docs.yml` ([Architecture #5](https://github.com/AbsoluteZeroDev/SubZeroDev.Architecture/pull/5)) passed L2 on hosted and on the pool and run on the pool. |
+| L4 generalization | each job that moves passes L2 on the pool; a job whose stage moves into BuildAgent also passes L1 ([runner-pool-l4.md](../handoffs/runner-pool-l4.md)) | **done** 2026-11-26. D5 approved (repository variables). Slices 1–5 moved every non-release job onto the pool; each passed L2 on hosted and on the pool. The jobs left hosted have a recorded reason. Slices 6 (BuildAgent stages) and 7 (D6 release, signing and deploy jobs) are optional and not started. One row per repository below. |
+
+#### L4 by repository
+
+Checked against each repository's main and its `SUBZERODEV_*` variables on GitHub, 2026-11-26.
+
+| Repository | On the pool (slice) | L2, hosted and pool | Stays hosted, and why |
+| --- | --- | --- | --- |
+| Cleaner | `ci.yml` `dotnet` (L4-1) | [run 45487347854](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/actions/runs/45487347854) | — |
+| HotCorners | `ci.yml` `dotnet`, `claude-code-review.yml` (L4-2) | [HotCorners #220](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/pull/220) | `release.yml` `release` (D6) |
+| Licensing | `ci.yml` `linux`, `package`, `windows`; `container.yml` `image`; `claude-code-review.yml` (L4-3) | [Licensing #77](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/pull/77); image `Build` and `Publish` from main on the pool after [Runners #43](https://github.com/The-Running-Dev/SubZeroDev.Runners/pull/43) and [Licensing #79](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/pull/79) ([run 45661101149](https://github.com/AbsoluteZeroDev/SubZeroDev.Licensing/actions/runs/45661101149)) | `ci.yml` `publish` (runs only on a version tag, so it cannot pass L2 from a PR); `container.yml` `deploy` (D6) |
+| Media | `ci.yml` `web`, `linux`, `dotnet`, `windows-package` (L4-4) | [run 45684554656](https://github.com/AbsoluteZeroDev/SubZeroDev.Media/actions/runs/45684554656), [Media #71](https://github.com/AbsoluteZeroDev/SubZeroDev.Media/pull/71), after per-slot TMP and TEMP ([Runners #46](https://github.com/The-Running-Dev/SubZeroDev.Runners/pull/46)) | `release.yml` `release` (D6) |
+| HollowMoon | `build.yml` `build`; `self-hosted-docs-smoke.yml` `verify` (L4-5); the smoke's `docs` was already on the fixed `subzerodev-linux` label | [HollowMoon #7](https://github.com/AbsoluteZeroDev/SubZeroDev.HollowMoon/pull/7) | `release.yml` `build` (`package-signing`), `publish` (`release`) (D6) |
+| Architecture | `docs.yml` `docs` (L4-5) | [Architecture #5](https://github.com/AbsoluteZeroDev/SubZeroDev.Architecture/pull/5) | — (`Deploy` is skipped: `deploy: false`) |
+
+Outside L4: `SubZeroDev.Licensing.Distribution` is empty and has no workflows; `SubZeroDev.Platform.Updater` is public (D1).
 
 Mocked tests in this repository are L0 and are reported separately from all of these.
 
