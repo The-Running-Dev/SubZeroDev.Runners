@@ -2,7 +2,7 @@
 
 Read [docs/runner-pool-plan.md](../docs/runner-pool-plan.md) first; its decisions D1–D4 still bind. S1–S9 in
 [runner-pool.md](runner-pool.md) built the pool and passed L3 on beast (2026-11-24). L4 moves the other
-repositories' jobs onto it.
+repositories' jobs onto it. **L4 is done (2026-11-26):** slices 1–5 and 8 are complete; 6 and 7 are optional.
 
 ## Where the repositories are (checked on GitHub, 2026-11-24)
 
@@ -126,8 +126,11 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
    - Only for the jobs the owner names: HotCorners and Media `release.yml`, HollowMoon `release.yml` (`package-signing`, `release`), and Licensing `container.yml` `deploy` (`production`).
    - Each keeps its environment and protection rules.
    - The first run of each is dispatched by the owner.
-8. **Record (this repository).**
-   - The validation table gets one L4 row per repository.
+8. **Record (this repository).** Done 2026-11-26: L4 is done.
+   - The validation table gets one L4 row per repository ([runner-pool-plan.md](../docs/runner-pool-plan.md#l4-by-repository)).
+   - Checked on 2026-11-26 against each repository's main: every non-release job except Licensing `publish` reads its D5 variable (the HollowMoon smoke's `docs` uses the fixed `subzerodev-linux` label), and every variable those jobs read is set.
+   - Stay hosted, with their reasons: Licensing `ci.yml` `publish` (tag-only) and the D6 jobs in slice 7.
+   - Slices 6 and 7 are optional and not started.
    - L4 is done when every non-release job has passed L2 on the pool or has a recorded reason to stay hosted.
 
 ## Unchanged
