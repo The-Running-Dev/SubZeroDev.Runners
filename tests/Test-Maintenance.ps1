@@ -269,6 +269,64 @@ Test-Case 'AutoStart over an unreadable inventory refuses' {
     Assert (-not (Test-Path -LiteralPath (Join-Path $fixture.WindowsClone 'actions.log'))) 'AutoStart started a slot on an unreadable inventory.'
 }
 
+# A fixture whose checkout is a git clone of a bare upstream that is one commit ahead. That commit makes the newer
+# Update-AtSignIn say so, which shows the updated scripts ran.
+function Initialize-FixtureGit($Fixture) {
+    $git = { param([string[]] $GitArgs) & git -c user.name=test -c user.email=test@example.invalid @GitArgs 2>&1 | Out-Null; if ($LASTEXITCODE) { throw "git $($GitArgs -join ' ') exited $LASTEXITCODE." } }
+    $upstream = New-CaseDirectory
+    & $git @('init', '--quiet', '--bare', '-b', 'main', $upstream)
+    & $git @('-C', $Fixture.Clone, 'init', '--quiet', '-b', 'main')
+    & $git @('-C', $Fixture.Clone, 'add', 'runners.json', 'scripts')
+    & $git @('-C', $Fixture.Clone, 'commit', '--quiet', '-m', 'base')
+    & $git @('-C', $Fixture.Clone, 'remote', 'add', 'origin', $upstream)
+    & $git @('-C', $Fixture.Clone, 'push', '--quiet', '-u', 'origin', 'main')
+    $other = New-CaseDirectory
+    & $git @('clone', '--quiet', $upstream, $other)
+    $script = Join-Path $other 'scripts\Manage-RunnerHost.ps1'
+    $text = [IO.File]::ReadAllText($script)
+    [IO.File]::WriteAllText($script, $text.Replace('function Update-AtSignIn($Inventory) {', "function Update-AtSignIn(`$Inventory) {`n    'the updated checkout ran'"))
+    & $git @('-C', $other, 'commit', '--quiet', '-am', 'newer')
+    & $git @('-C', $other, 'push', '--quiet')
+    (& git -C $other rev-parse HEAD).Trim()
+}
+
+Test-Case 'windows.updateAtSignIn fast-forwards the checkout, runs the newer AutoStart, and a slot update that stops never keeps the slot from starting' {
+    $fixture = New-Fixture @{ windows = @{ count = 1; updateAtSignIn = $true } }
+    $newer = Initialize-FixtureGit $fixture
+    $run = Invoke-Manager $fixture @('-Action', 'AutoStart')
+    $head = (& git -C $fixture.Clone rev-parse HEAD).Trim()
+    Assert ($head -eq $newer) "The checkout is at $head, not the upstream $newer.`n$($run.Output)"
+    Assert ($run.Output -match 'The host checkout moved from' -and @([regex]::Matches($run.Output, 'moved from')).Count -eq 1) "The checkout did not move exactly once.`n$($run.Output)"
+    Assert ($run.Output -match 'the updated checkout ran') "The newer AutoStart did not run.`n$($run.Output)"
+    # The fixture clone is not a runner checkout, so win01's update stops in its change step; it still starts.
+    Assert ($run.ExitCode -eq 1 -and $run.Output -match 'win01: .*Not a runner checkout') "The stopped update was not reported (exit $($run.ExitCode)).`n$($run.Output)"
+    Assert ($run.Output -match 'win01: fake AutoStart done') "win01 was not started.`n$($run.Output)"
+    $actions = @(Get-Content -LiteralPath (Join-Path $fixture.WindowsClone 'actions.log'))
+    Assert ($actions[-1] -eq 'end AutoStart' -and @($actions | Where-Object { $_ -eq 'begin AutoStart' }).Count -eq 1) "The Windows slot saw: $($actions -join ',')."
+    Assert (-not (Get-Log $fixture | Where-Object { $_ -match '^(start|stop|compose|build) ' })) 'The sign-in update touched a Linux container or image.'
+}
+
+Test-Case 'windows.updateAtSignIn leaves a checkout with local changes as it is, and still starts the slots' {
+    $fixture = New-Fixture @{ windows = @{ count = 1; updateAtSignIn = $true } }
+    Initialize-FixtureGit $fixture | Out-Null
+    $before = (& git -C $fixture.Clone rev-parse HEAD).Trim()
+    Add-Content -LiteralPath (Join-Path $fixture.Clone 'runners.json') -Value ' '
+    $run = Invoke-Manager $fixture @('-Action', 'AutoStart')
+    Assert ((& git -C $fixture.Clone rev-parse HEAD).Trim() -eq $before) 'A checkout with local changes was moved.'
+    Assert ($run.Output -match 'has local changes; it was not updated') "No warning for the local changes.`n$($run.Output)"
+    Assert ($run.Output -match 'win01: fake AutoStart done') "win01 was not started.`n$($run.Output)"
+}
+
+Test-Case 'Without windows.updateAtSignIn AutoStart neither pulls nor updates a slot' {
+    $fixture = New-Fixture
+    $newer = Initialize-FixtureGit $fixture
+    $run = Invoke-Manager $fixture @('-Action', 'AutoStart')
+    Assert ($run.ExitCode -eq 0) "AutoStart exited $($run.ExitCode).`n$($run.Output)"
+    Assert ((& git -C $fixture.Clone rev-parse HEAD).Trim() -ne $newer) 'AutoStart pulled without windows.updateAtSignIn.'
+    $actions = @(Get-Content -LiteralPath (Join-Path $fixture.WindowsClone 'actions.log'))
+    Assert (($actions -join ',') -eq 'begin AutoStart,end AutoStart') "The Windows slot saw: $($actions -join ',')."
+}
+
 # --- Hold and Resume ---------------------------------------------------------------------------------------------------
 
 Test-Case 'Hold keeps a record and stops the containers; a Docker restart or AutoStart leaves it; Resume restores labels and starts one listener' {

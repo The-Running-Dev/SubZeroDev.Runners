@@ -53,7 +53,7 @@ workspace, a non-numeric `lifecycle`/`housekeeping` value. Each runner gets `git
 | `buildAgent` | The pinned `BuildAgent.Tool` (`tool.version`, installed once per host in `tool.directory`), the net8.0 runtime it runs on (`dotnetRuntime`), the image by digest (`image`, passed to every build as `BUILD_AGENT_IMAGE`), the Docker connection (`docker.host`, `null` = Docker Desktop's default), per-instance build workspaces (`paths`), cache retention (`cache`) and the optional updater (`updater.version`, see below) |
 | `lifecycle` | Drain deadline, supervisor restart delay, backoff, the quick-exit threshold and `startTimeoutSeconds` (how long `Start` waits for the supervisor to initialize, default 60) |
 | `logs`, `housekeeping` | Log age and size caps, cleanup retries, the free-disk warning level |
-| `hostId`, `linux.count`, `windows.count`, `windows.startAtSignIn`, `github.runnerGroup` | The [host manager's](docs/host-management.md) settings: this host's ID, the slot counts (`null` = unmanaged, otherwise 0-16), whether the host starts the Windows runners at sign-in, and the runner group the runners belong to |
+| `hostId`, `linux.count`, `windows.count`, `windows.startAtSignIn`, `windows.updateAtSignIn`, `github.runnerGroup` | The [host manager's](docs/host-management.md) settings: this host's ID, the slot counts (`null` = unmanaged, otherwise 0-16), whether the host starts the Windows runners at sign-in, whether that start first pulls this checkout and updates the Windows slots, and the runner group the runners belong to |
 | `housekeeping.minFreeGB`, `buildAgent.estimate.memory` | The free disk below which `Apply` refuses to add a slot, and the Windows memory estimate `Plan` reports (advisory, not enforced) |
 
 Three files are merged, later wins: `runners.json` (committed defaults), `runners.host.json` (written by the host manager
@@ -104,7 +104,8 @@ listener. `Manage-WindowsRunner.ps1 -Action Start` also ends one instance's main
 2. Docker Desktop starts and restarts the Linux containers (`restart: always`); held ones wait in the entrypoint.
 3. With `windows.startAtSignIn: true` and `Startup` run once, the Startup entry runs `AutoStart`, which waits for Docker
    (`buildAgent.docker.readyTimeoutSeconds`) and starts each active Windows slot's supervisor. Without it, run
-   `Manage-RunnerHost.ps1 -Action AutoStart` yourself.
+   `Manage-RunnerHost.ps1 -Action AutoStart` yourself. With `windows.updateAtSignIn: true` it first fast-forwards this
+   checkout and updates the Windows slots that drifted from it ([details](docs/host-management.md#update-at-sign-in)).
 4. Held slots stay held; `Resume` them when you want them back.
 
 ## One-command Windows setup

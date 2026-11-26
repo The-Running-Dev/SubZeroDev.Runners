@@ -11,7 +11,9 @@
 #
 #   AutoStart  what runs at host start and at sign-in: waits for Docker (up to buildAgent.docker.readyTimeoutSeconds), then
 #           starts each active Windows slot's supervisor without ending maintenance. Linux slots need nothing: Docker restarts
-#           their containers and the entrypoint waits while a slot is held.
+#           their containers and the entrypoint waits while a slot is held. With windows.updateAtSignIn it first
+#           fast-forwards this checkout to its upstream (a clean branch only) and updates the Windows slots the plan shows
+#           drifted, as Apply would (busy or held: deferred). Linux slots, adds and retires stay with Apply.
 #   Hold -Slot  drains the slot, stops it and keeps its maintenance record: nothing starts it again until Resume.
 #   Resume -Slot  the only owner path that ends the maintenance Hold began: restores labels, deletes the record, starts the
 #           one listener. Hold and Resume refuse a slot while an operation on it is unfinished (finish it with Apply).
@@ -56,6 +58,8 @@ param(
     [string] $ExpectPlan,
     # Update: the BuildAgent release to move to, e.g. 1.4.2. Resolved to its digest; floating tags are refused.
     [string] $Version,
+    # AutoStart: the run the updated checkout makes of itself after windows.updateAtSignIn pulled it; it does not pull again.
+    [switch] $NoPull,
     [switch] $Json,
     # Where the Windows instance clones live (winNN). The setup default.
     [string] $InstallRoot = $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'SubZeroDev\Runners' })
@@ -649,6 +653,8 @@ function Wait-DockerReady {
 
 # What runs at host start (and at sign-in): every active Windows slot's supervisor starts with maintenance left as it is.
 # Linux slots need nothing: Docker restarts their containers and the entrypoint waits while a slot is held.
+# With windows.updateAtSignIn the host checkout is fast-forwarded first and the Windows slots the plan shows drifted are
+# updated as Apply would (Update-AtSignIn). Nothing in that step stops the slots from starting.
 function Invoke-AutoStart {
     $inventory = Read-HostInventory
     if ($inventory.State -eq 'absent') { 'No host inventory: nothing is managed here, so nothing was started.'; return }
@@ -657,11 +663,67 @@ function Invoke-AutoStart {
     if ($warning) { Write-Warning $warning }
     Use-HostLock -Kind 'Manage-RunnerHost AutoStart' -Joinable -ScriptBlock {
         $current = Assert-HostInventoryUsable 'Resume'
+        if ($Config.windows.updateAtSignIn -eq $true) {
+            $pulled = if ($NoPull) { @($false) } else { @(Update-HostCheckout) }
+            $pulled | Select-Object -SkipLast 1
+            if ($pulled[-1] -eq $true) {
+                # The newer scripts do the rest: the child joins this lock.
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Manage-RunnerHost.ps1') -Action AutoStart -NoPull -InstallRoot $InstallRoot
+                if ($LASTEXITCODE -ne 0) { $script:HostFailed = $true }
+                return
+            }
+            Update-AtSignIn $current
+            $current = Assert-HostInventoryUsable 'Resume'
+        }
         foreach ($slot in @($current.slots | Where-Object { $_ -and $_.platform -eq 'windows' -and $_.state -eq 'active' } | Sort-Object slotId)) {
             $result = Invoke-InstanceAction $slot 'AutoStart'
             if ($result.ExitCode -eq 0) { "$($slot.slotId): $($result.Output)" }
             else { $script:HostFailed = $true; [Console]::Error.WriteLine("$($slot.slotId): AutoStart failed (exit $($result.ExitCode)): $($result.Output)") }
         }
+    }
+}
+
+# Fast-forwards the host checkout to its upstream branch. Only a branch with an upstream and no local changes to tracked
+# files moves, and only forward; anything else is a warning and the checkout is left as it is. True when HEAD moved.
+function Update-HostCheckout {
+    $git = {
+        $output = & git -C $Root @args 2>&1 | ForEach-Object { "$_" }
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output -join ' ').Trim() }
+    }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Warning 'windows.updateAtSignIn: git is not installed here; the checkout was not updated.'; return $false }
+    $before = Get-GitCommit $Root
+    if (-not $before) { Write-Warning "windows.updateAtSignIn: $Root is not a git checkout; it was not updated."; return $false }
+    $upstream = & $git rev-parse --abbrev-ref --symbolic-full-name '@{u}'
+    if ($upstream.ExitCode -ne 0) { Write-Warning "windows.updateAtSignIn: $Root is not on a branch with an upstream; it was not updated."; return $false }
+    $dirty = & $git status --porcelain --untracked-files=no
+    if ($dirty.ExitCode -ne 0 -or $dirty.Output) { Write-Warning "windows.updateAtSignIn: $Root has local changes; it was not updated."; return $false }
+    $prompt = $env:GIT_TERMINAL_PROMPT
+    $env:GIT_TERMINAL_PROMPT = '0'
+    try {
+        $fetch = & $git fetch --quiet
+        if ($fetch.ExitCode -ne 0) { Write-Warning "windows.updateAtSignIn: git fetch failed (exit $($fetch.ExitCode)): $($fetch.Output) The checkout was not updated."; return $false }
+    } finally { $env:GIT_TERMINAL_PROMPT = $prompt }
+    $merge = & $git merge --ff-only --quiet '@{u}'
+    if ($merge.ExitCode -ne 0) { Write-Warning "windows.updateAtSignIn: $Root cannot fast-forward to $($upstream.Output): $($merge.Output) It was not updated."; return $false }
+    $after = Get-GitCommit $Root
+    if ($after -eq $before) { "The host checkout is current with $($upstream.Output) ($($before.Substring(0, 12)))."; return $false }
+    "The host checkout moved from $($before.Substring(0, 12)) to $($after.Substring(0, 12)) ($($upstream.Output))."
+    $true
+}
+
+# The Windows slot updates the plan shows, one at a time, as Apply would: a busy or held slot is deferred, and a slot
+# whose update stops keeps its journal for Apply. Adds, retires, migrations and Linux slots are left to Apply, and so is
+# everything while an operation is unfinished.
+function Update-AtSignIn($Inventory) {
+    $operation = Read-HostOperation
+    if ($operation.State -ne 'absent') { Write-Warning "windows.updateAtSignIn: an operation is unfinished ($($operation.State)); no slot was updated. Finish it with Apply."; return }
+    $downgrade = Get-DowngradeFinding $Inventory
+    if ($downgrade) { Write-Warning "windows.updateAtSignIn: $($downgrade.message) No slot was updated."; return }
+    $updates = @((Get-HostPlan).changes | Where-Object { $_.kind -eq 'update' -and $_.platform -eq 'windows' })
+    foreach ($change in $updates) {
+        try { Invoke-SlotUpdate $Inventory $null $change.slotId @($change.reasons) }
+        catch { $script:HostFailed = $true; [Console]::Error.WriteLine("$($change.slotId): $($_.Exception.Message)") }
+        $Inventory = Assert-HostInventoryUsable 'Resume'
     }
 }
 

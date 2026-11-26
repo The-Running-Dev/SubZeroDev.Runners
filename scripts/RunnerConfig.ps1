@@ -60,6 +60,8 @@ function Assert-RunnerConfig($Config) {
     }
     $signIn = $Config.windows.startAtSignIn
     Require ($null -eq $signIn -or $signIn -is [bool]) 'windows.startAtSignIn must be true or false.'
+    $updateAtSignIn = $Config.windows.updateAtSignIn
+    Require ($null -eq $updateAtSignIn -or $updateAtSignIn -is [bool]) 'windows.updateAtSignIn must be true or false.'
     $group = $Config.github.runnerGroup
     if ($null -ne $group) {
         Require ($group.name -is [string] -and $group.name.Trim()) 'github.runnerGroup.name is required.'

@@ -423,7 +423,9 @@ is one of these instances, in `%LOCALAPPDATA%\SubZeroDev\Runners\winNN`, registe
 (and removes it when the setting is `false`). At each sign-in that entry runs `Manage-RunnerHost.ps1 -Action AutoStart`,
 which waits for Docker for up to `buildAgent.docker.readyTimeoutSeconds`, then runs
 `Manage-WindowsRunner.ps1 -Action AutoStart` in each active Windows slot. It never ends maintenance: a held slot stays held
-until `Manage-RunnerHost.ps1 -Action Resume -Slot winNN`. With no inventory it starts nothing. It is not a service and it
+until `Manage-RunnerHost.ps1 -Action Resume -Slot winNN`. With no inventory it starts nothing. With
+`windows.updateAtSignIn: true` it first fast-forwards the host checkout and updates the drifted Windows slots
+([update at sign-in](host-management.md#update-at-sign-in)). It is not a service and it
 does not sign you in; setup never enables automatic sign-in, so the runners start when you sign in.
 
 **Retire.** With `windows.count` lower than the active slots, `Plan` and `Apply` report the surplus (exit 3) and change
