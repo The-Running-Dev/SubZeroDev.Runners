@@ -20,7 +20,7 @@ image to a release.
 
 Settings resolve in this order, later wins: `runners.json`, `runners.host.json` (written by the manager for a Windows
 clone), `runners.local.json` (yours, git-ignored). Host-owned keys are `hostId`, `linux.count`, `windows.count`,
-`windows.startAtSignIn`, `github.runnerGroup`, `housekeeping.minFreeGB` and `buildAgent.estimate.memory`. A count left `null`
+`windows.startAtSignIn`, `windows.updateAtSignIn`, `github.runnerGroup`, `housekeeping.minFreeGB` and `buildAgent.estimate.memory`. A count left `null`
 means "no change on that side".
 
 ## Actions
@@ -35,7 +35,7 @@ means "no change on that side".
 | `Adopt [-ReplaceUnreadable]` | Builds the first inventory from what can be proven: a registration directory whose `.runner` agent ID is the ID GitHub reports under that name, and the containers this repository's scripts created. Writes only the inventory. Refuses when an inventory exists (use `Plan`), or when it is unreadable unless `-ReplaceUnreadable`, which keeps the old file as `inventory.json.unreadable-<utc>` |
 | `Plan [-Json]` | Compares settings with the inventory, Docker and GitHub and prints the changes a later Apply would make, with a `planHash`. Exit 0: no changes; 3: changes, or a drift or blocked finding; 1: something the plan needs cannot be read |
 | `Status [-Json]` | Prints each slot as GitHub, Docker and the files on disk report it, with drift (image, compose config, compose file, clone settings, runner group) and any unfinished operation |
-| `AutoStart` | What runs at host start and sign-in: waits for Docker (up to `buildAgent.docker.readyTimeoutSeconds`), then starts each active Windows slot's supervisor. It never ends maintenance. Linux slots need nothing: Docker restarts their containers and the entrypoint waits while a slot is held |
+| `AutoStart` | What runs at host start and sign-in: waits for Docker (up to `buildAgent.docker.readyTimeoutSeconds`), then starts each active Windows slot's supervisor. It never ends maintenance. Linux slots need nothing: Docker restarts their containers and the entrypoint waits while a slot is held. With `windows.updateAtSignIn` it first pulls this checkout and updates the drifted Windows slots ([update at sign-in](#update-at-sign-in)) |
 | `Hold -Slot <id>` | Drains the slot, stops it and keeps its maintenance record. Nothing starts it again until `Resume` |
 | `Resume -Slot <id>` | The only path that ends the maintenance Hold began: restores labels, deletes the record, starts the one listener (starting a stopped Linux container first) |
 | `Apply [-ExpectPlan <hash>]` | Migrates the legacy `linux-01` (see [Legacy Linux migration](#legacy-linux-migration)), then adds the slots the counts want (see [Adding and retiring slots](#adding-and-retiring-slots)), or resumes an unfinished operation. Exit 0 when done or nothing to do; 3 when a surplus slot was not retired; 1 on a refusal or failure. With `-ExpectPlan` it refuses, changing nothing, when the plan is not the reviewed one |
@@ -90,6 +90,24 @@ To start at sign-in, set `"windows": { "startAtSignIn": true }` in `runners.loca
 
 That writes `SubZeroDev Runners AutoStart.cmd` into your per-user Startup folder (no elevation). Set the value back to
 `false` and run `Startup` again to remove it. Setup never enables automatic sign-in or restarts Windows.
+
+### Update at sign-in
+
+With `"windows": { "updateAtSignIn": true }` in `runners.local.json`, `AutoStart` (the Startup entry's, or yours) first
+brings the Windows slots up to this checkout:
+
+1. It fast-forwards this checkout to its upstream branch (`git fetch`, then `git merge --ff-only`), only when the checkout
+   is on a branch with an upstream and has no changes to tracked files. Anything else (no git, no upstream, local changes,
+   no network, diverged history) is a warning and the checkout stays as it is.
+2. When the checkout moved, the newer `Manage-RunnerHost.ps1` runs the rest (it joins the same host lock).
+3. Each Windows slot the plan shows as `update` is updated as `Apply` would: drained, its clone moved to this commit, its
+   generated settings written, started. A busy or held slot is deferred to the next `Apply`; an update that stops keeps
+   its journal for `Apply` and is reported.
+4. Every active Windows slot is then started as before, maintenance left as it is.
+
+Nothing is added, retired or migrated, the Linux slots and image are left to `Apply`, and nothing is updated while an
+operation is unfinished. A failed pull or update makes `AutoStart` exit 1 but never keeps a slot from starting. The
+Startup entry itself does not change, so no `Startup` rerun is needed.
 
 ## Linux slots as compose services
 

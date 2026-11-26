@@ -27,6 +27,7 @@ try {
     $config = Read-RunnerConfig (Use-Root $fixedHost)
     Assert ($null -eq $config.linux.count -and $null -eq $config.windows.count) 'Counts have a numeric default.'
     Assert ($config.windows.startAtSignIn -eq $false) 'windows.startAtSignIn does not default to false.'
+    Assert ($config.windows.updateAtSignIn -eq $false) 'windows.updateAtSignIn does not default to false.'
     Assert ($config.github.runnerGroup.name -eq 'Default' -and $null -eq $config.github.runnerGroup.repositories) 'The runner group default is wrong.'
     Assert ($config.buildAgent.estimate.memory -eq '8g') 'The BuildAgent memory estimate default is wrong.'
     Assert ((Get-RunnerHostId $config) -eq 'beast') 'hostId from runners.local.json was not used.'
@@ -49,6 +50,7 @@ try {
         Assert-Throws { Read-RunnerConfig (Use-Root @{ hostId = $bad }) } "hostId '$bad' was accepted." 'hostId'
     }
     Assert-Throws { Read-RunnerConfig (Use-Root @{ windows = @{ startAtSignIn = 'yes' } }) } 'A non-boolean startAtSignIn was accepted.' 'startAtSignIn'
+    Assert-Throws { Read-RunnerConfig (Use-Root @{ windows = @{ updateAtSignIn = 1 } }) } 'A non-boolean updateAtSignIn was accepted.' 'updateAtSignIn'
     Assert-Throws { Read-RunnerConfig (Use-Root @{ github = @{ runnerGroup = @{ name = '' } } }) } 'An empty runner group name was accepted.' 'runnerGroup\.name'
     Assert-Throws { Read-RunnerConfig (Use-Root @{ github = @{ runnerGroup = @{ name = 'Pool'; repositories = @('not a repo') } } }) } 'A bad group repository was accepted.' 'repositories'
     Assert-Throws { Read-RunnerConfig (Use-Root @{ housekeeping = @{ minFreeGB = -1 } }) } 'A negative minFreeGB was accepted.' 'minFreeGB'

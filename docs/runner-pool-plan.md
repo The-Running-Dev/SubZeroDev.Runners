@@ -157,6 +157,8 @@ have no listener, not just no custom labels. Every org workflow today includes `
 
 `windows.startAtSignIn: true` creates the Startup entry; false removes it. This reverses the "explicit Start only"
 rule only for a host that opts in, and only for starting a supervisor. A held instance stays held.
+`windows.updateAtSignIn: true` adds a fast-forward of the host checkout and the Windows slot updates the plan shows before
+that start; adds, retires and Linux changes stay with Apply.
 
 ## Settings and how they reach each slot
 

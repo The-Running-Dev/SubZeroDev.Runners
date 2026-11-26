@@ -46,6 +46,7 @@
     "directory": "windows",
     "count": null,
     "startAtSignIn": false,
+    "updateAtSignIn": false,
     "name": "subzerodev.runner.windows",
     "labels": ["subzerodev-windows"],
     "workFolder": "_work"
