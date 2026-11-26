@@ -93,6 +93,9 @@ jobs:
       - name: Verify each slot's caches and temp folder stay under the slot
         shell: pwsh
         run: ./tests/Test-SlotEnvironment.ps1
+      - name: Verify a dangling Uno emsdk link is removed when a job starts
+        shell: pwsh
+        run: ./tests/Test-UnoEmsdkLink.ps1
 
   linux-smoke-fixtures:
     name: Linux docs smoke fixtures (hosted)

@@ -25,6 +25,8 @@ try {
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
     $env:ACTIONS_RUNNER_HOOK_JOB_COMPLETED = Join-Path $PSScriptRoot 'Clear-WindowsActionCache.ps1'
+    # Uno links its emsdk under the owner's profile, shared by every slot; a link left pointing at a removed .NET breaks wasm builds.
+    $env:ACTIONS_RUNNER_HOOK_JOB_STARTED = Join-Path $PSScriptRoot 'Repair-UnoEmsdkLink.ps1'
     $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
     $env:SZR_SCRIPTS = $PSScriptRoot
     $env:PATH = "$env:DOTNET_ROOT;$env:PATH"
