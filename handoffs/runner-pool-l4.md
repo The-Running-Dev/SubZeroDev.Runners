@@ -125,7 +125,18 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
    - Started 2026-11-26. The owner chose to run these stages through ActionTemplates `dotnet.yml`, so the template changes first (this overrides "Unchanged" for ActionTemplates).
    - Done: ActionTemplates [#57](https://github.com/The-Running-Dev/GitHub-ActionTemplates/pull/57), released as [v2.4.0](https://github.com/The-Running-Dev/GitHub-ActionTemplates/releases/tag/v2.4.0) (#58). `dotnet.yml` takes `image-os` and `image` (BuildAgent 2.1.0 by digest; `Test` only, `Pack` stays on the runner) and `split-tests-by-platform` (Windows runners test only `net*-windows`/.NET Framework test projects, the others the rest). `gates` accepts an expression in `image-os`. Its self-test runs the split on `ubuntu-latest` in the image and on `windows-latest`.
    - Done: HotCorners [#221](https://github.com/AbsoluteZeroDev/SubZeroDev.HotCorners/pull/221) (2026-11-27). Core.Tests runs in the image on `subzerodev.runner.linux.beast.01`, App and Platform tests on `subzerodev.runner.windows.beast.win01`. On Linux, `Path.IsPathFullyQualified` rejected `C:\` paths, so the Core path check now applies Windows rules on any OS. L1 in the image and on Windows; L2 on the pool only, as the repository variables point PRs at the pool (hosted rests on ActionTemplates #57's self-test). The Windows job needs beast's top-right screen corner free for the window-protection tests.
-   - Next, one PR each: Cleaner (Core tests in the image, Windows-only tests on Windows), then Media (`dotnet` tests in the image, `windows-package` stays on Windows). Each sets `image-os` from `SUBZERODEV_LINUX_RUNS_ON`, `split-tests-by-platform: true` and `enable-windows-targeting: true`, and needs L1 and L2.
+   - Done: Cleaner [#32](https://github.com/AbsoluteZeroDev/SubZeroDev.Cleaner/pull/32) (`673fefb`, 2026-11-27). Core tests run in the image, Windows-only tests on Windows. On Linux, Core split paths on the wrong separator; it is fixed in that PR, which also adds `gates.json`. L1 in the image and on Windows. L2 on the pool: tests on `subzerodev.runner.windows.beast.win01` and `subzerodev.runner.linux.beast.01`, `Result` on `subzerodev.runner.linux.beast.02`.
+   - Done: Media [#72](https://github.com/AbsoluteZeroDev/SubZeroDev.Media/pull/72) (`765068a`, 2026-11-27). Every `dotnet` test project runs both in the image and on Windows (owner's choice); `windows-package` stays on Windows. Linux fixes:
+     - the decoder worker split `APP_CONTEXT_DEPS_FILES` on `Path.PathSeparator`, but the host joins it with `;` on every OS;
+     - the orphan check took `/` as every Unix path's volume root;
+     - the Linux libexif reports EXIF Orientation as an unknown value.
+     Windows-only test assumptions now state each platform's behavior. L1 in the image and on Windows. L2 on the pool, [run 46044699137](https://github.com/AbsoluteZeroDev/SubZeroDev.Media/actions/runs/46044699137):
+     - Linux tests passed on `subzerodev.runner.linux.beast.02` in attempt 2.
+     - Windows tests and `windows-package` passed on `subzerodev.runner.windows.beast.win01`.
+   - Observed on beast during Media, not fixed:
+     - Under load, the image's tests run about 3–5 times slower than locally (Core 3m50 against 47 s). Timing tests failed on CI but passed locally, a different set on each attempt: the edit worker's 5 s handshake (the tests now wait 60 s), MCP connects returning 499, and the 60 s bar for hashing 1000 images. A rerun passed.
+     - One `windows-package` attempt failed in its post steps because `_actions` was missing on `win01`; the rerun passed.
+   - Next: slice 6 is done for the `dotnet.yml` projects.
    - Licensing and HollowMoon are not on `dotnet.yml`; moving them is a separate owner decision.
 7. **Release, signing and deploy jobs (D6).**
    - Only for the jobs the owner names: HotCorners and Media `release.yml`, HollowMoon `release.yml` (`package-signing`, `release`), and Licensing `container.yml` `deploy` (`production`).
@@ -135,7 +146,7 @@ are outside L4. `SubZeroDev.Platform.Updater` is public and stays excluded (D1).
    - The validation table gets one L4 row per repository ([runner-pool-plan.md](../docs/runner-pool-plan.md#l4-by-repository)).
    - Checked on 2026-11-26 against each repository's main: every non-release job except Licensing `publish` reads its D5 variable (the HollowMoon smoke's `docs` uses the fixed `subzerodev-linux` label), and every variable those jobs read is set.
    - Stay hosted, with their reasons: Licensing `ci.yml` `publish` (tag-only) and the D6 jobs in slice 7.
-   - Slices 6 and 7 are optional. Slice 6 started 2026-11-26 (see above); slice 7 is not started.
+   - Slices 6 and 7 are optional. Slice 6 ran 2026-11-26 to 2026-11-27 (see above); slice 7 is not started.
    - L4 is done when every non-release job has passed L2 on the pool or has a recorded reason to stay hosted.
 
 ## Unchanged
